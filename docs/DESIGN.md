@@ -36,10 +36,13 @@ engine**, sitting between agents and two GitHub surfaces:
 ### Request path (MCP)
 
 ```
-agent → [authn: X-Octobroker-Key] → [session binding] → [tool allowlist]
+agent → [authn: X-Octobroker-Key or X-Octobroker-Iam] → [per-agent quota]
+      → [session binding] → [tool allowlist]
       → [write classification] → [repo allowlist (deny-if-unresolvable)]
-      → [in-flight cap] → [fail-closed audit] → forward with scoped token
+      → [in-flight cap] → [fail-closed audit] → [upstream circuit breaker]
+      → forward with scoped token
       → [buffer+parse write outcomes] → audit result
+      → [metrics: request/deny/latency/session/circuit]
 ```
 
 Every layer is independent; a request must clear all of them.
@@ -61,6 +64,26 @@ raised in review:
 - **Writes never run on PATs** — enforced by startup validation, not
   convention.
 
+### Agent authentication
+
+Two credential mechanisms, configured per agent (Phase 3, #18):
+
+- **`X-Octobroker-Key`** shared key(s), supporting `env:`/`aws:`/`k8s:`
+  secret references and dual-key rotation.
+- **`X-Octobroker-Iam`** — secretless: the client presigns
+  `sts:GetCallerIdentity` (SigV4) with its ambient AWS credentials and
+  sends the URL. The server verifies the proof's shape (TLS endpoint, ≤60s
+  `X-Amz-Expires`, `host` signed header only, `UNSIGNED-PAYLOAD`,
+  allowlisted `sts.<region>.amazonaws.com` / global `sts.amazonaws.com`
+  hosts), executes it, extracts the caller ARN, and matches it against the
+  agent's `iam_principals` (exact ARN, `prefix*`, or bare 12-digit account
+  id; assumed-role ARNs canonicalize to the role ARN). When the key header
+  is present it is the only mechanism tried — a bad key never silently
+  downgrades to the IAM path. On the client, `obk mcp` resolves ambient
+  credentials via the default AWS provider chain (env / ECS task role /
+  EKS IRSA / instance metadata) and re-signs per request, so proofs never
+  age out in flight. The agent never holds a GitHub credential.
+
 ## Session model
 
 Sessions (`Mcp-Session-Id`) are pinned to `(credential, agent)` at
@@ -76,8 +99,17 @@ Sessions (`Mcp-Session-Id`) are pinned to `(credential, agent)` at
   hosted endpoint's own session semantics as fail-open: upstream DELETE is a
   no-op (the session remains usable), and unknown sessions get 400 not 404.
   Nothing about session validity is delegated upstream.
-- Pins are in-process memory → single replica while MCP is enabled; config
-  change = restart = all sessions revoked (the current revocation story).
+- Pins are in-process memory → **horizontal scaling requires load-balancer
+  affinity** (sticky on `Mcp-Session-Id`, or source-IP hash for pre-session
+  `initialize`). Without affinity a second replica cannot resolve a
+  session created on the first: requests return 404 and the client
+  re-initializes — correct but chatty; a client unlucky enough to flap
+  between replicas re-initializes on every hop. Shared session state
+  (external store) is deliberately deferred — the pin cache interface is
+  the seam if it ever becomes necessary.
+- Config change = restart = all sessions revoked (the current revocation
+  story). Clients are expected to re-initialize on 404 — `obk mcp` does so
+  automatically.
 
 ## Policy model
 
@@ -121,12 +153,42 @@ status alone is never treated as success. Argument values are never logged
 call; ambiguous outcomes are recorded as undeterminable and surfaced to the
 caller.
 
+## Operational hardening (Phase 3)
+
+- **Per-agent quotas**: token bucket per agent (`rate_limit_rpm`,
+  `default_rate_limit_rpm` fallback; `0` = unlimited). Excess → `429` +
+  `Retry-After` in seconds, before any policy work — a noisy agent cannot
+  consume upstream budget.
+- **Upstream circuit breaker**: consecutive upstream transport errors and
+  5xx responses trip the breaker (`failure_threshold`, default 5). While
+  open, calls fail fast with `503` + `Retry-After: <cooldown_secs>`; after
+  the cooldown one half-open probe decides close-vs-extend. 4xx responses
+  do not count (the upstream is alive — the failure is contractual, not
+  sickness). No call is ever auto-retried by the proxy — *especially*
+  writes; the shim retries only provably idempotent methods.
+- **Timeouts**: POST is bounded by `upstream_timeout_secs` (default 120).
+  GET streams stay unbounded (long-lived resumable responses); DELETE has
+  its own short timeout.
+- **Metrics**: `GET /metrics` exposes Prometheus text — request counters
+  by `{agent, method, tool, result}`, denial counters by `{agent, reason}`
+  (authn/tool/repo/write/session/quota/circuit classes), upstream call
+  counts + latency histogram by result class, live session gauge, and a
+  `octobroker_mcp_circuit_open` gauge. A scrape with `denied_total` rising
+  faster than `requests_total` is the "someone is banging on a closed
+  door" signal; `circuit_open == 1` is the upstream-outage page.
+- **Cache authorization**: the REST response cache is never consulted on
+  the MCP path — MCP responses carry session- and agent-scoped content
+  keyed by no cacheable identity tuple. The `test_mcp_responses_never_cached`
+  probe pins this down: if MCP caching is ever added, the cache key must
+  include agent + session identity or it is an authorization bypass.
+
 ## Known constraints & non-goals
 
-- **Single replica** (MCP): session pins are in-process. Horizontal scaling
-  (shared session state) is Phase 3 (#18).
+- **Session pins are in-process** (MCP): scale out only behind
+  affinity-aware load balancing; see Session model.
 - **No rate-limit headers on the hosted MCP endpoint** (Phase 0 finding) —
-  budget accounting stays REST-driven; per-agent quotas are Phase 3.
+  the per-agent quota is therefore the only noisy-neighbor defense on the
+  MCP path.
 - **GitHub-side write attribution is the App identity**, not the individual
   agent. The octobroker audit log is the per-agent ledger; GraphQL mutation
   passthrough remains the right path when GitHub-side per-human attribution
@@ -135,8 +197,11 @@ caller.
   `X-MCP-Tools`) is partially undocumented. A daily e2e canary exercises
   the full flow — including real App-token minting — against the live
   endpoint.
-- Phase 3 (#18): SigV4/STS secretless agent auth via a stdio shim,
-  horizontal scaling, quotas/circuit-breaking, cache authorization.
+- Phase 3 (#18) shipped: SigV4/STS secretless agent auth via `obk mcp`,
+  per-agent quotas, upstream circuit breaker, `/metrics`, upstream
+  contract probes (timeout / mid-stream disconnect / credential expiry /
+  no-cache). Remaining: shared session state for affinity-free scaling is
+  a deliberate deferral (see Session model).
 
 ## Decision log
 
@@ -151,3 +216,5 @@ caller.
 | Scoped installation tokens per policy envelope | #17 review | GitHub enforces the repo boundary, not just our parser |
 | Writes: App + audit + agents required in code | #17 review | Hard rules, not documented hopes |
 | `octobroker_*` review tools as a narrow MCP exception | #44 / PR #45 | Fill upstream capability gaps without arbitrary GraphQL; preserve default-deny, repo binding, App credentials, and audit |
+| SigV4 presigned STS as agent identity | #18 | Secretless agent authn; same primitive as aws-iam-authenticator; proof ≤60s, TLS, host-allowlisted |
+| Affinity over shared session state | #18 | Pin cache is in-process; sticky LB is sufficient — no external store dependency yet |

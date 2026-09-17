@@ -7,3 +7,9 @@ description = "gh CLI shim that routes read commands through octobroker"
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde_json = "1.0"
+sha2 = "0.10"
+hmac = "0.12"
+# Ambient AWS credential resolution for `obk mcp` IAM auth (env / ECS / IRSA / IMDS)
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+tokio = { version = "1", features = ["rt"] }

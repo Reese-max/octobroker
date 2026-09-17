@@ -48,6 +48,9 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2026-03-12)
       - name: cargo build
         run: cargo build
+      - name: cargo build obk (MCP stdio shim section)
+        run: cargo build
+        working-directory: obk
       - name: e2e — MCP reverse proxy against hosted endpoint
         env:
           GITHUB_TOKEN: ${{ steps.app.outputs.token }}

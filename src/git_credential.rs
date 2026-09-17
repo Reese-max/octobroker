@@ -22,7 +22,7 @@ use axum::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::mcp::{authenticate, rpc_error};
+use crate::mcp::{authenticate_any, rpc_error};
 use crate::AppState;
 
 pub async fn git_credential(
@@ -35,12 +35,12 @@ pub async fn git_credential(
     }
     // Authenticated agents only. Startup validation guarantees agents exist
     // when the endpoint is enabled, so network-trust mode (None) is denied.
-    let agent = match authenticate(&state, &headers) {
+    let agent = match authenticate_any(&state, &headers).await {
         Ok(Some(a)) => a,
         Ok(None) => {
             return rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required")
         }
-        Err(resp) => return *resp,
+        Err((resp, _)) => return *resp,
     };
 
     // Exactly one repository per credential: owner/name, strict shape AND
@@ -308,6 +308,8 @@ mod tests {
             tools: vec![],
             repos: repos.iter().map(|s| s.to_string()).collect(),
             git_credentials_read_only: None,
+            iam_principals: Vec::new(),
+            rate_limit_rpm: None,
         }
     }
 
@@ -372,6 +374,10 @@ mod tests {
                     toolsets: vec![],
                     session_ttl_secs: 3600,
                     max_inflight_writes: 4,
+                    upstream_timeout_secs: 120,
+                    default_rate_limit_rpm: 0,
+                    iam: None,
+                    circuit_breaker: config::CircuitBreakerConfig::default(),
                     agents: vec![
                         agent(
                             "b0",
@@ -397,6 +403,7 @@ mod tests {
             multi_app_tokens: Some(multi),
             audit: sink,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_ops: crate::McpOps::default(),
         }),
             mint_log,
         )

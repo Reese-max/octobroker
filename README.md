@@ -345,6 +345,38 @@ Client config gains one line:
 
 Deliver `OCTOBROKER_KEY` to the agent container via ECS task secrets / K8s Secrets — most MCP clients expand `${ENV}` in config.
 
+#### Secretless IAM authentication and the `obk mcp` shim (Phase 3)
+
+Agents running on AWS (ECS tasks, EKS pods with IRSA, EC2/Lambda) can authenticate **without any distributed key at all**. The agent presigns `sts:GetCallerIdentity` with its ambient AWS credentials (SigV4) and sends the URL as `X-Octobroker-Iam`; octobroker executes the proof over TLS and maps the caller ARN to an agent:
+
+```toml
+[mcp.iam]
+sts_regions = ["us-east-1"]        # STS endpoints the proof may target
+allow_global_sts = true            # and/or sts.amazonaws.com
+max_expires_secs = 60              # hard cap — proofs are short-lived
+
+[[mcp.agents]]
+id = "openab-bot"
+iam_principals = ["arn:aws:iam::123456789012:role/openab-bot"]   # exact, prefix*, or bare account id
+tools = ["issue_read", "list_issues"]
+```
+
+`obk mcp` is a drop-in stdio shim that does all of this automatically — point the MCP client at the shim and it resolves ambient AWS credentials (env / ECS task role / EKS IRSA / instance metadata), re-signs a fresh proof per request, manages `Mcp-Session-Id`, replays `initialize` transparently on session expiry (404), honors `Retry-After` with bounded backoff, and **never retries `tools/call`** (it may be a non-idempotent write):
+
+```json
+{ "mcpServers": { "github": { "command": "obk", "args": ["mcp"] } } }
+```
+
+with `OCTOBROKER_URL=https://octobroker.example.com` in the environment. Without AWS credentials the shim falls back to `OCTOBROKER_KEY`. Note: proofs require TLS on the wire — `obk mcp` refuses plaintext `OCTOBROKER_URL` for IAM auth unless the broker is on-loopback.
+
+#### Quotas, circuit breaking, and observability (Phase 3)
+
+- **Per-agent rate quotas**: `default_rate_limit_rpm` and per-agent `rate_limit_rpm` token buckets (burst = rpm; `0` = unlimited). Excess gets `429` + `Retry-After`.
+- **Upstream circuit breaker**: `[mcp.circuit_breaker]` — after `failure_threshold` consecutive upstream transport errors/5xx, calls fail fast `503` + `Retry-After` for `cooldown_secs`, then a half-open probe decides recovery. 4xx doesn't count (alive-but-contract-error ≠ sick).
+- **Timeouts**: `upstream_timeout_secs` bounds POST calls (default 120); GET streams stay unbounded for resumability.
+- **`GET /metrics`**: Prometheus text — `octobroker_mcp_requests_total{agent,method,tool,result}`, `octobroker_mcp_denied_total{agent,reason}`, upstream latency histogram + result classes, `octobroker_mcp_sessions`, `octobroker_mcp_circuit_open`.
+- **Horizontal scaling**: session pins are in-process — scale out **only behind affinity-aware load balancing** (sticky on `Mcp-Session-Id`, or source-IP hash so `initialize` lands consistently). Without affinity, cross-replica requests get 404 and the client re-initializes (correct but chatty). See `docs/DESIGN.md` → Session model.
+
 #### Write access (Phase 2b)
 
 ```toml

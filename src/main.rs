@@ -3,7 +3,10 @@ mod audit;
 mod cache;
 mod config;
 mod git_credential;
+mod iam;
+mod limiter;
 mod mcp;
+mod metrics;
 mod policy;
 mod pool;
 
@@ -38,6 +41,41 @@ struct AppState {
     audit: Option<audit::AuditSink>,
     /// Per-agent in-flight write call counters (2b-5 concurrency cap).
     write_inflight: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    /// Phase 3 (#18) operational state: IAM verifier, quotas, circuit
+    /// breaker, metrics registry.
+    mcp_ops: McpOps,
+}
+
+/// Operational state for the MCP path — built once from `[mcp]` config.
+struct McpOps {
+    /// SigV4/STS identity-proof verifier; None = IAM authn disabled.
+    iam: Option<iam::IamVerifier>,
+    /// Per-agent request quotas across all /mcp verbs.
+    limiter: limiter::RateLimiter,
+    /// Fail-fast gate while the hosted upstream is failing.
+    circuit: limiter::CircuitBreaker,
+    /// /metrics registry.
+    metrics: metrics::Metrics,
+}
+
+impl McpOps {
+    fn new(cfg: &config::McpConfig) -> Self {
+        Self {
+            iam: cfg.iam.clone().map(iam::IamVerifier::new),
+            limiter: limiter::RateLimiter::new(),
+            circuit: limiter::CircuitBreaker::new(
+                cfg.circuit_breaker.failure_threshold,
+                cfg.circuit_breaker.cooldown_secs,
+            ),
+            metrics: metrics::Metrics::new(),
+        }
+    }
+}
+
+impl Default for McpOps {
+    fn default() -> Self {
+        Self::new(&config::McpConfig::default())
+    }
 }
 
 #[tokio::main]
@@ -102,6 +140,7 @@ async fn main() {
         multi_app_tokens,
         audit,
         write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        mcp_ops: McpOps::new(&config.mcp),
     });
 
     let mut app = base_router();
@@ -143,6 +182,7 @@ fn base_router() -> Router<Arc<AppState>> {
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
         .route("/graphql", post(graphql_proxy))
+        .route("/metrics", get(metrics_endpoint))
         .route("/git-credential", get(git_credential::git_credential))
         .route("/raw/{*path}", get(proxy_raw))
         .route("/{*path}", get(proxy))
@@ -150,6 +190,22 @@ fn base_router() -> Router<Arc<AppState>> {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Prometheus text exposition (Phase 3, #18). Unauthenticated like /healthz —
+/// it exposes counters only, never secrets; bind inside the private network.
+async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> (StatusCode, HeaderMap, String) {
+    let sessions = state.mcp_sessions.entry_count();
+    let text = state
+        .mcp_ops
+        .metrics
+        .render(sessions, state.mcp_ops.circuit.is_open());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        "text/plain; version=0.0.4; charset=utf-8".parse().unwrap(),
+    );
+    (StatusCode::OK, headers, text)
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -467,6 +523,7 @@ mod tests {
             multi_app_tokens: None,
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_ops: McpOps::default(),
         })
     }
 
@@ -483,6 +540,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        let state = test_state(vec!["openabdev"]);
+        let resp = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+        use http_body_util::BodyExt;
+        let text = String::from_utf8(
+            resp.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("octobroker_mcp_requests_total"), "{}", text);
+        assert!(text.contains("octobroker_mcp_circuit_open"), "{}", text);
     }
 
     #[tokio::test]

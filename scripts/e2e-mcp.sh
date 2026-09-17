@@ -153,6 +153,31 @@ echo "8. server-side behavior"
 check "session pinned in audit log" grep -q "MCP session pinned" "${LOG}"
 check "tools/call audit-logged" grep -q "MCP tools/call issue_read" "${LOG}"
 
+# ── Optional: `obk mcp` stdio shim (Phase 3, #18) ────────────────────────
+# Runs when the obk binary is present (built via `cargo build` in ./obk).
+OBK_BIN="${OBK_BIN:-}"
+if [ -z "${OBK_BIN}" ] && [ -x ./obk/target/debug/obk ]; then
+  OBK_BIN=./obk/target/debug/obk
+fi
+if [ -n "${OBK_BIN}" ]; then
+  echo "8.5. obk mcp stdio shim (OCTOBROKER_KEY auth)"
+  # The e2e server runs network-trust mode (no [[mcp.agents]]), so the key
+  # is accepted-but-unchecked — this exercises stdio↔HTTP bridging, session
+  # capture, and SSE→NDJSON unwrapping.
+  printf '%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"obk-e2e","version":"0"}}}' \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+    | OCTOBROKER_URL="${BASE}" OCTOBROKER_KEY="e2e-shim-key" "${OBK_BIN}" mcp \
+    > "${WORKDIR}/shim-out.txt" 2> "${WORKDIR}/shim-err.txt" || true
+  sed -n '1p' "${WORKDIR}/shim-out.txt" > "${WORKDIR}/shim-init.json"
+  sed -n '2p' "${WORKDIR}/shim-out.txt" > "${WORKDIR}/shim-tools.json"
+  check "shim initialize response streamed" jq_ok '.result.capabilities' "${WORKDIR}/shim-init.json"
+  check "shim tools/list response streamed" \
+    jq_ok '.result.tools[] | select(.name == "issue_read")' "${WORKDIR}/shim-tools.json"
+else
+  echo "8.5. obk mcp shim skipped (obk binary not found — set OBK_BIN)"
+fi
+
 # ── Optional: GitHub App credential backend mode (2b) ────────────────────
 # Runs when App credentials are provided (CI passes the repo secrets).
 if [ -n "${APP_ID:-}" ] && [ -n "${APP_PRIVATE_KEY:-}" ]; then

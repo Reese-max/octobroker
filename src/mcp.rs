@@ -30,13 +30,12 @@ use axum::{
 };
 use std::sync::Arc;
 
+use crate::metrics::RequestResult;
 use crate::{pool, AppState};
 
 /// Max accepted request body (JSON-RPC frames are typically <10 KB).
 pub const MAX_BODY_BYTES: usize = 1_048_576;
 
-/// POST covers initialize/tools calls — bounded responses, generous ceiling.
-const POST_TIMEOUT_SECS: u64 = 120;
 /// DELETE is a small control-plane call.
 const DELETE_TIMEOUT_SECS: u64 = 30;
 
@@ -83,12 +82,21 @@ pub async fn mcp_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Phase 2a: agent authentication. With no [[mcp.agents]] configured this
-    // is Phase 1 network-trust mode (agent = None).
-    let agent = match authenticate(&state, &headers) {
+    let mut reqm = ReqMetric::new(method.as_str());
+
+    // Phase 2a/3 agent authentication: X-Octobroker-Key, or an
+    // X-Octobroker-Iam presigned STS proof when [mcp.iam] is configured.
+    // With no [[mcp.agents]] configured this is Phase 1 network-trust mode
+    // (agent = None).
+    let agent = match authenticate_any(&state, &headers).await {
         Ok(a) => a,
-        Err(resp) => return *resp,
+        Err((resp, reason)) => {
+            return reqm.deny(&state, reason, RequestResult::Denied, *resp);
+        }
     };
+    if let Some(a) = agent {
+        reqm.agent = a.id.clone();
+    }
 
     let session_id = headers
         .get("mcp-session-id")
@@ -97,7 +105,11 @@ pub async fn mcp_proxy(
 
     // Session termination without a session identifier is semantically invalid
     if method == Method::DELETE && session_id.is_none() {
-        return rpc_error(StatusCode::BAD_REQUEST, "Mcp-Session-Id header required");
+        return reqm.finish(
+            &state,
+            RequestResult::Rejected,
+            rpc_error(StatusCode::BAD_REQUEST, "Mcp-Session-Id header required"),
+        );
     }
 
     let agent_id = agent.map(|a| a.id.as_str());
@@ -106,9 +118,33 @@ pub async fn mcp_proxy(
     let frame = if method == Method::POST { parse_frame(&body) } else { None };
     let mut resolved_repo: Option<(String, String)> = None;
     if let Some(f) = &frame {
+        reqm.method = f.method.clone();
+        if let Some(t) = &f.tool {
+            reqm.tool = t.clone();
+        }
         if f.method == "tools/call" {
             resolved_repo = crate::policy::resolve_repo(f.arguments.as_ref());
         }
+    }
+
+    // Per-agent quota (Phase 3): token bucket checked before any policy or
+    // credential work so a noisy agent cannot consume upstream budget.
+    // Unauthenticated requests (Phase 1 mode) share the "-" bucket.
+    let rpm = agent
+        .and_then(|a| a.rate_limit_rpm)
+        .unwrap_or(state.config.mcp.default_rate_limit_rpm)
+        .min(u32::MAX as u64) as u32;
+    if let Err(retry_after) = state.mcp_ops.limiter.try_acquire(&reqm.agent, rpm) {
+        tracing::warn!(
+            "MCP request rate-limited: agent {} exceeded {} rpm",
+            reqm.agent, rpm
+        );
+        let mut resp = rpc_error(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
+        resp.headers_mut().insert(
+            "retry-after",
+            axum::http::HeaderValue::from(retry_after.max(1)),
+        );
+        return reqm.deny(&state, "quota", RequestResult::Rejected, resp);
     }
 
     // Policy enforcement for tools/call — before credential resolution, so
@@ -122,9 +158,14 @@ pub async fn mcp_proxy(
                         "MCP tools/call {} DENIED (not on allowlist) [agent={}]{}",
                         tool_name, agent.id, session_suffix(session_id.as_deref())
                     );
-                    return tool_call_denied(
-                        frame.rpc_id.as_ref(),
-                        "tool not permitted by agent policy",
+                    return reqm.deny(
+                        &state,
+                        "tool_not_allowed",
+                        RequestResult::Denied,
+                        tool_call_denied(
+                            frame.rpc_id.as_ref(),
+                            "tool not permitted by agent policy",
+                        ),
                     );
                 }
                 // 2. Write classification (unknown names → Write,
@@ -139,9 +180,14 @@ pub async fn mcp_proxy(
                         "MCP tools/call {} DENIED (write tools not enabled) [agent={}]{}",
                         tool_name, agent.id, session_suffix(session_id.as_deref())
                     );
-                    return tool_call_denied(
-                        frame.rpc_id.as_ref(),
-                        "write tools are not enabled",
+                    return reqm.deny(
+                        &state,
+                        "write_disabled",
+                        RequestResult::Denied,
+                        tool_call_denied(
+                            frame.rpc_id.as_ref(),
+                            "write tools are not enabled",
+                        ),
                     );
                 }
                 // 2b. Multi-installation mode: repo-less agents ride pooled
@@ -156,9 +202,14 @@ pub async fn mcp_proxy(
                         "MCP tools/call {} DENIED (repo-less agent uses pooled PATs) [agent={}]{}",
                         tool_name, agent.id, session_suffix(session_id.as_deref())
                     );
-                    return tool_call_denied(
-                        frame.rpc_id.as_ref(),
-                        "write tools require a repository-scoped agent",
+                    return reqm.deny(
+                        &state,
+                        "write_needs_repo_scope",
+                        RequestResult::Denied,
+                        tool_call_denied(
+                            frame.rpc_id.as_ref(),
+                            "write tools require a repository-scoped agent",
+                        ),
                     );
                 }
                 // 3. Repository allowlist (deny-if-unresolvable)
@@ -169,9 +220,14 @@ pub async fn mcp_proxy(
                                 "MCP tools/call {} DENIED (no resolvable repo target) [agent={}]{}",
                                 tool_name, agent.id, session_suffix(session_id.as_deref())
                             );
-                            return tool_call_denied(
-                                frame.rpc_id.as_ref(),
-                                "call has no resolvable repository target",
+                            return reqm.deny(
+                                &state,
+                                "repo_unresolvable",
+                                RequestResult::Denied,
+                                tool_call_denied(
+                                    frame.rpc_id.as_ref(),
+                                    "call has no resolvable repository target",
+                                ),
                             );
                         }
                         Some((owner, repo_name)) => {
@@ -181,9 +237,14 @@ pub async fn mcp_proxy(
                                     tool_name, owner, repo_name, agent.id,
                                     session_suffix(session_id.as_deref())
                                 );
-                                return tool_call_denied(
-                                    frame.rpc_id.as_ref(),
-                                    "repository not permitted by agent policy",
+                                return reqm.deny(
+                                    &state,
+                                    "repo_denied",
+                                    RequestResult::Denied,
+                                    tool_call_denied(
+                                        frame.rpc_id.as_ref(),
+                                        "repository not permitted by agent policy",
+                                    ),
                                 );
                             }
                         }
@@ -206,9 +267,14 @@ pub async fn mcp_proxy(
                 "MCP tools/call {} DENIED (local write tools require an authenticated write-enabled agent)",
                 local
             );
-            return tool_call_denied(
-                frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
-                "local write tools require an authenticated write-enabled agent",
+            return reqm.deny(
+                &state,
+                "local_gate",
+                RequestResult::Denied,
+                tool_call_denied(
+                    frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+                    "local write tools require an authenticated write-enabled agent",
+                ),
             );
         }
     }
@@ -222,11 +288,16 @@ pub async fn mcp_proxy(
         if method == Method::POST && frame_method == "initialize" && session_id.is_none() {
             let Some(agent) = agent else {
                 // Startup validation requires agents in multi mode, and
-                // authenticate() already rejected keyless requests.
-                return rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required");
+                // authenticate_any() already rejected keyless requests.
+                return reqm.finish(
+                    &state,
+                    RequestResult::Rejected,
+                    rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required"),
+                );
             };
             if !agent.repos.is_empty() {
-                return multi_initialize(&state, &headers, body, agent).await;
+                let resp = multi_initialize(&state, &headers, body, agent).await;
+                return reqm.finish(&state, result_from_status(resp.status()), resp);
             }
         }
         if let Some(sid) = session_id.as_deref() {
@@ -235,7 +306,7 @@ pub async fn mcp_proxy(
             {
                 if let Some(resp) = multi_fanout(&state, &method, &headers, &body, sid, agent).await
                 {
-                    return resp;
+                    return reqm.finish(&state, result_from_status(resp.status()), resp);
                 }
             }
         }
@@ -249,15 +320,35 @@ pub async fn mcp_proxy(
                 "MCP request rejected: unknown or expired session{}",
                 session_suffix(session_id.as_deref())
             );
-            return rpc_error(StatusCode::NOT_FOUND, "session not found or expired");
+            return reqm.deny(
+                &state,
+                "session_unknown",
+                RequestResult::Rejected,
+                rpc_error(StatusCode::NOT_FOUND, "session not found or expired"),
+            );
         }
         Err(StatusCode::FORBIDDEN) => {
-            return rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent");
+            return reqm.deny(
+                &state,
+                "session_binding",
+                RequestResult::Rejected,
+                rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent"),
+            );
         }
         Err(StatusCode::BAD_GATEWAY) => {
-            return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential unavailable");
+            return reqm.finish(
+                &state,
+                RequestResult::Error,
+                rpc_error(StatusCode::BAD_GATEWAY, "upstream credential unavailable"),
+            );
         }
-        Err(code) => return rpc_error(code, "no upstream identity available"),
+        Err(code) => {
+            return reqm.finish(
+                &state,
+                RequestResult::Error,
+                rpc_error(code, "no upstream identity available"),
+            );
+        }
     };
     let cred_label = cred.label();
 
@@ -316,9 +407,14 @@ pub async fn mcp_proxy(
                         "MCP write call rejected: agent {} at in-flight cap ({})",
                         aid, cap
                     );
-                    return rpc_error(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "agent write concurrency limit reached",
+                    return reqm.deny(
+                        &state,
+                        "inflight_cap",
+                        RequestResult::Rejected,
+                        rpc_error(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "agent write concurrency limit reached",
+                        ),
                     );
                 }
             }
@@ -341,9 +437,14 @@ pub async fn mcp_proxy(
             // FAIL-CLOSED: a write whose audit record cannot be persisted
             // must not happen.
             tracing::error!("audit unavailable — rejecting write call (fail-closed): {}", e);
-            return rpc_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "audit backend unavailable — write rejected",
+            return reqm.deny(
+                &state,
+                "audit_unavailable",
+                RequestResult::Error,
+                rpc_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "audit backend unavailable — write rejected",
+                ),
             );
         }
     }
@@ -384,7 +485,7 @@ pub async fn mcp_proxy(
                 tracing::error!("custom MCP tool result audit failed: {}", e);
             }
         }
-        return local.response;
+        return reqm.finish(&state, RequestResult::Local, local.response);
     }
 
     let upstream = state.config.mcp.upstream();
@@ -397,13 +498,21 @@ pub async fn mcp_proxy(
             .http
             .post(upstream)
             .body(reqwest::Body::from(body))
-            .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS)),
+            .timeout(std::time::Duration::from_secs(
+                state.config.mcp.upstream_timeout_secs,
+            )),
         Method::GET => state.http.get(&upstream),
         Method::DELETE => state
             .http
             .delete(upstream)
             .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS)),
-        _ => return rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+        _ => {
+            return reqm.finish(
+                &state,
+                RequestResult::Rejected,
+                rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+            );
+        }
     };
 
     let Some(mut upstream_headers) =
@@ -413,7 +522,11 @@ pub async fn mcp_proxy(
             "credential '{}' is not a valid header value — check secret source",
             cred_label
         );
-        return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential misconfigured");
+        return reqm.finish(
+            &state,
+            RequestResult::Error,
+            rpc_error(StatusCode::BAD_GATEWAY, "upstream credential misconfigured"),
+        );
     };
     // Multi-installation routing: every installation has its own upstream
     // session. Secondary routes replace the downstream session ID with their
@@ -423,7 +536,11 @@ pub async fn mcp_proxy(
         match upstream_session {
             Some(us) if Some(us.as_str()) != session_id.as_deref() => {
                 let Ok(v) = us.parse() else {
-                    return rpc_error(StatusCode::BAD_GATEWAY, "invalid upstream session id");
+                    return reqm.finish(
+                        &state,
+                        RequestResult::Error,
+                        rpc_error(StatusCode::BAD_GATEWAY, "invalid upstream session id"),
+                    );
                 };
                 upstream_headers.insert("mcp-session-id", v);
             }
@@ -434,11 +551,38 @@ pub async fn mcp_proxy(
         }
     }
 
-    let resp = match req.headers(upstream_headers).send().await {
+    let resp = match upstream_send(
+        &state,
+        UpstreamSend {
+            req,
+            headers: upstream_headers,
+        },
+    )
+    .await
+    {
         Ok(r) => r,
-        Err(e) => {
+        Err(UpstreamErr::Open(cooldown)) => {
+            tracing::warn!(
+                "MCP upstream circuit open — failing fast (cooldown {}s)",
+                cooldown
+            );
+            let mut resp = rpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream unavailable (circuit open)",
+            );
+            resp.headers_mut().insert(
+                "retry-after",
+                axum::http::HeaderValue::from(cooldown.max(1)),
+            );
+            return reqm.deny(&state, "circuit_open", RequestResult::Rejected, resp);
+        }
+        Err(UpstreamErr::Send(e)) => {
             tracing::error!("mcp upstream request failed: {}", e);
-            return rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed");
+            return reqm.finish(
+                &state,
+                RequestResult::Error,
+                rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed"),
+            );
         }
     };
 
@@ -535,21 +679,33 @@ pub async fn mcp_proxy(
                     agent.map(|a| a.tools.as_slice()),
                 )
                 .unwrap_or(bytes);
-                return builder
-                    .body(Body::from(body))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                return reqm.finish(
+                    &state,
+                    RequestResult::Forwarded,
+                    builder
+                        .body(Body::from(body))
+                        .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")),
+                );
             }
             Ok(BufferedBody::Overflow(head, rest)) => {
                 let head_stream = futures_util::stream::once(async move {
                     Ok::<_, reqwest::Error>(Bytes::from(head))
                 });
-                return builder
-                    .body(Body::from_stream(head_stream.chain(rest)))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                return reqm.finish(
+                    &state,
+                    RequestResult::Forwarded,
+                    builder
+                        .body(Body::from_stream(head_stream.chain(rest)))
+                        .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")),
+                );
             }
             Err(e) => {
                 tracing::error!("tools/list response read failed: {}", e);
-                return rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed");
+                return reqm.finish(
+                    &state,
+                    RequestResult::Error,
+                    rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed"),
+                );
             }
         }
     }
@@ -593,9 +749,13 @@ pub async fn mcp_proxy(
                     // The call already happened — cannot unwind. Loud error.
                     tracing::error!("audit result record failed (call already executed): {}", e);
                 }
-                return builder
-                    .body(Body::from(bytes))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                return reqm.finish(
+                    &state,
+                    RequestResult::Forwarded,
+                    builder
+                        .body(Body::from(bytes))
+                        .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")),
+                );
             }
             Ok(BufferedBody::Overflow(head, rest)) => {
                 // Oversize: outcome undeterminable; forward head + remainder
@@ -609,9 +769,13 @@ pub async fn mcp_proxy(
                 let head_stream = futures_util::stream::once(async move {
                     Ok::<_, reqwest::Error>(Bytes::from(head))
                 });
-                return builder
-                    .body(Body::from_stream(head_stream.chain(rest)))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                return reqm.finish(
+                    &state,
+                    RequestResult::Forwarded,
+                    builder
+                        .body(Body::from_stream(head_stream.chain(rest)))
+                        .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")),
+                );
             }
             Err(e) => {
                 tracing::error!("upstream body read failed mid-response: {}", e);
@@ -622,14 +786,180 @@ pub async fn mcp_proxy(
                 if let Err(e) = sink.record_result(&call, &outcome) {
                     tracing::error!("audit result record failed: {}", e);
                 }
-                return rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed");
+                return reqm.finish(
+                    &state,
+                    RequestResult::Error,
+                    rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed"),
+                );
             }
         }
     }
 
-    builder
-        .body(Body::from_stream(resp.bytes_stream()))
-        .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"))
+    reqm.finish(
+        &state,
+        RequestResult::Forwarded,
+        builder
+            .body(Body::from_stream(resp.bytes_stream()))
+            .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")),
+    )
+}
+
+/// Per-request metric context (Phase 3): populated as the request moves
+/// through authn/policy/quota/circuit, flushed at exactly one terminal point.
+struct ReqMetric {
+    agent: String,
+    method: String,
+    tool: String,
+}
+
+impl ReqMetric {
+    fn new(method: &str) -> Self {
+        Self {
+            agent: "-".to_string(),
+            method: method.to_string(),
+            tool: "-".to_string(),
+        }
+    }
+
+    /// Terminal metric: request counter + (for deny-classed results) the
+    /// denial counter, then the response.
+    fn finish(self, state: &AppState, result: RequestResult, resp: Response) -> Response {
+        state
+            .mcp_ops
+            .metrics
+            .request(&self.agent, &self.method, &self.tool, result);
+        resp
+    }
+
+    /// Denial path: both counters, with a stable reason class.
+    fn deny(
+        self,
+        state: &AppState,
+        reason: &str,
+        result: RequestResult,
+        resp: Response,
+    ) -> Response {
+        state
+            .mcp_ops
+            .metrics
+            .request(&self.agent, &self.method, &self.tool, result);
+        state.mcp_ops.metrics.denied(&self.agent, reason);
+        resp
+    }
+}
+
+/// Agent authentication: shared key or SigV4/STS identity proof.
+/// Returns the configured agent, `None` in network-trust mode (no agents),
+/// or a complete error response plus its metric denial reason.
+pub(crate) async fn authenticate_any<'a>(
+    state: &'a AppState,
+    headers: &HeaderMap,
+) -> Result<Option<&'a crate::config::McpAgentConfig>, (Box<Response>, &'static str)> {
+    // An explicit key header never falls through to the IAM path — an
+    // invalid key is a rejection, not a downgrade to a weaker mechanism.
+    if headers.contains_key("x-octobroker-key") {
+        return authenticate(state, headers).map_err(|r| (r, "authn_invalid"));
+    }
+    if let (Some(verifier), Some(proof)) = (
+        state.mcp_ops.iam.as_ref(),
+        headers.get(crate::iam::IAM_HEADER).and_then(|v| v.to_str().ok()),
+    ) {
+        match verifier.caller_identity(proof).await {
+            Ok(identity) => {
+                if let Some(agent) = state
+                    .config
+                    .mcp
+                    .agents
+                    .iter()
+                    .find(|a| crate::iam::arn_allowed(&a.iam_principals, &identity))
+                {
+                    return Ok(Some(agent));
+                }
+                tracing::warn!(
+                    "MCP IAM authn: caller {} matched no agent iam_principals",
+                    identity.arn
+                );
+                return Err((
+                    Box::new(rpc_error(
+                        StatusCode::UNAUTHORIZED,
+                        "IAM identity not authorized for any agent",
+                    )),
+                    "iam_invalid",
+                ));
+            }
+            Err(e) => {
+                tracing::warn!("MCP IAM authn rejected: {}", e);
+                return Err((
+                    Box::new(rpc_error(StatusCode::UNAUTHORIZED, "IAM proof rejected")),
+                    "iam_invalid",
+                ));
+            }
+        }
+    }
+    authenticate(state, headers).map_err(|r| (r, "authn_missing"))
+}
+
+/// Result class for the multi-installation helpers, which may return a
+/// relayed upstream response OR a locally generated error: 5xx is always
+/// an error (all their local failure paths are 5xx), 4xx counts as a
+/// rejection (local binding/method denials, or a relayed upstream client
+/// error), anything else was forwarded.
+fn result_from_status(status: StatusCode) -> RequestResult {
+    if status.is_server_error() {
+        RequestResult::Error
+    } else if status.is_client_error() {
+        RequestResult::Denied
+    } else {
+        RequestResult::Forwarded
+    }
+}
+
+/// One upstream call for the MCP path: circuit gate + latency/result-class
+/// metrics. All MCP upstream sends (main path, multi-app fan-out, cleanup)
+/// go through here so circuit and metrics accounting is uniform.
+struct UpstreamSend {
+    req: reqwest::RequestBuilder,
+    headers: HeaderMap,
+}
+
+enum UpstreamErr {
+    /// Circuit open; carries the `Retry-After` hint (seconds).
+    Open(u64),
+    /// Transport-level failure (DNS/connect/timeout/write).
+    Send(reqwest::Error),
+}
+
+async fn upstream_send(
+    state: &AppState,
+    send: UpstreamSend,
+) -> Result<reqwest::Response, UpstreamErr> {
+    if let Err(cooldown) = state.mcp_ops.circuit.check() {
+        return Err(UpstreamErr::Open(cooldown));
+    }
+    let started = std::time::Instant::now();
+    let result = send.req.headers(send.headers).send().await;
+    let secs = started.elapsed().as_secs_f64();
+    match &result {
+        Ok(resp) => {
+            state
+                .mcp_ops
+                .metrics
+                .upstream(crate::metrics::status_class(resp.status()), secs);
+            if resp.status().is_server_error() {
+                state.mcp_ops.circuit.record_failure();
+            } else {
+                // 4xx counts as availability success: the upstream is alive
+                // and answering — the failure is contractual, not sickness.
+                state.mcp_ops.circuit.record_success();
+            }
+        }
+        Err(e) => {
+            let class = if e.is_timeout() { "timeout" } else { "transport_error" };
+            state.mcp_ops.metrics.upstream(class, secs);
+            state.mcp_ops.circuit.record_failure();
+        }
+    }
+    result.map_err(UpstreamErr::Send)
 }
 
 /// Result of buffering an upstream response up to a byte cap.
@@ -853,7 +1183,9 @@ async fn execute_graphql(
         .header("user-agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
         .header("content-type", "application/json")
         .json(payload)
-        .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(
+            state.config.mcp.upstream_timeout_secs,
+        ))
         .send()
         .await
         .map_err(|error| {
@@ -1104,7 +1436,9 @@ async fn handle_commit_status_set(
         .header("accept", "application/vnd.github+json")
         .header("x-github-api-version", "2022-11-28")
         .json(&payload)
-        .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(
+            state.config.mcp.upstream_timeout_secs,
+        ))
         .send()
         .await
     {
@@ -1523,26 +1857,35 @@ async fn multi_initialize(
             )
             .await;
         };
-        let resp = match state
-            .http
-            .post(&upstream)
-            .headers(upstream_headers)
-            .body(reqwest::Body::from(body.clone()))
-            .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
-            .send()
-            .await
+        let resp = match upstream_send(
+            state,
+            UpstreamSend {
+                req: state
+                    .http
+                    .post(&upstream)
+                    .body(reqwest::Body::from(body.clone()))
+                    .timeout(std::time::Duration::from_secs(
+                        state.config.mcp.upstream_timeout_secs,
+                    )),
+                headers: upstream_headers,
+            },
+        )
+        .await
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("mcp upstream initialize failed for owner {}: {}", owner, e);
-                return abort_multi_initialize(
-                    state,
-                    &upstream,
-                    agent,
-                    &routes,
-                    rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed"),
-                )
-                .await;
+                let (msg, status) = match &e {
+                    UpstreamErr::Open(_) => (
+                        "upstream unavailable (circuit open)",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    ),
+                    UpstreamErr::Send(e) => {
+                        tracing::error!("mcp upstream initialize failed for owner {}: {}", owner, e);
+                        ("upstream request failed", StatusCode::BAD_GATEWAY)
+                    }
+                };
+                return abort_multi_initialize(state, &upstream, agent, &routes, rpc_error(status, msg))
+                    .await;
             }
         };
         if !resp.status().is_success() {
@@ -1706,22 +2049,32 @@ async fn abort_multi_initialize(
         };
         let Ok(v) = us.parse() else { continue };
         h.insert("mcp-session-id", v);
-        match state
-            .http
-            .delete(upstream)
-            .headers(h)
-            .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS))
-            .send()
-            .await
+        match upstream_send(
+            state,
+            UpstreamSend {
+                req: state
+                    .http
+                    .delete(upstream)
+                    .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS)),
+                headers: h,
+            },
+        )
+        .await
         {
             Ok(_) => tracing::info!(
                 "aborted initialize: cleaned up upstream session for owner {} [agent={}]",
                 owner, agent.id
             ),
-            Err(e) => tracing::warn!(
-                "aborted initialize: failed to clean up upstream session for owner {}: {}",
-                owner, e
-            ),
+            Err(e) => match &e {
+                UpstreamErr::Open(_) => tracing::warn!(
+                    "aborted initialize: cleanup skipped for owner {} (circuit open)",
+                    owner
+                ),
+                UpstreamErr::Send(e) => tracing::warn!(
+                    "aborted initialize: failed to clean up upstream session for owner {}: {}",
+                    owner, e
+                ),
+            },
         }
     }
     error_resp
@@ -1748,6 +2101,10 @@ async fn multi_fanout(
             agent.map(|a| a.id.as_str()),
             session_suffix(Some(downstream_sid))
         );
+        state
+            .mcp_ops
+            .metrics
+            .denied(agent.map(|a| a.id.as_str()).unwrap_or("-"), "session_binding");
         return Some(rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent"));
     }
     let PinnedCred::MultiApp { routes, primary } = &pin.cred else {
@@ -1773,7 +2130,9 @@ async fn multi_fanout(
                 .http
                 .post(&upstream)
                 .body(reqwest::Body::from(body.clone()))
-                .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
+                .timeout(std::time::Duration::from_secs(
+                    state.config.mcp.upstream_timeout_secs,
+                ))
         } else if *method == Method::DELETE {
             state
                 .http
@@ -1782,7 +2141,15 @@ async fn multi_fanout(
         } else {
             return Some(rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"));
         };
-        match req.headers(h).send().await {
+        match upstream_send(
+            state,
+            UpstreamSend {
+                req,
+                headers: h,
+            },
+        )
+        .await
+        {
             Ok(resp) => {
                 if owner == primary && primary_result.is_none() {
                     let status = StatusCode::from_u16(resp.status().as_u16())
@@ -1807,7 +2174,15 @@ async fn multi_fanout(
                 }
             }
             Err(e) => {
-                tracing::warn!("mcp multi fan-out to owner {} failed: {}", owner, e);
+                match &e {
+                    UpstreamErr::Open(_) => tracing::warn!(
+                        "mcp multi fan-out to owner {} skipped (circuit open)",
+                        owner
+                    ),
+                    UpstreamErr::Send(e) => {
+                        tracing::warn!("mcp multi fan-out to owner {} failed: {}", owner, e)
+                    }
+                }
             }
         }
     }
@@ -2011,6 +2386,7 @@ mod tests {
     use super::*;
     use crate::{cache, config};
     use axum::http::Request;
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     fn test_state(identity_ids: &[&str]) -> Arc<AppState> {
@@ -2029,6 +2405,8 @@ mod tests {
             tools: tools.iter().map(|s| s.to_string()).collect(),
             repos: Vec::new(),
             git_credentials_read_only: None,
+            iam_principals: Vec::new(),
+            rate_limit_rpm: None,
         }
     }
 
@@ -2080,6 +2458,10 @@ mod tests {
                     toolsets: toolsets.iter().map(|s| s.to_string()).collect(),
                     session_ttl_secs: 3600,
                     max_inflight_writes: 4,
+                    upstream_timeout_secs: 120,
+                    default_rate_limit_rpm: 0,
+                    iam: None,
+                    circuit_breaker: config::CircuitBreakerConfig::default(),
                     agents,
                     github_app: None,
                     github_apps: Vec::new(),
@@ -2093,6 +2475,62 @@ mod tests {
             multi_app_tokens: None,
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_ops: crate::McpOps::default(),
+        })
+    }
+
+    /// State with explicit MCP config — Phase-3 tests mutate the config;
+    /// ops (limiter/circuit/metrics/verifier) derive from the final config.
+    fn test_state_ops<F>(mutate: F) -> Arc<AppState>
+    where
+        F: FnOnce(&mut config::McpConfig),
+    {
+        let mut mcp_cfg = config::McpConfig {
+            enabled: true,
+            enable_writes: false,
+            enable_git_credentials: false,
+            git_credentials_read_only: false,
+            upstream: Some("http://unused.invalid".to_string()),
+            toolsets: vec![],
+            session_ttl_secs: 3600,
+            max_inflight_writes: 4,
+            upstream_timeout_secs: 120,
+            default_rate_limit_rpm: 0,
+            iam: None,
+            circuit_breaker: config::CircuitBreakerConfig::default(),
+            agents: vec![],
+            github_app: None,
+            github_apps: Vec::new(),
+            audit: None,
+        };
+        mutate(&mut mcp_cfg);
+        let ops = crate::McpOps::new(&mcp_cfg);
+        assemble_state(mcp_cfg, ops)
+    }
+
+    fn assemble_state(mcp_cfg: config::McpConfig, ops: crate::McpOps) -> Arc<AppState> {
+        let identities = vec![config::IdentityConfig {
+            id: "test".to_string(),
+            token: "fake".to_string(),
+        }];
+        Arc::new(AppState {
+            pool: pool::PatPool::new(&identities),
+            cache: cache::Cache::new(&config::CacheConfig::default()),
+            config: config::Config {
+                port: 8080,
+                identities,
+                allowed_owners: vec!["openabdev".to_string()],
+                cache: config::CacheConfig::default(),
+                mcp: mcp_cfg,
+            },
+            token_users: moka::future::Cache::builder().max_capacity(10).build(),
+            http: reqwest::Client::new(),
+            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+            app_tokens: None,
+            multi_app_tokens: None,
+            audit: None,
+            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_ops: ops,
         })
     }
 
@@ -2360,6 +2798,41 @@ data: "id":1,"result":{"tools":[]}}
             session: get("mcp-session-id"),
             body: body_str.clone(),
         });
+        // Phase-3 contract probes — body-keyword triggers, same convention
+        // as fail_500/make_it_fail (client headers never reach upstream).
+        if body_str.contains("mock_sleep2") {
+            // Response head arrives only after 2s — exceeds a 1s client
+            // POST timeout (the whole send() call fails, not just body).
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            return Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from("slow"))
+                .unwrap();
+        }
+        if body_str.contains("mock_drop_stream") {
+            // Mid-stream disconnect: headers + one chunk flushed, then the
+            // stream errors (100ms later so the client sees 200 first).
+            let stream = futures_util::stream::once(async {
+                Ok::<_, std::io::Error>(Bytes::from("event: message\ndata: {}\n\n"))
+            })
+            .chain(futures_util::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Err::<Bytes, _>(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom"))
+            }));
+            return Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap();
+        }
+        if body_str.contains("mock_429") {
+            return Response::builder()
+                .status(429)
+                .header("retry-after", "30")
+                .body(Body::from("throttled"))
+                .unwrap();
+        }
         if body_str.contains("fail_500") {
             return Response::builder()
                 .status(500)
@@ -3386,6 +3859,10 @@ data: "id":1,"result":{"tools":[]}}
                     toolsets: vec![],
                     session_ttl_secs: 3600,
                     max_inflight_writes: 4,
+                    upstream_timeout_secs: 120,
+                    default_rate_limit_rpm: 0,
+                    iam: None,
+                    circuit_breaker: config::CircuitBreakerConfig::default(),
                     agents: vec![],
                     github_app: None, // provider injected directly below
                     github_apps: Vec::new(),
@@ -3399,6 +3876,7 @@ data: "id":1,"result":{"tools":[]}}
             multi_app_tokens: None,
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_ops: crate::McpOps::default(),
         })
     }
 
@@ -3517,6 +3995,10 @@ data: "id":1,"result":{"tools":[]}}
                     toolsets: vec![],
                     session_ttl_secs: 3600,
                     max_inflight_writes: 4,
+                    upstream_timeout_secs: 120,
+                    default_rate_limit_rpm: 0,
+                    iam: None,
+                    circuit_breaker: config::CircuitBreakerConfig::default(),
                     agents: vec![],
                     github_app: None,
                     github_apps: Vec::new(),
@@ -3530,6 +4012,7 @@ data: "id":1,"result":{"tools":[]}}
             multi_app_tokens: None,
             audit: Some(sink),
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_ops: crate::McpOps::default(),
         })
     }
 
@@ -3709,6 +4192,10 @@ data: "id":1,"result":{"tools":[]}}
                     toolsets: vec![],
                     session_ttl_secs: 3600,
                     max_inflight_writes: max_inflight,
+                    upstream_timeout_secs: 120,
+                    default_rate_limit_rpm: 0,
+                    iam: None,
+                    circuit_breaker: config::CircuitBreakerConfig::default(),
                     agents,
                     github_app: None, // PAT creds acceptable for unit tests
                     github_apps: Vec::new(),
@@ -3722,6 +4209,7 @@ data: "id":1,"result":{"tools":[]}}
             multi_app_tokens: None,
             audit: Some(sink),
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_ops: crate::McpOps::default(),
         })
     }
 
@@ -4005,6 +4493,10 @@ data: "id":1,"result":{"tools":[]}}
                     toolsets: vec![],
                     session_ttl_secs: 3600,
                     max_inflight_writes: 4,
+                    upstream_timeout_secs: 120,
+                    default_rate_limit_rpm: 0,
+                    iam: None,
+                    circuit_breaker: config::CircuitBreakerConfig::default(),
                     agents,
                     github_app: None,
                     github_apps: entries,
@@ -4021,6 +4513,7 @@ data: "id":1,"result":{"tools":[]}}
             multi_app_tokens: Some(multi),
             audit: sink,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            mcp_ops: crate::McpOps::default(),
         })
     }
 
@@ -4476,5 +4969,490 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(records[1]["phase"], "result");
         assert_eq!(records[1]["tool_error"], false);
         std::fs::remove_file(&path).ok();
+    }
+
+    // ── Phase 3 (#18): quotas, circuit breaker, IAM authn, probes ──────
+
+    /// Fresh `YYYYMMDDTHHMMSSZ` so a structurally-valid proof isn't expired
+    /// (validation is real-time; signature content is verified by STS, not
+    /// us — a placeholder hex string is fine).
+    fn amz_now() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let days = secs / 86400;
+        let rem = secs % 86400;
+        let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        let z = days as i64 + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = (z - era * 146097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if mo <= 2 { y + 1 } else { y };
+        format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", y, mo, d, h, m, s)
+    }
+
+    fn live_proof_url() -> String {
+        let d = amz_now();
+        format!(
+            "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F{}%2Fus-east-1%2Fsts%2Faws4_request&X-Amz-Date={}&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature={}",
+            &d[..8],
+            d,
+            "a".repeat(64)
+        )
+    }
+
+    /// Agent state with a stub-STS IAM verifier pointed at `upstream_url`.
+    /// The fetch stub answers `caller_arn` and counts invocations (proof
+    /// caching is observable through the counter).
+    fn iam_test_state(
+        upstream_url: &str,
+        caller_arn: &str,
+    ) -> (Arc<AppState>, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let arn = caller_arn.to_string();
+        let fetch: crate::iam::FetchFn = std::sync::Arc::new(move |_proof| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let arn = arn.clone();
+            Box::pin(async move {
+                Ok(format!(
+                    "<GetCallerIdentityResponse><GetCallerIdentityResult><Arn>{}</Arn><UserId>AIDA</UserId><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>",
+                    arn
+                ))
+            })
+        });
+        let iam_cfg = config::IamConfig {
+            sts_regions: vec!["us-east-1".to_string()],
+            allow_global_sts: false,
+            max_expires_secs: 60,
+            fetch_timeout_secs: 10,
+        };
+        let mut mcp_cfg = config::McpConfig {
+            enabled: true,
+            upstream: Some(upstream_url.to_string()),
+            iam: Some(iam_cfg.clone()),
+            agents: vec![{
+                let mut a = agent("bot", "key-bot", &["issue_read", "list_issues"]);
+                a.iam_principals = vec!["arn:aws:iam::123456789012:role/agent-bot".to_string()];
+                a
+            }],
+            ..Default::default()
+        };
+        let _ = &mut mcp_cfg;
+        let mut ops = crate::McpOps::new(&mcp_cfg);
+        ops.iam = Some(crate::iam::IamVerifier::with_fetch(iam_cfg, fetch));
+        (assemble_state(mcp_cfg, ops), calls)
+    }
+
+    #[tokio::test]
+    async fn test_mcp_iam_authn_happy_path() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let (state, calls) =
+            iam_test_state(&url, "arn:aws:iam::123456789012:role/agent-bot");
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("x-octobroker-iam", &live_proof_url())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Upstream saw the agent's allowlist injected as X-MCP-Tools
+        assert_eq!(
+            captured.lock().unwrap()[0].tools_hdr.as_deref(),
+            Some("issue_read,list_issues")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_iam_authn_rejects_bad_proof() {
+        let (url, _) = spawn_mock_upstream().await;
+        let (state, calls) =
+            iam_test_state(&url, "arn:aws:iam::123456789012:role/agent-bot");
+        for bad in [
+            "not-a-url",
+            "http://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity", // plaintext
+            "https://sts.evil.example/?Action=GetCallerIdentity",
+        ] {
+            let resp = mcp_app(state.clone())
+                .oneshot(post_frame(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    &[("x-octobroker-iam", bad)],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{}", bad);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no STS call");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_iam_unknown_principal_rejected() {
+        let (url, _) = spawn_mock_upstream().await;
+        let (state, _) = iam_test_state(&url, "arn:aws:iam::123456789012:role/impostor");
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("x-octobroker-iam", &live_proof_url())],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_key_header_never_falls_through_to_iam() {
+        // A present-but-WRONG key must not silently downgrade to the IAM
+        // path even when a valid proof is attached.
+        let (url, _) = spawn_mock_upstream().await;
+        let (state, calls) =
+            iam_test_state(&url, "arn:aws:iam::123456789012:role/agent-bot");
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[
+                    ("x-octobroker-key", "wrong-key"),
+                    ("x-octobroker-iam", &live_proof_url()),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_iam_proof_cached_within_lifetime() {
+        let (url, _) = spawn_mock_upstream().await;
+        let (state, calls) =
+            iam_test_state(&url, "arn:aws:iam::123456789012:role/agent-bot");
+        let proof = live_proof_url();
+        for _ in 0..3 {
+            let resp = mcp_app(state.clone())
+                .oneshot(post_frame(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    &[("x-octobroker-iam", &proof)],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        // One STS verification across N requests on the same proof.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_agent_quota_429_and_retry_after() {
+        let (url, _) = spawn_mock_upstream().await;
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some(url);
+            cfg.default_rate_limit_rpm = 1; // burst 1, ~1 refill/min
+        });
+        let app = mcp_app(state);
+        let first = app
+            .clone()
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = app
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = second
+            .headers()
+            .get("retry-after")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!((1..=60).contains(&retry), "retry-after {}", retry);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_per_agent_quota_override() {
+        // Per-agent rate_limit_rpm overrides the global default.
+        let (url, _) = spawn_mock_upstream().await;
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some(url);
+            cfg.default_rate_limit_rpm = 100;
+            let mut tight = agent("tight", "key-tight", &["issue_read"]);
+            tight.rate_limit_rpm = Some(1); // burst 1
+            cfg.agents = vec![tight, agent("loose", "key-loose", &["issue_read"])];
+        });
+        let app = mcp_app(state);
+        // First call for "tight" spends the burst…
+        app.clone()
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("x-octobroker-key", "key-tight")],
+            ))
+            .await
+            .unwrap();
+        // …second is rate-limited…
+        let r = app
+            .clone()
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                &[("x-octobroker-key", "key-tight")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        // …while "loose" inherits the 100-rpm default and is unaffected.
+        let r2 = app
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+                &[("x-octobroker-key", "key-loose")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_circuit_recovers_after_cooldown() {
+        let (url, _) = spawn_mock_upstream().await;
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some(url);
+            cfg.circuit_breaker = config::CircuitBreakerConfig {
+                failure_threshold: 1,
+                cooldown_secs: 1,
+            };
+        });
+        let app = mcp_app(state.clone());
+        // Trip the breaker.
+        let r = app
+            .clone()
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fail_500","arguments":{}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.mcp_ops.circuit.is_open());
+        // After cooldown a probe flows through; success closes it again.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let r2 = app
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert!(!state.mcp_ops.circuit.is_open());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_upstream_5xx_trips_circuit() {
+        let (url, _) = spawn_mock_upstream().await;
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some(url);
+            cfg.circuit_breaker = config::CircuitBreakerConfig {
+                failure_threshold: 1,
+                cooldown_secs: 30,
+            };
+        });
+        let app = mcp_app(state.clone());
+        // One upstream 5xx trips the breaker…
+        let r1 = app
+            .clone()
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fail_500","arguments":{}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // …next request fails fast without touching upstream.
+        let r2 = app
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry: u64 = r2
+            .headers()
+            .get("retry-after")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=30).contains(&retry), "retry-after {}", retry);
+        assert!(state.mcp_ops.circuit.is_open());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_upstream_4xx_does_not_trip_circuit() {
+        let (url, _) = spawn_mock_upstream().await;
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some(url);
+            cfg.circuit_breaker = config::CircuitBreakerConfig {
+                failure_threshold: 1,
+                cooldown_secs: 30,
+            };
+        });
+        let app = mcp_app(state.clone());
+        let r = app
+            .clone()
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mock_429","arguments":{}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Upstream 4xx = alive-but-rejecting, not sickness.
+        assert!(!state.mcp_ops.circuit.is_open());
+        let r2 = app
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_post_respects_configured_timeout() {
+        let (url, _) = spawn_mock_upstream().await;
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some(url);
+            cfg.upstream_timeout_secs = 1;
+        });
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mock_sleep2","arguments":{}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // Timeout is an upstream failure — the circuit counts it.
+        let text = state.mcp_ops.metrics.render(0, state.mcp_ops.circuit.is_open());
+        assert!(text.contains(r#"result="timeout""#), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_upstream_early_disconnect_returns_502() {
+        // Nothing listens on 127.0.0.1:1 — connection refused at connect.
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some("http://127.0.0.1:1".to_string());
+        });
+        let resp = mcp_app(state)
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_midstream_disconnect_does_not_hang() {
+        // Upstream delivers headers + one SSE chunk, then the stream dies.
+        // The client sees 200 + a partial body (or a propagated body error)
+        // — never a hang.
+        let (url, _) = spawn_mock_upstream().await;
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some(url);
+        });
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mock_drop_stream","arguments":{}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Body collection completes (partial) or errors — both are fine,
+        // the point is termination rather than a hang. oneshot's body is
+        // already materialized for axum test service, so just read it.
+        let collected = resp.into_body().collect().await;
+        match collected {
+            Ok(b) => {
+                let bytes = b.to_bytes();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(text.contains("data: {}"), "partial body: {}", text);
+            }
+            Err(e) => {
+                assert!(e.to_string().contains("error"), "{}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mcp_responses_never_cached() {
+        // MCP responses are agent/session-scoped — they must never enter the
+        // REST response cache (a cache hit would cross identity boundaries).
+        let (url, _) = spawn_mock_upstream().await;
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some(url);
+        });
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            state.cache.stats().entries,
+            0,
+            "MCP responses must not enter the REST cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_population_flow() {
+        let (url, _) = spawn_mock_upstream().await;
+        let state = test_state_ops(|cfg| {
+            cfg.upstream = Some(url);
+        });
+        let app = mcp_app(state.clone());
+        // One forwarded request…
+        app.clone()
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        // …and one policy denial (agents configured → keyless = 401).
+        app.oneshot(post_frame(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+        let text = state
+            .mcp_ops
+            .metrics
+            .render(state.mcp_sessions.entry_count(), state.mcp_ops.circuit.is_open());
+        assert!(
+            text.contains(r#"agent="-",method="tools/list",tool="-",result="forwarded"#),
+            "{}",
+            text
+        );
+        assert!(text.contains(r#"result="2xx""#), "{}", text);
+        assert!(text.contains("octobroker_mcp_sessions 0"), "{}", text);
+        assert!(text.contains("octobroker_mcp_circuit_open 0"), "{}", text);
+    }
+
+    #[tokio::test]
+    async fn test_multi_initialize_uses_circuit_gate() {
+        // Multi-app init fans out through upstream_send too — a dead
+        // upstream means the first failure is a real send error, and the
+        // circuit counts it.
+        let state = test_state_multi("http://127.0.0.1:1", false, None).await;
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b0")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // The circuit counted a real upstream failure.
+        assert!(state.mcp_ops.circuit.is_open() || {
+            let text = state.mcp_ops.metrics.render(0, false);
+            text.contains(r#"result="transport_error""#)
+        });
     }
 }

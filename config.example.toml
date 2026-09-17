@@ -68,6 +68,19 @@ enabled = false
 # git_credentials_read_only = false
 # Max concurrent write calls per agent (0 = unlimited).
 # max_inflight_writes = 4
+# ── Phase 3 (#18): operational hardening ─────────────────────────────
+# Timeout for upstream POST calls (initialize/tools). GET streams are
+# unbounded (long-lived resumable); DELETE uses its own short timeout.
+# upstream_timeout_secs = 120
+# Default per-agent request budget, requests/minute (token bucket, burst =
+# the rpm value). 0 = unlimited. Per-agent `rate_limit_rpm` overrides.
+# default_rate_limit_rpm = 0
+# Upstream circuit breaker: after `failure_threshold` consecutive upstream
+# transport errors/5xx, calls fail fast (503 + Retry-After) for
+# `cooldown_secs`, then one probe is allowed through. 0 = disabled.
+# [mcp.circuit_breaker]
+# failure_threshold = 5
+# cooldown_secs = 30
 # Upstream MCP endpoint. Default: hosted read-only variant, or the full
 # surface when enable_writes is set.
 # upstream = "https://api.githubcopilot.com/mcp/readonly"
@@ -133,11 +146,32 @@ enabled = false
 # once): add the new key, roll agents over, remove the old key.
 # Sessions are bound to the agent that initialized them — a session ID
 # presented by a different agent is rejected (403).
+#
+# SECRETLESS IAM AUTHENTICATION (Phase 3, #18): an agent may instead (or
+# additionally) present `X-Octobroker-Iam` — a presigned
+# sts:GetCallerIdentity URL (SigV4, ≤60s lifetime, `host` signed header
+# only, `UNSIGNED-PAYLOAD`). octobroker executes it over TLS, extracts the
+# caller ARN, and maps it to an agent via `iam_principals`. Entry forms:
+# exact ARN, `prefix*` trailing wildcard, or a bare 12-digit account id
+# (matches any principal in that account). Assumed-role ARNs match their
+# canonical role ARN. Requires [mcp.iam] to be configured — agents with
+# iam_principals but no [mcp.iam] fail startup (fail closed).
+# [mcp.iam]
+# sts_regions = ["us-east-1", "eu-west-1"]   # allowed STS endpoints
+# allow_global_sts = true                    # sts.amazonaws.com too
+# max_expires_secs = 60                      # proof lifetime cap (hard max 60)
+# fetch_timeout_secs = 10                    # STS verification call timeout
 # [[mcp.agents]]
 # id = "openab-bot"
 # key = "aws:secretsmanager:octobroker/mcp-keys:openab"   # or env:OCTOBROKER_KEY_OPENAB
 # # keys = ["env:OCTOBROKER_KEY_OPENAB", "env:OCTOBROKER_KEY_OPENAB_NEXT"]  # rotation
+# # Secretless: principals whose sts:GetCallerIdentity ARN may act as this
+# # agent. Client side: `obk mcp` signs with ambient AWS creds automatically.
+# # iam_principals = ["arn:aws:iam::123456789012:role/openab-bot"]
 # tools = ["issue_read", "list_issues", "pull_request_read"]
+# # Per-agent rate quota, requests/minute (0/unset = use
+# # default_rate_limit_rpm). Excess → 429 + Retry-After.
+# # rate_limit_rpm = 120
 # # Repository allowlist: "owner/repo" exact or "owner/*" wildcard.
 # # Non-empty = every tools/call must resolve to a listed repo from its
 # # arguments; calls with no repo target (e.g. search_code, get_me) are

@@ -100,6 +100,21 @@ pub struct McpConfig {
     /// Max concurrent write calls per agent (in-flight cap). 0 = unlimited.
     #[serde(default = "default_mcp_max_inflight_writes")]
     pub max_inflight_writes: usize,
+    /// Timeout for upstream MCP POST calls (initialize/tools). GET streams
+    /// are unbounded (long-lived resumable); DELETE uses a short timeout.
+    #[serde(default = "default_mcp_upstream_timeout")]
+    pub upstream_timeout_secs: u64,
+    /// Default per-agent request quota in requests/minute (token bucket;
+    /// burst = the rate). 0 = unlimited. Per-agent `rate_limit_rpm` wins.
+    #[serde(default)]
+    pub default_rate_limit_rpm: u64,
+    /// SigV4/STS identity-proof agent authentication (Phase 3, #18).
+    /// Required when any agent sets `iam_principals`.
+    #[serde(default)]
+    pub iam: Option<IamConfig>,
+    /// Upstream circuit breaker (Phase 3, #18).
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
     /// Per-agent authentication + default-deny tool allowlists (Phase 2a).
     /// Empty = Phase 1 network-trust mode (no agent authn on /mcp).
     /// Non-empty = every /mcp request must present a valid X-Octobroker-Key.
@@ -136,6 +151,50 @@ pub struct AuditConfig {
 
 fn default_audit_max_result_bytes() -> usize {
     4 * 1024 * 1024
+}
+
+/// Secretless IAM authentication for MCP agents (Phase 3, #18).
+/// Agents present `X-Octobroker-Iam`: a presigned `sts:GetCallerIdentity`
+/// URL which octobroker executes (TLS-only, host-allowlisted) to resolve
+/// the caller's ARN, matched against each agent's `iam_principals`.
+#[derive(Clone, Deserialize)]
+pub struct IamConfig {
+    /// Allowed STS endpoint regions — proofs may only target
+    /// `sts.<region>.amazonaws.com` for listed regions.
+    #[serde(default)]
+    pub sts_regions: Vec<String>,
+    /// Also allow the global `sts.amazonaws.com` endpoint.
+    #[serde(default)]
+    pub allow_global_sts: bool,
+    /// Maximum accepted `X-Amz-Expires` on proofs. Hard-bounded at 60s —
+    /// identity proofs are single-purpose and short-lived.
+    #[serde(default = "default_iam_max_expires")]
+    pub max_expires_secs: u64,
+    /// Timeout for the outbound STS verification call.
+    #[serde(default = "default_iam_fetch_timeout")]
+    pub fetch_timeout_secs: u64,
+}
+
+/// Upstream circuit breaker for the hosted MCP endpoint (Phase 3, #18).
+#[derive(Clone, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Consecutive upstream failures (transport error or 5xx) that open
+    /// the circuit. 0 = disabled.
+    #[serde(default = "default_circuit_threshold")]
+    pub failure_threshold: u32,
+    /// Open-state dwell before a half-open probe; also the `Retry-After`
+    /// hint returned while the circuit is open.
+    #[serde(default = "default_circuit_cooldown")]
+    pub cooldown_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: default_circuit_threshold(),
+            cooldown_secs: default_circuit_cooldown(),
+        }
+    }
 }
 
 /// GitHub App credentials for the MCP path.
@@ -204,6 +263,16 @@ pub struct McpAgentConfig {
     /// agent-controlled.
     #[serde(default)]
     pub git_credentials_read_only: Option<bool>,
+    /// IAM principals authorized to act as this agent via
+    /// `X-Octobroker-Iam` proofs (Phase 3): exact ARNs, `prefix*` trailing
+    /// wildcards, or bare 12-digit account ids (any principal in that
+    /// account). Assumed-role callers match their canonical role ARN.
+    #[serde(default)]
+    pub iam_principals: Vec<String>,
+    /// Per-agent request quota in requests/minute; overrides
+    /// `[mcp] default_rate_limit_rpm`. Unset = inherit.
+    #[serde(default)]
+    pub rate_limit_rpm: Option<u64>,
 }
 
 impl Default for McpConfig {
@@ -217,6 +286,10 @@ impl Default for McpConfig {
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),
             max_inflight_writes: default_mcp_max_inflight_writes(),
+            upstream_timeout_secs: default_mcp_upstream_timeout(),
+            default_rate_limit_rpm: 0,
+            iam: None,
+            circuit_breaker: CircuitBreakerConfig::default(),
             agents: Vec::new(),
             github_app: None,
             github_apps: Vec::new(),
@@ -291,6 +364,43 @@ impl McpConfig {
                 return Err("enable_git_credentials with [mcp.github_app] requires `owner` — explicit installation IDs are verified against this owner before issuance".into());
             }
         }
+        // IAM authentication requires [mcp.iam] — an agent that lists
+        // iam_principals without it could never authenticate; fail at
+        // startup rather than at request time.
+        for agent in &self.agents {
+            if !agent.iam_principals.is_empty() && self.iam.is_none() {
+                return Err(format!(
+                    "mcp agent '{}' sets iam_principals but [mcp.iam] is not configured — IAM authentication is disabled",
+                    agent.id
+                ));
+            }
+        }
+        if let Some(iam) = &self.iam {
+            if iam.max_expires_secs == 0 || iam.max_expires_secs > 60 {
+                return Err(
+                    "[mcp.iam] max_expires_secs must be 1..=60 — identity proofs are short-lived"
+                        .into(),
+                );
+            }
+            for region in &iam.sts_regions {
+                if region.is_empty()
+                    || !region
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                {
+                    return Err(format!(
+                        "[mcp.iam] sts_regions entry '{}' is not a valid AWS region name",
+                        region
+                    ));
+                }
+            }
+        }
+        if self.circuit_breaker.failure_threshold > 0 && self.circuit_breaker.cooldown_secs == 0 {
+            return Err(
+                "[mcp.circuit_breaker] cooldown_secs must be > 0 when the breaker is enabled"
+                    .into(),
+            );
+        }
         // Mutual exclusion: singular and plural forms cannot coexist
         if self.github_app.is_some() && !self.github_apps.is_empty() {
             return Err("[mcp.github_app] and [[mcp.github_apps]] are mutually exclusive — use one or the other".into());
@@ -361,6 +471,11 @@ fn default_mcp_upstream() -> String {
 }
 fn default_mcp_session_ttl() -> u64 { 3600 }
 fn default_mcp_max_inflight_writes() -> usize { 4 }
+fn default_mcp_upstream_timeout() -> u64 { 120 }
+fn default_iam_max_expires() -> u64 { 60 }
+fn default_iam_fetch_timeout() -> u64 { 10 }
+fn default_circuit_threshold() -> u32 { 5 }
+fn default_circuit_cooldown() -> u64 { 30 }
 
 fn default_port() -> u16 { 8080 }
 fn default_max_entries() -> u64 { 10000 }
@@ -472,8 +587,11 @@ impl Config {
             for k in &agent.keys {
                 resolved.push(resolve_secret(k).await);
             }
-            if resolved.is_empty() {
-                panic!("mcp agent '{}' has no key/keys configured", agent.id);
+            if resolved.is_empty() && agent.iam_principals.is_empty() {
+                panic!(
+                    "mcp agent '{}' has no key/keys or iam_principals configured",
+                    agent.id
+                );
             }
             agent.keys = resolved;
         }
@@ -667,6 +785,8 @@ mod tests {
         m.agents.push(McpAgentConfig {
             id: "a".into(), key: None, keys: vec!["k".into()], tools: vec![], repos: vec![],
             git_credentials_read_only: None,
+            iam_principals: Vec::new(),
+            rate_limit_rpm: None,
         });
         assert!(m.validate().unwrap_err().contains("github_app"));
         m.github_app = Some(GithubAppConfig {
@@ -708,6 +828,8 @@ mod tests {
                 tools: vec![],
                 repos: repos.iter().map(|s| s.to_string()).collect(),
                 git_credentials_read_only: None,
+                iam_principals: Vec::new(),
+                rate_limit_rpm: None,
             }
         }
 
@@ -826,6 +948,8 @@ mod tests {
                 tools: vec![],
                 repos: vec!["openabdev/openab".into()],
                 git_credentials_read_only: None,
+                iam_principals: Vec::new(),
+                rate_limit_rpm: None,
             }
         }
         fn audit() -> Option<AuditConfig> {
@@ -902,5 +1026,124 @@ mod tests {
             ..Default::default()
         };
         assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_iam_gate_and_bounds() {
+        // iam_principals without [mcp.iam] → fail closed at startup.
+        let mut a = McpAgentConfig {
+            id: "bot".into(),
+            key: None,
+            keys: vec!["k".into()],
+            tools: vec![],
+            repos: vec![],
+            git_credentials_read_only: None,
+            iam_principals: vec![],
+            rate_limit_rpm: None,
+        };
+        a.iam_principals = vec!["arn:aws:iam::123456789012:role/bot".into()];
+        let m = McpConfig {
+            agents: vec![a.clone()],
+            iam: None,
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("mcp.iam"));
+
+        // With [mcp.iam] configured, it validates.
+        let m = McpConfig {
+            agents: vec![a],
+            iam: Some(IamConfig {
+                sts_regions: vec!["us-east-1".into()],
+                allow_global_sts: true,
+                max_expires_secs: 60,
+                fetch_timeout_secs: 10,
+            }),
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
+
+        // max_expires_secs is hard-bounded at 60.
+        for bad in [0u64, 61, 3600] {
+            let m = McpConfig {
+                iam: Some(IamConfig {
+                    sts_regions: vec![],
+                    allow_global_sts: false,
+                    max_expires_secs: bad,
+                    fetch_timeout_secs: 10,
+                }),
+                ..Default::default()
+            };
+            assert!(m.validate().is_err(), "expires={}", bad);
+        }
+
+        // Region names must look like AWS regions.
+        let m = McpConfig {
+            iam: Some(IamConfig {
+                sts_regions: vec!["not a region".into(), "UPPER".into()],
+                allow_global_sts: false,
+                max_expires_secs: 60,
+                fetch_timeout_secs: 10,
+            }),
+            ..Default::default()
+        };
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn test_mcp_circuit_breaker_defaults_and_validation() {
+        let c = CircuitBreakerConfig::default();
+        assert_eq!(c.failure_threshold, 5);
+        assert_eq!(c.cooldown_secs, 30);
+
+        // Cooldown must be positive when enabled.
+        let m = McpConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 5,
+                cooldown_secs: 0,
+            },
+            ..Default::default()
+        };
+        assert!(m.validate().is_err());
+        // Disabled breaker (threshold 0) permits any cooldown value.
+        let m = McpConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 0,
+                cooldown_secs: 0,
+            },
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_quota_and_iam_toml_roundtrip() {
+        let raw: RawConfig = toml::from_str(
+            r##"
+allowed_owners = ["openabdev"]
+[[identities]]
+id = "a"
+token = "x"
+[mcp]
+enabled = true
+default_rate_limit_rpm = 60
+[mcp.iam]
+sts_regions = ["us-east-1", "eu-west-1"]
+allow_global_sts = true
+[[mcp.agents]]
+id = "bot"
+iam_principals = ["arn:aws:iam::123456789012:role/bot", "123456789012"]
+rate_limit_rpm = 120
+tools = ["issue_read"]
+"##,
+        )
+        .unwrap();
+        let m = &raw.mcp;
+        assert_eq!(m.default_rate_limit_rpm, 60);
+        let iam = m.iam.as_ref().unwrap();
+        assert_eq!(iam.sts_regions, vec!["us-east-1", "eu-west-1"]);
+        assert!(iam.allow_global_sts);
+        assert_eq!(m.agents[0].rate_limit_rpm, Some(120));
+        assert_eq!(m.agents[0].iam_principals.len(), 2);
+        // Keyless + iam_principals survives normalization (no panic).
     }
 }

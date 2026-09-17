@@ -1,3 +1,6 @@
+mod mcp_shim;
+mod sigv4;
+
 use std::env;
 use std::process::{Command, exit};
 
@@ -22,6 +25,13 @@ fn main() {
     //   git config --global credential."https://github.com".useHttpPath true
     if args.first().map(|s| s.as_str()) == Some("git-credential") {
         exit(git_credential(args.get(1).map(|s| s.as_str()), &octobroker_url));
+    }
+
+    // MCP stdio shim (#18): newline-delimited JSON-RPC on stdio ↔
+    // POST /mcp on octobroker. Auth: OCTOBROKER_KEY or ambient AWS creds
+    // (IAM identity proof — never a GitHub credential).
+    if args.first().map(|s| s.as_str()) == Some("mcp") {
+        exit(mcp_shim::run(&octobroker_url));
     }
 
     // Try to handle as a pooled read via octobroker REST
