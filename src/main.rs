@@ -56,13 +56,21 @@ async fn main() {
     let pool = pool::PatPool::new(&config.identities);
     let cache = cache::Cache::new(&config.cache);
 
+    // GitHub API base for the App credential backend (installation
+    // resolution, token mints, repo checks) — overridable for GitHub
+    // Enterprise Server deployments and tests; default api.github.com.
+    let github_api_base = std::env::var("OCTOBROKER_GITHUB_API_BASE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_string());
+
     let app_tokens = config.mcp.github_app.as_ref().map(|app| {
         app_token::AppTokenProvider::new(
             app.app_id.clone(),
             &app.private_key,
             app.installation_id,
             app.owner.clone(),
-            "https://api.github.com".to_string(),
+            github_api_base.clone(),
         )
         .expect("invalid [mcp.github_app] config")
     });
@@ -71,11 +79,9 @@ async fn main() {
     }
 
     let multi_app_tokens = if !config.mcp.github_apps.is_empty() {
-        let provider = app_token::MultiAppTokenProvider::new(
-            &config.mcp.github_apps,
-            "https://api.github.com".to_string(),
-        )
-        .expect("invalid [[mcp.github_apps]] config");
+        let provider =
+            app_token::MultiAppTokenProvider::new(&config.mcp.github_apps, github_api_base.clone())
+                .expect("invalid [[mcp.github_apps]] config");
         tracing::info!(
             "MCP credential backend: multi-app mode ({} owners)",
             config.mcp.github_apps.len()

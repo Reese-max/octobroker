@@ -102,7 +102,7 @@ impl AppTokenProvider {
             encoding_key,
             installation_id: Mutex::new(installation_id),
             owner,
-            api_base,
+            api_base: api_base.trim_end_matches('/').to_string(),
             http: reqwest::Client::builder()
                 .timeout(MINT_TIMEOUT)
                 .build()
@@ -343,6 +343,86 @@ impl AppTokenProvider {
         Ok(())
     }
 
+    /// Whether the repository's default branch is protected by a ruleset or
+    /// classic branch protection (#49 `require_protected_default_branch`):
+    /// `GET /repos/{owner}/{repo}` → `default_branch`, then
+    /// `GET /repos/{owner}/{repo}/branches/{default}` → `protected`. A
+    /// Contents-scoped token is repo-wide — it can push to `main` as freely
+    /// as to a feature branch — so GitHub-side enforcement is the only ref
+    /// boundary; this check refuses credentials for repos that lack it.
+    ///
+    /// The reads ride a repo-scoped `contents:read` installation token —
+    /// the least-privilege envelope, never the App's full permissions. A
+    /// missing `protected` field is treated as unprotected. Errors are
+    /// never mapped to "unprotected": callers must fail closed on Err.
+    ///
+    /// Preconditions: `owner`/`repo` are interpolated into request URLs
+    /// verbatim — callers must pass GitHub-charset-validated values (the
+    /// /git-credential handler enforces this). `protected` reflects rulesets
+    /// as well as classic branch protection on current GitHub; if that ever
+    /// regressed, the check fails closed (denies, not bypasses).
+    pub async fn default_branch_protected(&self, owner: &str, repo: &str) -> Result<bool, String> {
+        #[derive(Deserialize)]
+        struct RepoMeta {
+            default_branch: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct BranchMeta {
+            protected: Option<bool>,
+        }
+
+        let token = self.token_git(repo, true).await?;
+        let meta: RepoMeta = self
+            .get_json(
+                &format!("{}/repos/{}/{}", self.api_base, owner, repo),
+                &token.token,
+            )
+            .await?;
+        let default = meta
+            .default_branch
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| format!("repository {}/{} has no default branch", owner, repo))?;
+        // Branch names may contain '/': push onto the URL's path segments so
+        // the name is percent-encoded instead of splitting the path.
+        let mut url = reqwest::Url::parse(&format!(
+            "{}/repos/{}/{}/branches",
+            self.api_base, owner, repo
+        ))
+        .map_err(|e| format!("invalid api base url: {}", e))?;
+        url.path_segments_mut()
+            .map_err(|_| "invalid api base url".to_string())?
+            .push(&default);
+        let branch: BranchMeta = self.get_json(url.as_str(), &token.token).await?;
+        Ok(branch.protected.unwrap_or(false))
+    }
+
+    /// GET a JSON endpoint with an installation token; Err on transport
+    /// failure, non-2xx status, or an unparseable body.
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        token: &str,
+    ) -> Result<T, String> {
+        let resp = self
+            .http
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header(
+                "User-Agent",
+                concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+            )
+            .send()
+            .await
+            .map_err(|e| format!("GET {} failed: {}", url, e))?;
+        if !resp.status().is_success() {
+            return Err(format!("GET {} returned {}", url, resp.status()));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("GET {} response parse failed: {}", url, e))
+    }
+
     async fn resolve_installation(&self, jwt: &str) -> Result<u64, String> {
         if let Some(id) = *self.installation_id.lock().unwrap() {
             return Ok(id);
@@ -488,6 +568,19 @@ pub(crate) mod tests {
                 .err()
                 .unwrap();
         assert!(err.contains("invalid GitHub App private key"));
+    }
+
+    #[test]
+    fn test_new_normalizes_api_base_trailing_slash() {
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(1),
+            None,
+            "http://x/".into(),
+        )
+        .unwrap();
+        assert_eq!(p.api_base, "http://x");
     }
 
     #[test]

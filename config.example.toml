@@ -66,6 +66,14 @@ enabled = false
 # per agent: a `git_credentials_read_only` key on an [[mcp.agents]] entry
 # wins over this global default, in either direction (see below).
 # git_credentials_read_only = false
+# Require the target repo's DEFAULT BRANCH to be protected (ruleset or
+# classic branch protection) before issuing a push-capable git credential.
+# A Contents token is repo-wide — GitHub-side enforcement is the only ref
+# boundary — so this keeps push-capable tokens out of repos where an agent
+# could push straight to the default branch. Verified with a repo-scoped
+# contents:read read before minting; unverifiable status fails closed.
+# Read-only issuance is unaffected (contents:read cannot push to any ref).
+# require_protected_default_branch = false
 # Max concurrent write calls per agent (0 = unlimited).
 # max_inflight_writes = 4
 # Upstream MCP endpoint. Default: hosted read-only variant, or the full

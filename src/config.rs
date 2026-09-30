@@ -86,6 +86,18 @@ pub struct McpConfig {
     /// target repositories. Default false (push-capable, unchanged behavior).
     #[serde(default)]
     pub git_credentials_read_only: bool,
+    /// Ref-level push policy (#49): when true, /git-credential verifies the
+    /// target repository's default branch is protected (ruleset or classic
+    /// branch protection) BEFORE minting a push-capable credential, and
+    /// refuses when it is not — the token's Contents scope is repo-wide, so
+    /// GitHub-side enforcement is the only ref boundary a push-capable token
+    /// respects (e.g. a ruleset requiring PRs into the default branch keeps
+    /// an agent from pushing straight to it). The check is a read via a
+    /// repo-scoped `contents:read` installation token; an unverifiable
+    /// status fails closed. Read-only issuance is unaffected — a
+    /// `contents:read` token cannot push to any ref. Default false.
+    #[serde(default)]
+    pub require_protected_default_branch: bool,
     /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant,
     /// or the full write-capable surface when enable_writes is set.
     #[serde(default)]
@@ -213,6 +225,7 @@ impl Default for McpConfig {
             enable_writes: false,
             enable_git_credentials: false,
             git_credentials_read_only: false,
+            require_protected_default_branch: false,
             upstream: None,
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),

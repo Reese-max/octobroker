@@ -151,3 +151,4 @@ caller.
 | Scoped installation tokens per policy envelope | #17 review | GitHub enforces the repo boundary, not just our parser |
 | Writes: App + audit + agents required in code | #17 review | Hard rules, not documented hopes |
 | `octobroker_*` review tools as a narrow MCP exception | #44 / PR #45 | Fill upstream capability gaps without arbitrary GraphQL; preserve default-deny, repo binding, App credentials, and audit |
+| GitHub rulesets/branch protection = the ref boundary; `require_protected_default_branch` verifies at issuance | #49 | The broker never proxies git, so ref policy lives on GitHub; the flag keeps unhardened repos out of the push path |

@@ -545,6 +545,46 @@ tokens are cached under separate namespaces, so agents with different modes
 never share credentials even for the same repository. Note the App itself
 must hold **Contents: Read & write** whenever any agent is push-capable.
 
+**Ref-level push policy.** A `contents:write` token is scoped to a
+*repository*, not a *ref*: GitHub enforces the repo boundary, but inside the
+repo the token can push to `main` as freely as to a feature branch — subject
+only to whatever protections the repo itself has. octobroker deliberately
+does not proxy the git protocol, so the ref boundary must live where it can
+be enforced — on GitHub, via rulesets / classic branch protection on every
+agent-writable repo:
+
+- **Default branch**: require a pull request before merging (and do not
+  grant the App a bypass) — direct pushes to `main` are refused, so agent
+  work lands through PRs that CI and humans can gate.
+- **Branch namespaces**: a ruleset targeting all branches with an exclusion
+  for e.g. `refs/heads/agent-*` lets you allow pushes only inside the agent
+  namespace while blocking force pushes and deletions elsewhere.
+- **Fleet-wide**: define the ruleset at the *organization* level so every
+  agent-writable repo inherits it instead of relying on per-repo settings.
+
+As a belt-and-suspenders check, the broker can refuse to mint credentials
+for repos whose default branch is not protected:
+
+```toml
+[mcp]
+require_protected_default_branch = true   # verify before minting
+```
+
+When set, `/git-credential` reads the repo's `default_branch` and its
+protection status through a repo-scoped `contents:read` installation token
+*before* minting a push-capable credential. An unprotected — or
+unverifiable — default branch denies the request (fail-closed, audited
+like every other denial). Read-only issuance is unaffected: a
+`contents:read` token cannot push to any ref, so the check is skipped.
+Default `false`.
+
+The check runs at issuance, not at push time — protection removed or a
+renamed default branch during the token's ~1h lifetime is outside its
+window (that residual is why the ruleset, not this flag, is the actual
+enforcement). A broker-side ref allowlist inside git `receive-pack` is out
+of scope by design: it would require proxying the git protocol, which this
+project does not do.
+
 Agent side, `obk` doubles as a standard git credential helper. Register it
 as the **only** helper for `github.com` — `--replace-all` with an empty
 first entry clears any inherited helpers (osxkeychain, GCM, `gh auth
@@ -564,6 +604,8 @@ git push → obk git-credential (OCTOBROKER_KEY from env)
          → key auth → repo allowlist → installation routing
          → durable audit preflight (phase: git_credential_request)
          → installation owner verified against GitHub
+         → [require_protected_default_branch] default-branch
+           protection verified — deny + audit when absent/unverifiable
          → Contents-only single-repo token (~1h, GitHub-enforced scope)
          → audit result (phase: git_credential_result, mode: read|write)
          → push authenticated as <app>[bot]
@@ -598,6 +640,10 @@ Properties:
 
 Deployment notes:
 
+- `OCTOBROKER_GITHUB_API_BASE` overrides the GitHub API base used by the App
+  credential backend (installation resolution, token mints, repo checks) —
+  for GitHub Enterprise Server deployments and tests. Default
+  `https://api.github.com`.
 - Requires egress to `api.githubcopilot.com` (the only additional external dependency).
 - Run a **single replica** while MCP is enabled — session pins live in process memory. A rolling deploy terminates sessions; clients recover by re-initializing.
 - Inside a trusted network, any workload that can reach `/mcp` gets the same read-only access (same trust model as octobroker's REST reads). Put TLS and agent authentication in front before any write-capable phase.
