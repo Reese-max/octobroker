@@ -381,7 +381,8 @@ Required GitHub App permissions (grant only what your agents' tools need):
 | Tools | App permission |
 |-------|----------------|
 | `issue_read`, `list_issues`, `create_issue`, `add_issue_comment` | Issues: read / write |
-| `octobroker_review_minimize_comment` | Issues: write and Pull requests: write |
+| `octobroker_review_minimize_comment`, `octobroker_review_restore_comment` | Issues: write and Pull requests: write |
+| `octobroker_review_delete_pending`, `octobroker_review_submit` | Pull requests: write |
 | `octobroker_commit_status_set` | Commit statuses: write |
 | `pull_request_read`, `create_pull_request`, `merge_pull_request` | Pull requests: read / write |
 | `get_file_contents`, `create_or_update_file`, `push_files` | Contents: read / write |
@@ -396,11 +397,17 @@ When writes are enabled and an authenticated agent explicitly includes a tool in
 [[mcp.agents]]
 id = "review-bot"
 key = "env:OCTOBROKER_REVIEW_KEY"
-tools = ["issue_read", "list_issues", "octobroker_review_minimize_comment", "octobroker_commit_status_set"]
+tools = ["issue_read", "list_issues", "octobroker_review_minimize_comment", "octobroker_review_restore_comment", "octobroker_review_delete_pending", "octobroker_review_submit", "octobroker_commit_status_set"]
 repos = ["openabdev/octobroker"]
 ```
 
 `octobroker_review_minimize_comment` accepts `owner`, `repo`, `node_id`, and a `classifier` (`ABUSE`, `DUPLICATE`, `OFF_TOPIC`, `OUTDATED`, `RESOLVED`, or `SPAM`). It supports issue and pull-request comments authored by the current GitHub App bot identity; it does not minimize human-authored comments or unsupported node types. Before mutating, it verifies both the App-bot author and the exact repository owner/name against the policy arguments, then executes GitHub's `minimizeComment` GraphQL mutation locally through octobroker's scoped GitHub App credential. The operation is not forwarded to the upstream MCP server. The call uses the same repository policy, write gate, in-flight limit, and fail-closed audit as upstream write tools. Agents that do not explicitly allowlist the name, or that have writes disabled, neither see it in `tools/list` nor can call it.
+
+`octobroker_review_restore_comment` is the inverse: it accepts `owner`, `repo`, and `node_id`, runs the same App-bot authorship and repository verification, then executes GitHub's `unminimizeComment` mutation locally. The call succeeds only when GitHub reports the comment no longer minimized.
+
+`octobroker_review_delete_pending` accepts `owner`, `repo`, and `node_id` (the GraphQL ID of a pending pull-request review). Before mutating it verifies that the node is a PENDING pull-request review authored by the current App bot identity inside the policy-checked repository, then executes GitHub's `deletePullRequestReview` mutation locally. Submitted or dismissed reviews, and reviews by other authors, are refused.
+
+`octobroker_review_submit` accepts `owner`, `repo`, `node_id`, an `event` (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`), and an optional `body`. It runs the same pending-review verification, then executes GitHub's `submitPullRequestReview` mutation locally and requires the returned state to match the event (`APPROVED`, `CHANGES_REQUESTED`, or `COMMENTED`) — an ambiguous outcome is reported as an error, never as success.
 
 `octobroker_commit_status_set` creates a [commit status](https://docs.github.com/en/rest/commits/statuses) — the upstream GitHub MCP server offers no commit-status mutation at all (only the read-only `get_status`), so review agents that need to publish a verdict as a status check (e.g. `context: "OpenAB PR Review"`, `state: failure`) use this broker-owned tool instead. It accepts `owner`, `repo`, a full commit `sha`, a `state` (`error`, `failure`, `pending`, or `success`), a non-empty `context`, and optional `description` (≤ 140 chars) and http(s) `target_url`. Arguments are strictly validated (the SHA and repository become URL path segments), then octobroker executes `POST /repos/{owner}/{repo}/statuses/{sha}` locally through the scoped GitHub App credential; only HTTP 201 counts as success. The same explicit allowlist, repository policy, write gate, in-flight limit, and fail-closed audit apply. Requires **Commit statuses: write** on the App.
 

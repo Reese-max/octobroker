@@ -55,11 +55,20 @@ const FWD_HEADERS: &[&str] = &[
 /// octobroker-owned MCP tools are namespaced so they cannot collide with tools
 /// exposed by GitHub's hosted MCP server.
 const MINIMIZE_COMMENT_TOOL: &str = "octobroker_review_minimize_comment";
+const RESTORE_COMMENT_TOOL: &str = "octobroker_review_restore_comment";
+const DELETE_PENDING_REVIEW_TOOL: &str = "octobroker_review_delete_pending";
+const SUBMIT_REVIEW_TOOL: &str = "octobroker_review_submit";
 const COMMIT_STATUS_TOOL: &str = "octobroker_commit_status_set";
 /// Every octobroker-owned local tool. Any new entry must preserve the explicit
 /// per-agent allowlist, repository binding, write gate, and fail-closed audit
 /// requirements (see issue #44).
-const LOCAL_TOOLS: &[&str] = &[MINIMIZE_COMMENT_TOOL, COMMIT_STATUS_TOOL];
+const LOCAL_TOOLS: &[&str] = &[
+    MINIMIZE_COMMENT_TOOL,
+    RESTORE_COMMENT_TOOL,
+    DELETE_PENDING_REVIEW_TOOL,
+    SUBMIT_REVIEW_TOOL,
+    COMMIT_STATUS_TOOL,
+];
 const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const GITHUB_API_URL: &str = "https://api.github.com";
 const MINIMIZE_CLASSIFIERS: &[&str] = &[
@@ -70,6 +79,8 @@ const MINIMIZE_CLASSIFIERS: &[&str] = &[
     "RESOLVED",
     "SPAM",
 ];
+/// Events accepted by GitHub's `submitPullRequestReview` mutation.
+const SUBMIT_REVIEW_EVENTS: &[&str] = &["APPROVE", "REQUEST_CHANGES", "COMMENT"];
 /// States accepted by GitHub's REST commit status API.
 const COMMIT_STATUS_STATES: &[&str] = &["error", "failure", "pending", "success"];
 
@@ -371,15 +382,24 @@ pub async fn mcp_proxy(
         .filter(|t| is_local_tool(t))
         .map(str::to_string)
     {
+        let frame_ref = frame.as_ref().unwrap();
         let local = match local_tool.as_str() {
             MINIMIZE_COMMENT_TOOL => {
-                handle_minimize_comment(&state, &cred, frame.as_ref().unwrap(), GITHUB_GRAPHQL_URL)
-                    .await
+                handle_minimize_comment(&state, &cred, frame_ref, GITHUB_GRAPHQL_URL).await
             }
-            _ => {
-                handle_commit_status_set(&state, &cred, frame.as_ref().unwrap(), GITHUB_API_URL)
-                    .await
+            RESTORE_COMMENT_TOOL => {
+                handle_restore_comment(&state, &cred, frame_ref, GITHUB_GRAPHQL_URL).await
             }
+            DELETE_PENDING_REVIEW_TOOL => {
+                handle_review_delete_pending(&state, &cred, frame_ref, GITHUB_GRAPHQL_URL).await
+            }
+            SUBMIT_REVIEW_TOOL => {
+                handle_review_submit(&state, &cred, frame_ref, GITHUB_GRAPHQL_URL).await
+            }
+            COMMIT_STATUS_TOOL => {
+                handle_commit_status_set(&state, &cred, frame_ref, GITHUB_API_URL).await
+            }
+            other => unreachable!("is_local_tool admitted {}", other),
         };
         if let (Some(tool_name), Some(sink)) = (&write_call, &state.audit) {
             let call = crate::audit::CallInfo {
@@ -734,6 +754,50 @@ fn local_tool_definition(name: &str) -> serde_json::Value {
                 "required": ["owner", "repo", "node_id", "classifier"]
             }
         }),
+        RESTORE_COMMENT_TOOL => serde_json::json!({
+            "name": RESTORE_COMMENT_TOOL,
+            "description": "Restore a minimized GitHub issue or pull request comment by GraphQL node ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "Repository owner." },
+                    "repo": { "type": "string", "description": "Repository name." },
+                    "node_id": { "type": "string", "description": "Global GraphQL node ID of the comment." }
+                },
+                "required": ["owner", "repo", "node_id"]
+            }
+        }),
+        DELETE_PENDING_REVIEW_TOOL => serde_json::json!({
+            "name": DELETE_PENDING_REVIEW_TOOL,
+            "description": "Delete a stale or partial pending pull-request review by GraphQL node ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "Repository owner." },
+                    "repo": { "type": "string", "description": "Repository name." },
+                    "node_id": { "type": "string", "description": "Global GraphQL node ID of the pending pull request review." }
+                },
+                "required": ["owner", "repo", "node_id"]
+            }
+        }),
+        SUBMIT_REVIEW_TOOL => serde_json::json!({
+            "name": SUBMIT_REVIEW_TOOL,
+            "description": "Submit a pending pull-request review by GraphQL node ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "Repository owner." },
+                    "repo": { "type": "string", "description": "Repository name." },
+                    "node_id": { "type": "string", "description": "Global GraphQL node ID of the pending pull request review." },
+                    "event": {
+                        "type": "string",
+                        "enum": SUBMIT_REVIEW_EVENTS
+                    },
+                    "body": { "type": "string", "description": "Optional review body text." }
+                },
+                "required": ["owner", "repo", "node_id", "event"]
+            }
+        }),
         COMMIT_STATUS_TOOL => serde_json::json!({
             "name": COMMIT_STATUS_TOOL,
             "description": "Create a commit status (state + context) on a commit SHA via GitHub's REST statuses API.",
@@ -813,17 +877,25 @@ fn inject_custom_tools(
                 .unwrap_or(false)
         });
     }
-    for local in LOCAL_TOOLS {
-        let enabled = allowed_tools
-            .map(|allowed| allowed.iter().any(|candidate| candidate == local))
-            .unwrap_or(true);
-        if enabled
-            && !tools
-                .iter()
-                .any(|tool| tool.get("name").and_then(|name| name.as_str()) == Some(*local))
-        {
-            tools.push(local_tool_definition(local));
-        }
+    let enabled_locals: Vec<&str> = LOCAL_TOOLS
+        .iter()
+        .copied()
+        .filter(|local| {
+            allowed_tools
+                .map(|allowed| allowed.iter().any(|candidate| candidate == local))
+                .unwrap_or(true)
+        })
+        .collect();
+    // A broker-owned name must never be shadowed by an upstream entry:
+    // replace collisions with the local definition rather than skipping.
+    tools.retain(|tool| {
+        tool.get("name")
+            .and_then(|name| name.as_str())
+            .map(|name| !enabled_locals.contains(&name))
+            .unwrap_or(true)
+    });
+    for local in enabled_locals {
+        tools.push(local_tool_definition(local));
     }
     let encoded = serde_json::to_string(&json).ok()?;
     if is_sse {
@@ -871,13 +943,18 @@ fn tool_response(
         .expect("static MCP tool response")
 }
 
+/// Every local-tool failure — argument, verification, or GitHub rejection —
+/// rides the wire as HTTP 200 with `result.isError`, same contract as
+/// `tool_call_denied`: strict JSON-RPC clients treat non-2xx as transport
+/// errors and would never surface the message to the model. The underlying
+/// status is preserved in `http_status` for the audit record only.
 fn local_tool_error(
     rpc_id: Option<&serde_json::Value>,
     http_status: StatusCode,
     message: impl Into<String>,
 ) -> LocalToolResponse {
     LocalToolResponse {
-        response: tool_response(rpc_id, true, http_status, message),
+        response: tool_response(rpc_id, true, StatusCode::OK, message),
         http_status: http_status.as_u16(),
         tool_error: Some(true),
     }
@@ -921,6 +998,186 @@ fn normalize_actor(login: &str) -> &str {
     login.strip_suffix("[bot]").unwrap_or(login)
 }
 
+/// Validate the shared `owner`/`repo`/`node_id` argument set. Every local
+/// review-operations tool binds to a repository through these names — they
+/// are also what the proxy's policy layer resolves for the repo allowlist.
+fn required_repo_node_args<'a>(
+    arguments: &'a serde_json::Map<String, serde_json::Value>,
+    extra: &[&str],
+    rpc_id: Option<&serde_json::Value>,
+) -> Result<(&'a str, &'a str, &'a str), Box<LocalToolResponse>> {
+    let mut keys = vec!["owner", "repo", "node_id"];
+    keys.extend_from_slice(extra);
+    for key in keys {
+        if arguments
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_none()
+        {
+            return Err(Box::new(local_tool_error(
+                rpc_id,
+                StatusCode::OK,
+                format!("missing or invalid argument: {}", key),
+            )));
+        }
+    }
+    Ok((
+        arguments["owner"].as_str().unwrap(),
+        arguments["repo"].as_str().unwrap(),
+        arguments["node_id"].as_str().unwrap(),
+    ))
+}
+
+/// Fail-closed verification shared by the comment-node tools: the node must
+/// be an issue or pull-request comment authored by the GitHub identity behind
+/// `cred`, inside the policy-checked `expected_repo` ("owner/repo"). Only a
+/// verified comment may be mutated. `Some(response)` is the user-facing tool
+/// error; `None` means the comment is verified.
+async fn verify_comment_ownership(
+    state: &AppState,
+    cred: &McpCredential,
+    graphql_url: &str,
+    rpc_id: Option<&serde_json::Value>,
+    node_id: &str,
+    expected_repo: &str,
+) -> Option<LocalToolResponse> {
+    let verify_payload = serde_json::json!({
+        "query": "query VerifyComment($id: ID!) { viewer { login } node(id: $id) { ... on IssueComment { author { login } issue { repository { nameWithOwner } } } ... on PullRequestReviewComment { author { login } pullRequest { repository { nameWithOwner } } } } }",
+        "variables": { "id": node_id }
+    });
+    let (verify_status, verify_body) =
+        match execute_graphql(state, cred, graphql_url, &verify_payload).await {
+            Ok(result) => result,
+            Err(()) => {
+                return Some(local_tool_error(
+                    rpc_id,
+                    StatusCode::BAD_GATEWAY,
+                    "GitHub comment ownership check failed",
+                ));
+            }
+        };
+    let viewer = verify_body
+        .pointer("/data/viewer/login")
+        .and_then(|value| value.as_str());
+    let author = verify_body
+        .pointer("/data/node/author/login")
+        .and_then(|value| value.as_str());
+    let actual_repo = verify_body
+        .pointer("/data/node/issue/repository/nameWithOwner")
+        .or_else(|| verify_body.pointer("/data/node/pullRequest/repository/nameWithOwner"))
+        .and_then(|value| value.as_str());
+    if !verify_status.is_success()
+        || verify_body.get("errors").is_some()
+        || viewer.is_none()
+        || author.is_none()
+        || viewer.map(normalize_actor) != author.map(normalize_actor)
+    {
+        tracing::warn!("comment ownership check failed for {}", expected_repo);
+        return Some(local_tool_error(
+            rpc_id,
+            verify_status,
+            "comment is not authored by the current GitHub identity",
+        ));
+    }
+    if actual_repo.map(|value| value.eq_ignore_ascii_case(expected_repo)) != Some(true) {
+        tracing::warn!(
+            "comment repository mismatch: expected {}, actual {:?}",
+            expected_repo,
+            actual_repo
+        );
+        return Some(local_tool_error(
+            rpc_id,
+            StatusCode::FORBIDDEN,
+            "comment does not belong to the authorized repository",
+        ));
+    }
+    None
+}
+
+/// Fail-closed verification shared by the pending-review tools: the node
+/// must be a PENDING pull-request review authored by the GitHub identity
+/// behind `cred`, inside the policy-checked `expected_repo` ("owner/repo").
+/// Only a verified pending review may be deleted or submitted.
+/// `Some(response)` is the user-facing tool error; `None` means verified.
+/// The PENDING check is inherently advisory — a review can transition
+/// between this query and the mutation; GitHub itself rejects delete/submit
+/// on non-pending reviews, and the callers' success checks fail closed on
+/// an ambiguous outcome.
+async fn verify_pending_review(
+    state: &AppState,
+    cred: &McpCredential,
+    graphql_url: &str,
+    rpc_id: Option<&serde_json::Value>,
+    node_id: &str,
+    expected_repo: &str,
+) -> Option<LocalToolResponse> {
+    let verify_payload = serde_json::json!({
+        "query": "query VerifyReview($id: ID!) { viewer { login } node(id: $id) { ... on PullRequestReview { state author { login } repository { nameWithOwner } } } }",
+        "variables": { "id": node_id }
+    });
+    let (verify_status, verify_body) =
+        match execute_graphql(state, cred, graphql_url, &verify_payload).await {
+            Ok(result) => result,
+            Err(()) => {
+                return Some(local_tool_error(
+                    rpc_id,
+                    StatusCode::BAD_GATEWAY,
+                    "GitHub review ownership check failed",
+                ));
+            }
+        };
+    let viewer = verify_body
+        .pointer("/data/viewer/login")
+        .and_then(|value| value.as_str());
+    let author = verify_body
+        .pointer("/data/node/author/login")
+        .and_then(|value| value.as_str());
+    let review_state = verify_body
+        .pointer("/data/node/state")
+        .and_then(|value| value.as_str());
+    let actual_repo = verify_body
+        .pointer("/data/node/repository/nameWithOwner")
+        .and_then(|value| value.as_str());
+    if !verify_status.is_success()
+        || verify_body.get("errors").is_some()
+        || viewer.is_none()
+        || author.is_none()
+        || viewer.map(normalize_actor) != author.map(normalize_actor)
+    {
+        tracing::warn!("review ownership check failed for {}", expected_repo);
+        return Some(local_tool_error(
+            rpc_id,
+            verify_status,
+            "review is not authored by the current GitHub identity",
+        ));
+    }
+    if actual_repo.map(|value| value.eq_ignore_ascii_case(expected_repo)) != Some(true) {
+        tracing::warn!(
+            "review repository mismatch: expected {}, actual {:?}",
+            expected_repo,
+            actual_repo
+        );
+        return Some(local_tool_error(
+            rpc_id,
+            StatusCode::FORBIDDEN,
+            "review does not belong to the authorized repository",
+        ));
+    }
+    if review_state != Some("PENDING") {
+        tracing::warn!(
+            "review state check failed for {}: {:?}",
+            expected_repo,
+            review_state
+        );
+        return Some(local_tool_error(
+            rpc_id,
+            StatusCode::CONFLICT,
+            "review is not pending",
+        ));
+    }
+    None
+}
+
 async fn handle_minimize_comment(
     state: &AppState,
     cred: &McpCredential,
@@ -934,22 +1191,11 @@ async fn handle_minimize_comment(
             "arguments must be an object",
         );
     };
-    for key in ["owner", "repo", "node_id", "classifier"] {
-        if arguments
-            .get(key)
-            .and_then(|value| value.as_str())
-            .is_none()
-        {
-            return local_tool_error(
-                frame.rpc_id.as_ref(),
-                StatusCode::OK,
-                format!("missing or invalid argument: {}", key),
-            );
-        }
-    }
-    let owner = arguments["owner"].as_str().unwrap();
-    let repo = arguments["repo"].as_str().unwrap();
-    let node_id = arguments["node_id"].as_str().unwrap();
+    let (owner, repo, node_id) =
+        match required_repo_node_args(arguments, &["classifier"], frame.rpc_id.as_ref()) {
+            Ok(args) => args,
+            Err(response) => return *response,
+        };
     let classifier = arguments["classifier"].as_str().unwrap();
     if !MINIMIZE_CLASSIFIERS.contains(&classifier) {
         return local_tool_error(
@@ -959,56 +1205,18 @@ async fn handle_minimize_comment(
         );
     }
 
-    let verify_payload = serde_json::json!({
-        "query": "query VerifyComment($id: ID!) { viewer { login } node(id: $id) { ... on IssueComment { author { login } issue { repository { nameWithOwner } } } ... on PullRequestReviewComment { author { login } pullRequest { repository { nameWithOwner } } } } }",
-        "variables": { "id": node_id }
-    });
-    let (verify_status, verify_body) =
-        match execute_graphql(state, cred, graphql_url, &verify_payload).await {
-            Ok(result) => result,
-            Err(()) => {
-                return local_tool_error(
-                    frame.rpc_id.as_ref(),
-                    StatusCode::BAD_GATEWAY,
-                    "GitHub comment ownership check failed",
-                );
-            }
-        };
-    let viewer = verify_body
-        .pointer("/data/viewer/login")
-        .and_then(|value| value.as_str());
-    let author = verify_body
-        .pointer("/data/node/author/login")
-        .and_then(|value| value.as_str());
-    let actual_repo = verify_body
-        .pointer("/data/node/issue/repository/nameWithOwner")
-        .or_else(|| verify_body.pointer("/data/node/pullRequest/repository/nameWithOwner"))
-        .and_then(|value| value.as_str());
     let expected_repo = format!("{}/{}", owner, repo);
-    if !verify_status.is_success()
-        || verify_body.get("errors").is_some()
-        || viewer.is_none()
-        || author.is_none()
-        || viewer.map(normalize_actor) != author.map(normalize_actor)
+    if let Some(response) = verify_comment_ownership(
+        state,
+        cred,
+        graphql_url,
+        frame.rpc_id.as_ref(),
+        node_id,
+        &expected_repo,
+    )
+    .await
     {
-        tracing::warn!("comment ownership check failed for {}/{}", owner, repo);
-        return local_tool_error(
-            frame.rpc_id.as_ref(),
-            verify_status,
-            "comment is not authored by the current GitHub identity",
-        );
-    }
-    if actual_repo.map(|value| value.eq_ignore_ascii_case(&expected_repo)) != Some(true) {
-        tracing::warn!(
-            "comment repository mismatch: expected {}, actual {:?}",
-            expected_repo,
-            actual_repo
-        );
-        return local_tool_error(
-            frame.rpc_id.as_ref(),
-            StatusCode::FORBIDDEN,
-            "comment does not belong to the authorized repository",
-        );
+        return response;
     }
 
     let payload = serde_json::json!({
@@ -1049,6 +1257,275 @@ async fn handle_minimize_comment(
             false,
             StatusCode::OK,
             format!("Comment minimized as {}", classifier),
+        ),
+        http_status: status.as_u16(),
+        tool_error: Some(false),
+    }
+}
+
+/// octobroker-owned tool: restore a minimized issue/PR comment via GitHub's
+/// `unminimizeComment` mutation. Same ownership and repository binding as
+/// `handle_minimize_comment`; success requires GitHub to report the comment
+/// no longer minimized.
+async fn handle_restore_comment(
+    state: &AppState,
+    cred: &McpCredential,
+    frame: &Frame,
+    graphql_url: &str,
+) -> LocalToolResponse {
+    let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "arguments must be an object",
+        );
+    };
+    let (owner, repo, node_id) =
+        match required_repo_node_args(arguments, &[], frame.rpc_id.as_ref()) {
+            Ok(args) => args,
+            Err(response) => return *response,
+        };
+
+    let expected_repo = format!("{}/{}", owner, repo);
+    if let Some(response) = verify_comment_ownership(
+        state,
+        cred,
+        graphql_url,
+        frame.rpc_id.as_ref(),
+        node_id,
+        &expected_repo,
+    )
+    .await
+    {
+        return response;
+    }
+
+    let payload = serde_json::json!({
+        "query": "mutation UnminimizeComment($subjectId: ID!) { unminimizeComment(input: { subjectId: $subjectId }) { unminimizedComment { isMinimized } } }",
+        "variables": { "subjectId": node_id }
+    });
+    let (status, body) = match execute_graphql(state, cred, graphql_url, &payload).await {
+        Ok(result) => result,
+        Err(()) => {
+            tracing::error!(
+                "custom restore_comment request failed for {}/{}",
+                owner,
+                repo
+            );
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::BAD_GATEWAY,
+                "GitHub restore comment request failed",
+            );
+        }
+    };
+    let still_minimized = body
+        .pointer("/data/unminimizeComment/unminimizedComment/isMinimized")
+        .and_then(|value| value.as_bool())
+        != Some(false);
+    if !status.is_success() || body.get("errors").is_some() || still_minimized {
+        tracing::warn!("GitHub restore_comment failed for {}/{}", owner, repo);
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            status,
+            "GitHub rejected comment restore",
+        );
+    }
+
+    LocalToolResponse {
+        response: tool_response(
+            frame.rpc_id.as_ref(),
+            false,
+            StatusCode::OK,
+            "Comment restored",
+        ),
+        http_status: status.as_u16(),
+        tool_error: Some(false),
+    }
+}
+
+/// octobroker-owned tool: delete a stale or partial pending pull-request
+/// review via GitHub's `deletePullRequestReview` mutation. Only PENDING
+/// reviews authored by the current App identity in the policy-checked
+/// repository are touched.
+async fn handle_review_delete_pending(
+    state: &AppState,
+    cred: &McpCredential,
+    frame: &Frame,
+    graphql_url: &str,
+) -> LocalToolResponse {
+    let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "arguments must be an object",
+        );
+    };
+    let (owner, repo, node_id) =
+        match required_repo_node_args(arguments, &[], frame.rpc_id.as_ref()) {
+            Ok(args) => args,
+            Err(response) => return *response,
+        };
+
+    let expected_repo = format!("{}/{}", owner, repo);
+    if let Some(response) = verify_pending_review(
+        state,
+        cred,
+        graphql_url,
+        frame.rpc_id.as_ref(),
+        node_id,
+        &expected_repo,
+    )
+    .await
+    {
+        return response;
+    }
+
+    let payload = serde_json::json!({
+        "query": "mutation DeletePendingReview($id: ID!) { deletePullRequestReview(input: { pullRequestReviewId: $id }) { pullRequestReview { id } } }",
+        "variables": { "id": node_id }
+    });
+    let (status, body) = match execute_graphql(state, cred, graphql_url, &payload).await {
+        Ok(result) => result,
+        Err(()) => {
+            tracing::error!(
+                "custom delete_pending request failed for {}/{}",
+                owner,
+                repo
+            );
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::BAD_GATEWAY,
+                "GitHub delete pending review request failed",
+            );
+        }
+    };
+    let deleted = body
+        .pointer("/data/deletePullRequestReview/pullRequestReview/id")
+        .and_then(|value| value.as_str())
+        .is_some();
+    if !status.is_success() || body.get("errors").is_some() || !deleted {
+        tracing::warn!("GitHub delete_pending failed for {}/{}", owner, repo);
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            status,
+            "GitHub rejected pending review deletion",
+        );
+    }
+
+    LocalToolResponse {
+        response: tool_response(
+            frame.rpc_id.as_ref(),
+            false,
+            StatusCode::OK,
+            "Pending review deleted",
+        ),
+        http_status: status.as_u16(),
+        tool_error: Some(false),
+    }
+}
+
+/// octobroker-owned tool: submit a pending pull-request review via GitHub's
+/// `submitPullRequestReview` mutation. `event` is APPROVE, REQUEST_CHANGES,
+/// or COMMENT; `body` is optional review text. Only PENDING reviews authored
+/// by the current App identity in the policy-checked repository are touched.
+async fn handle_review_submit(
+    state: &AppState,
+    cred: &McpCredential,
+    frame: &Frame,
+    graphql_url: &str,
+) -> LocalToolResponse {
+    let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "arguments must be an object",
+        );
+    };
+    let (owner, repo, node_id) =
+        match required_repo_node_args(arguments, &["event"], frame.rpc_id.as_ref()) {
+            Ok(args) => args,
+            Err(response) => return *response,
+        };
+    let event = arguments["event"].as_str().unwrap();
+    if !SUBMIT_REVIEW_EVENTS.contains(&event) {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "event must be one of: APPROVE, REQUEST_CHANGES, COMMENT",
+        );
+    }
+    let body_text = match arguments.get("body") {
+        None => None,
+        Some(value) => match value.as_str() {
+            Some(text) => Some(text),
+            None => {
+                return local_tool_error(
+                    frame.rpc_id.as_ref(),
+                    StatusCode::OK,
+                    "body must be a string",
+                );
+            }
+        },
+    };
+
+    let expected_repo = format!("{}/{}", owner, repo);
+    if let Some(response) = verify_pending_review(
+        state,
+        cred,
+        graphql_url,
+        frame.rpc_id.as_ref(),
+        node_id,
+        &expected_repo,
+    )
+    .await
+    {
+        return response;
+    }
+
+    let mut input = serde_json::json!({ "pullRequestReviewId": node_id, "event": event });
+    if let Some(text) = body_text {
+        input["body"] = serde_json::json!(text);
+    }
+    let payload = serde_json::json!({
+        "query": "mutation SubmitReview($input: SubmitPullRequestReviewInput!) { submitPullRequestReview(input: $input) { pullRequestReview { state } } }",
+        "variables": { "input": input }
+    });
+    let (status, body) = match execute_graphql(state, cred, graphql_url, &payload).await {
+        Ok(result) => result,
+        Err(()) => {
+            tracing::error!("custom review_submit request failed for {}/{}", owner, repo);
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::BAD_GATEWAY,
+                "GitHub submit review request failed",
+            );
+        }
+    };
+    let expected_state = match event {
+        "APPROVE" => "APPROVED",
+        "REQUEST_CHANGES" => "CHANGES_REQUESTED",
+        _ => "COMMENTED",
+    };
+    let submitted = body
+        .pointer("/data/submitPullRequestReview/pullRequestReview/state")
+        .and_then(|value| value.as_str())
+        == Some(expected_state);
+    if !status.is_success() || body.get("errors").is_some() || !submitted {
+        tracing::warn!("GitHub review_submit failed for {}/{}", owner, repo);
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            status,
+            "GitHub rejected review submission",
+        );
+    }
+
+    LocalToolResponse {
+        response: tool_response(
+            frame.rpc_id.as_ref(),
+            false,
+            StatusCode::OK,
+            format!("Review submitted as {}", expected_state),
         ),
         http_status: status.as_u16(),
         tool_error: Some(false),
@@ -2272,7 +2749,53 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert_eq!(names, vec![MINIMIZE_COMMENT_TOOL, COMMIT_STATUS_TOOL]);
+        assert_eq!(
+            names,
+            vec![
+                MINIMIZE_COMMENT_TOOL,
+                RESTORE_COMMENT_TOOL,
+                DELETE_PENDING_REVIEW_TOOL,
+                SUBMIT_REVIEW_TOOL,
+                COMMIT_STATUS_TOOL
+            ]
+        );
+    }
+
+    #[test]
+    fn test_inject_custom_tools_replaces_upstream_collision() {
+        // A broker-owned name must never be shadowed by an upstream entry:
+        // the collision is replaced by the local definition, not kept.
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[
+            {"name":"issue_read"},
+            {"name":"octobroker_review_submit","description":"upstream shadow"}
+        ]}}"#;
+        let out = inject_custom_tools(body, Some("application/json"), None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"issue_read"));
+        let occurrences = names
+            .iter()
+            .filter(|name| **name == SUBMIT_REVIEW_TOOL)
+            .count();
+        assert_eq!(occurrences, 1, "exactly one entry for the local tool");
+        let entry = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some(SUBMIT_REVIEW_TOOL))
+            .unwrap();
+        assert!(
+            entry["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pending pull-request review"),
+            "collision must be replaced by the local definition"
+        );
     }
 
     #[test]
@@ -3293,7 +3816,8 @@ data: "id":1,"result":{"tools":[]}}
     /// Mock api.github.com/graphql: VerifyComment queries answer with the
     /// given author/repo (viewer is always the App bot identity, with the
     /// "[bot]" suffix exactly as the live API returns it); MinimizeComment
-    /// mutations are recorded and succeed.
+    /// mutations are recorded and succeed; UnminimizeComment mutations are
+    /// recorded and report the comment no longer minimized.
     async fn spawn_mock_graphql(
         author_login: &'static str,
         node_repo: &'static str,
@@ -3307,6 +3831,12 @@ data: "id":1,"result":{"tools":[]}}
             let log = log2.clone();
             async move {
                 let query = body["query"].as_str().unwrap_or_default().to_string();
+                if query.contains("UnminimizeComment") {
+                    log.lock().unwrap().push(body);
+                    return Json(serde_json::json!({
+                        "data": {"unminimizeComment": {"unminimizedComment": {"isMinimized": false}}}
+                    }));
+                }
                 if query.contains("MinimizeComment") {
                     log.lock().unwrap().push(body);
                     return Json(serde_json::json!({
@@ -3400,6 +3930,7 @@ data: "id":1,"result":{"tools":[]}}
         let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
         assert_eq!(out.http_status, StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(out.response.status(), StatusCode::OK);
         assert_eq!(out.tool_error, Some(true));
         assert!(
             mutations.lock().unwrap().is_empty(),
@@ -3438,6 +3969,415 @@ data: "id":1,"result":{"tools":[]}}
             .await
             .unwrap();
         assert_tool_denied(resp, 1, "local write tools").await;
+        assert_eq!(captured.lock().unwrap().len(), 0);
+    }
+
+    // ---- octobroker-owned tool: restore comment (mock GraphQL) ----
+
+    fn restore_frame(owner: &str, repo: &str) -> Frame {
+        Frame {
+            method: "tools/call".to_string(),
+            rpc_id: Some(serde_json::json!(1)),
+            tool: Some(RESTORE_COMMENT_TOOL.to_string()),
+            arguments: Some(serde_json::json!({
+                "owner": owner,
+                "repo": repo,
+                "node_id": "IC_kwDOtest",
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_restore_accepts_app_bot_authored_comment() {
+        let (gql, mutations) =
+            spawn_mock_graphql("oab-octobroker", "openabdev/octobroker", false).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = restore_frame("openabdev", "octobroker");
+        let out = handle_restore_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.http_status, 200);
+        assert_eq!(out.tool_error, Some(false));
+        let recorded = mutations.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one mutation");
+        assert_eq!(recorded[0]["variables"]["subjectId"], "IC_kwDOtest");
+    }
+
+    #[tokio::test]
+    async fn test_restore_rejects_human_authored_comment() {
+        let (gql, mutations) =
+            spawn_mock_graphql("chaodu-agent", "openabdev/octobroker", false).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = restore_frame("openabdev", "octobroker");
+        let out = handle_restore_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.tool_error, Some(true));
+        assert!(
+            mutations.lock().unwrap().is_empty(),
+            "no mutation for foreign authors"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_rejects_repo_mismatch() {
+        let (gql, mutations) =
+            spawn_mock_graphql("oab-octobroker", "openabdev/other-repo", false).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = restore_frame("openabdev", "octobroker");
+        let out = handle_restore_comment(&state, &app_cred(), &frame, &gql).await;
+        // http_status is the audit trail's view; the wire response stays
+        // HTTP 200 + result.isError so the model can see the denial.
+        assert_eq!(out.http_status, StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(out.response.status(), StatusCode::OK);
+        assert_eq!(out.tool_error, Some(true));
+        assert!(
+            mutations.lock().unwrap().is_empty(),
+            "no cross-repo mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_rejects_graphql_errors_and_missing_args() {
+        // GraphQL soft errors (HTTP 200 + errors[]) fail closed.
+        let (gql, mutations) =
+            spawn_mock_graphql("oab-octobroker", "openabdev/octobroker", true).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = restore_frame("openabdev", "octobroker");
+        let out = handle_restore_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.tool_error, Some(true));
+        assert!(mutations.lock().unwrap().is_empty());
+
+        // Missing node_id is rejected before any network call.
+        let frame = Frame {
+            method: "tools/call".to_string(),
+            rpc_id: Some(serde_json::json!(1)),
+            tool: Some(RESTORE_COMMENT_TOOL.to_string()),
+            arguments: Some(serde_json::json!({"owner": "openabdev", "repo": "octobroker"})),
+        };
+        let out = handle_restore_comment(&state, &app_cred(), &frame, "http://127.0.0.1:1/").await;
+        assert_eq!(out.tool_error, Some(true));
+    }
+
+    // ---- octobroker-owned tools: pending review delete/submit (mock GraphQL) ----
+
+    /// Mock api.github.com/graphql for the review tools: VerifyReview queries
+    /// answer with the given state/author/repo; DeletePendingReview and
+    /// SubmitReview mutations are recorded — submit echoes the state that
+    /// corresponds to the requested event unless `submit_wrong_state` is set.
+    async fn spawn_mock_review_graphql(
+        review_state: &'static str,
+        author_login: &'static str,
+        node_repo: &'static str,
+        verify_errors: bool,
+        submit_wrong_state: bool,
+    ) -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use axum::{routing::post, Json, Router};
+        type Log = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+        let log: Log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let handler = move |Json(body): Json<serde_json::Value>| {
+            let log = log2.clone();
+            async move {
+                let query = body["query"].as_str().unwrap_or_default().to_string();
+                if query.contains("DeletePendingReview") {
+                    log.lock().unwrap().push(body);
+                    return Json(serde_json::json!({
+                        "data": {"deletePullRequestReview": {"pullRequestReview": {"id": "PRR_kwDOtest"}}}
+                    }));
+                }
+                if query.contains("SubmitReview") {
+                    let event = body
+                        .pointer("/variables/input/event")
+                        .and_then(|v| v.as_str());
+                    let state = if submit_wrong_state {
+                        "PENDING"
+                    } else {
+                        match event {
+                            Some("APPROVE") => "APPROVED",
+                            Some("REQUEST_CHANGES") => "CHANGES_REQUESTED",
+                            _ => "COMMENTED",
+                        }
+                    };
+                    log.lock().unwrap().push(body);
+                    return Json(serde_json::json!({
+                        "data": {"submitPullRequestReview": {"pullRequestReview": {"state": state}}}
+                    }));
+                }
+                if verify_errors {
+                    return Json(serde_json::json!({
+                        "data": null,
+                        "errors": [{"message": "Could not resolve node"}]
+                    }));
+                }
+                Json(serde_json::json!({
+                    "data": {
+                        "viewer": {"login": "oab-octobroker[bot]"},
+                        "node": {
+                            "state": review_state,
+                            "author": {"login": author_login},
+                            "repository": {"nameWithOwner": node_repo}
+                        }
+                    }
+                }))
+            }
+        };
+        let app = Router::new().route("/", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}/", addr), log)
+    }
+
+    fn pending_review_frame(
+        tool: &str,
+        owner: &str,
+        repo: &str,
+        extra: serde_json::Value,
+    ) -> Frame {
+        let mut arguments = serde_json::json!({
+            "owner": owner,
+            "repo": repo,
+            "node_id": "PRR_kwDOtest",
+        });
+        if let serde_json::Value::Object(map) = extra {
+            for (k, v) in map {
+                arguments[k] = v;
+            }
+        }
+        Frame {
+            method: "tools/call".to_string(),
+            rpc_id: Some(serde_json::json!(1)),
+            tool: Some(tool.to_string()),
+            arguments: Some(arguments),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_pending_accepts_pending_bot_review() {
+        let (gql, mutations) = spawn_mock_review_graphql(
+            "PENDING",
+            "oab-octobroker",
+            "openabdev/openab",
+            false,
+            false,
+        )
+        .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pending_review_frame(
+            DELETE_PENDING_REVIEW_TOOL,
+            "openabdev",
+            "openab",
+            serde_json::json!({}),
+        );
+        let out = handle_review_delete_pending(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.http_status, 200);
+        assert_eq!(out.tool_error, Some(false));
+        let recorded = mutations.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one mutation");
+        assert_eq!(recorded[0]["variables"]["id"], "PRR_kwDOtest");
+    }
+
+    #[tokio::test]
+    async fn test_delete_pending_rejects_non_pending_review() {
+        // A submitted review must never be deleted through this tool.
+        let (gql, mutations) = spawn_mock_review_graphql(
+            "APPROVED",
+            "oab-octobroker",
+            "openabdev/openab",
+            false,
+            false,
+        )
+        .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pending_review_frame(
+            DELETE_PENDING_REVIEW_TOOL,
+            "openabdev",
+            "openab",
+            serde_json::json!({}),
+        );
+        let out = handle_review_delete_pending(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.http_status, StatusCode::CONFLICT.as_u16());
+        assert_eq!(
+            out.response.status(),
+            StatusCode::OK,
+            "tool errors ride HTTP 200"
+        );
+        assert_eq!(out.tool_error, Some(true));
+        assert!(
+            mutations.lock().unwrap().is_empty(),
+            "no mutation for non-pending review"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_pending_rejects_foreign_review() {
+        // A human-authored pending review is outside the tool's reach.
+        let (gql, mutations) =
+            spawn_mock_review_graphql("PENDING", "chaodu-agent", "openabdev/openab", false, false)
+                .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pending_review_frame(
+            DELETE_PENDING_REVIEW_TOOL,
+            "openabdev",
+            "openab",
+            serde_json::json!({}),
+        );
+        let out = handle_review_delete_pending(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.tool_error, Some(true));
+        assert!(
+            mutations.lock().unwrap().is_empty(),
+            "no mutation for foreign authors"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_pending_rejects_repo_mismatch() {
+        let (gql, mutations) = spawn_mock_review_graphql(
+            "PENDING",
+            "oab-octobroker",
+            "openabdev/other-repo",
+            false,
+            false,
+        )
+        .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pending_review_frame(
+            DELETE_PENDING_REVIEW_TOOL,
+            "openabdev",
+            "openab",
+            serde_json::json!({}),
+        );
+        let out = handle_review_delete_pending(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.http_status, StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(
+            out.response.status(),
+            StatusCode::OK,
+            "tool errors ride HTTP 200"
+        );
+        assert_eq!(out.tool_error, Some(true));
+        assert!(
+            mutations.lock().unwrap().is_empty(),
+            "no cross-repo mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_ops_reject_graphql_errors() {
+        for tool in [DELETE_PENDING_REVIEW_TOOL, SUBMIT_REVIEW_TOOL] {
+            let (gql, mutations) = spawn_mock_review_graphql(
+                "PENDING",
+                "oab-octobroker",
+                "openabdev/openab",
+                true,
+                false,
+            )
+            .await;
+            let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+            let frame = pending_review_frame(
+                tool,
+                "openabdev",
+                "openab",
+                serde_json::json!({"event": "COMMENT"}),
+            );
+            let out = if tool == SUBMIT_REVIEW_TOOL {
+                handle_review_submit(&state, &app_cred(), &frame, &gql).await
+            } else {
+                handle_review_delete_pending(&state, &app_cred(), &frame, &gql).await
+            };
+            assert_eq!(out.tool_error, Some(true), "{}", tool);
+            assert!(
+                mutations.lock().unwrap().is_empty(),
+                "{} must not mutate on verify errors",
+                tool
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_review_submits_each_event() {
+        for event in ["APPROVE", "REQUEST_CHANGES", "COMMENT"] {
+            let (gql, mutations) = spawn_mock_review_graphql(
+                "PENDING",
+                "oab-octobroker",
+                "openabdev/openab",
+                false,
+                false,
+            )
+            .await;
+            let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+            let frame = pending_review_frame(
+                SUBMIT_REVIEW_TOOL,
+                "openabdev",
+                "openab",
+                serde_json::json!({"event": event, "body": "lgtm-ish"}),
+            );
+            let out = handle_review_submit(&state, &app_cred(), &frame, &gql).await;
+            assert_eq!(out.tool_error, Some(false), "{}", event);
+            let recorded = mutations.lock().unwrap();
+            assert_eq!(recorded.len(), 1, "{}: exactly one mutation", event);
+            assert_eq!(
+                recorded[0]["variables"]["input"]["pullRequestReviewId"],
+                "PRR_kwDOtest"
+            );
+            assert_eq!(recorded[0]["variables"]["input"]["event"], event);
+            assert_eq!(recorded[0]["variables"]["input"]["body"], "lgtm-ish");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_review_rejects_invalid_event_before_network() {
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pending_review_frame(
+            SUBMIT_REVIEW_TOOL,
+            "openabdev",
+            "openab",
+            serde_json::json!({"event": "DISMISS"}),
+        );
+        // Unroutable URL: a network call would surface as BAD_GATEWAY, not an arg error.
+        let out = handle_review_submit(&state, &app_cred(), &frame, "http://127.0.0.1:1/").await;
+        assert_eq!(out.http_status, 200, "arg errors are tool errors");
+        assert_eq!(out.tool_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_submit_review_fails_closed_on_state_mismatch() {
+        // If GitHub does not report the expected post-submit state, the
+        // operation failed — never report success on an ambiguous outcome.
+        let (gql, mutations) =
+            spawn_mock_review_graphql("PENDING", "oab-octobroker", "openabdev/openab", false, true)
+                .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pending_review_frame(
+            SUBMIT_REVIEW_TOOL,
+            "openabdev",
+            "openab",
+            serde_json::json!({"event": "APPROVE"}),
+        );
+        let out = handle_review_submit(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.tool_error, Some(true));
+        assert_eq!(mutations.lock().unwrap().len(), 1, "mutation was attempted");
+    }
+
+    #[tokio::test]
+    async fn test_phase1_mode_denies_all_new_local_tools() {
+        // Every new broker-owned tool must be denied locally in network-trust
+        // mode and must never be proxied to the upstream MCP server.
+        let (url, captured) = spawn_mock_upstream().await;
+        for tool in [
+            RESTORE_COMMENT_TOOL,
+            DELETE_PENDING_REVIEW_TOOL,
+            SUBMIT_REVIEW_TOOL,
+        ] {
+            let state = test_state_full(&["alice"], &url, &[], vec![]);
+            let resp = mcp_app(state)
+                .oneshot(post_frame(
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{{"owner":"openabdev","repo":"octobroker","node_id":"PRR_kwDOtest","event":"COMMENT"}}}}}}"#,
+                        tool
+                    ),
+                    &[],
+                ))
+                .await
+                .unwrap();
+            assert_tool_denied(resp, 1, "local write tools").await;
+        }
         assert_eq!(captured.lock().unwrap().len(), 0);
     }
 
