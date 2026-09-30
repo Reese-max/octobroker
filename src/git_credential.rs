@@ -35,7 +35,7 @@ pub async fn git_credential(
     }
     // Authenticated agents only. Startup validation guarantees agents exist
     // when the endpoint is enabled, so network-trust mode (None) is denied.
-    let agent = match authenticate(&state, &headers) {
+    let agent = match authenticate(&state, &headers, None) {
         Ok(Some(a)) => a,
         Ok(None) => {
             return rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required")

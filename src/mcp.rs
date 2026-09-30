@@ -83,9 +83,15 @@ pub async fn mcp_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Parse the JSON-RPC frame first (pure, bounded): every error response
+    // below — including authn failures — can then echo the request id, so an
+    // in-flight call never sees an un-correlatable `id: null` (#59).
+    let frame = if method == Method::POST { parse_frame(&body) } else { None };
+    let rpc_id = frame.as_ref().and_then(|f| f.rpc_id.as_ref());
+
     // Phase 2a: agent authentication. With no [[mcp.agents]] configured this
     // is Phase 1 network-trust mode (agent = None).
-    let agent = match authenticate(&state, &headers) {
+    let agent = match authenticate(&state, &headers, rpc_id) {
         Ok(a) => a,
         Err(resp) => return *resp,
     };
@@ -97,13 +103,12 @@ pub async fn mcp_proxy(
 
     // Session termination without a session identifier is semantically invalid
     if method == Method::DELETE && session_id.is_none() {
-        return rpc_error(StatusCode::BAD_REQUEST, "Mcp-Session-Id header required");
+        return rpc_error_with_id(StatusCode::BAD_REQUEST, "Mcp-Session-Id header required", rpc_id);
     }
 
     let agent_id = agent.map(|a| a.id.as_str());
 
-    // Parse frame early so we can resolve the target owner for multi-app mode.
-    let frame = if method == Method::POST { parse_frame(&body) } else { None };
+    // Resolve the target owner for multi-app mode.
     let mut resolved_repo: Option<(String, String)> = None;
     if let Some(f) = &frame {
         if f.method == "tools/call" {
@@ -223,17 +228,18 @@ pub async fn mcp_proxy(
             let Some(agent) = agent else {
                 // Startup validation requires agents in multi mode, and
                 // authenticate() already rejected keyless requests.
-                return rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required");
+                return rpc_error_with_id(StatusCode::UNAUTHORIZED, "agent authentication required", rpc_id);
             };
             if !agent.repos.is_empty() {
-                return multi_initialize(&state, &headers, body, agent).await;
+                return multi_initialize(&state, &headers, body, agent, rpc_id).await;
             }
         }
         if let Some(sid) = session_id.as_deref() {
             if method == Method::DELETE
                 || (method == Method::POST && frame_method.starts_with("notifications/"))
             {
-                if let Some(resp) = multi_fanout(&state, &method, &headers, &body, sid, agent).await
+                if let Some(resp) =
+                    multi_fanout(&state, &method, &headers, &body, sid, agent, rpc_id).await
                 {
                     return resp;
                 }
@@ -249,15 +255,15 @@ pub async fn mcp_proxy(
                 "MCP request rejected: unknown or expired session{}",
                 session_suffix(session_id.as_deref())
             );
-            return rpc_error(StatusCode::NOT_FOUND, "session not found or expired");
+            return rpc_error_with_id(StatusCode::NOT_FOUND, "session not found or expired", rpc_id);
         }
         Err(StatusCode::FORBIDDEN) => {
-            return rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent");
+            return rpc_error_with_id(StatusCode::FORBIDDEN, "session not owned by this agent", rpc_id);
         }
         Err(StatusCode::BAD_GATEWAY) => {
-            return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential unavailable");
+            return rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream credential unavailable", rpc_id);
         }
-        Err(code) => return rpc_error(code, "no upstream identity available"),
+        Err(code) => return rpc_error_with_id(code, "no upstream identity available", rpc_id),
     };
     let cred_label = cred.label();
 
@@ -316,9 +322,10 @@ pub async fn mcp_proxy(
                         "MCP write call rejected: agent {} at in-flight cap ({})",
                         aid, cap
                     );
-                    return rpc_error(
+                    return rpc_error_with_id(
                         StatusCode::TOO_MANY_REQUESTS,
                         "agent write concurrency limit reached",
+                        rpc_id,
                     );
                 }
             }
@@ -341,9 +348,10 @@ pub async fn mcp_proxy(
             // FAIL-CLOSED: a write whose audit record cannot be persisted
             // must not happen.
             tracing::error!("audit unavailable — rejecting write call (fail-closed): {}", e);
-            return rpc_error(
+            return rpc_error_with_id(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "audit backend unavailable — write rejected",
+                rpc_id,
             );
         }
     }
@@ -403,7 +411,7 @@ pub async fn mcp_proxy(
             .http
             .delete(upstream)
             .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS)),
-        _ => return rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+        _ => return rpc_error_with_id(StatusCode::METHOD_NOT_ALLOWED, "method not allowed", rpc_id),
     };
 
     let Some(mut upstream_headers) =
@@ -413,7 +421,7 @@ pub async fn mcp_proxy(
             "credential '{}' is not a valid header value — check secret source",
             cred_label
         );
-        return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential misconfigured");
+        return rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream credential misconfigured", rpc_id);
     };
     // Multi-installation routing: every installation has its own upstream
     // session. Secondary routes replace the downstream session ID with their
@@ -423,7 +431,7 @@ pub async fn mcp_proxy(
         match upstream_session {
             Some(us) if Some(us.as_str()) != session_id.as_deref() => {
                 let Ok(v) = us.parse() else {
-                    return rpc_error(StatusCode::BAD_GATEWAY, "invalid upstream session id");
+                    return rpc_error_with_id(StatusCode::BAD_GATEWAY, "invalid upstream session id", rpc_id);
                 };
                 upstream_headers.insert("mcp-session-id", v);
             }
@@ -438,7 +446,7 @@ pub async fn mcp_proxy(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("mcp upstream request failed: {}", e);
-            return rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed");
+            return rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream request failed", rpc_id);
         }
     };
 
@@ -537,7 +545,7 @@ pub async fn mcp_proxy(
                 .unwrap_or(bytes);
                 return builder
                     .body(Body::from(body))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                    .unwrap_or_else(|_| rpc_error_with_id(StatusCode::BAD_GATEWAY, "failed to build response", rpc_id));
             }
             Ok(BufferedBody::Overflow(head, rest)) => {
                 let head_stream = futures_util::stream::once(async move {
@@ -545,11 +553,11 @@ pub async fn mcp_proxy(
                 });
                 return builder
                     .body(Body::from_stream(head_stream.chain(rest)))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                    .unwrap_or_else(|_| rpc_error_with_id(StatusCode::BAD_GATEWAY, "failed to build response", rpc_id));
             }
             Err(e) => {
                 tracing::error!("tools/list response read failed: {}", e);
-                return rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed");
+                return rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream response failed", rpc_id);
             }
         }
     }
@@ -595,7 +603,7 @@ pub async fn mcp_proxy(
                 }
                 return builder
                     .body(Body::from(bytes))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                    .unwrap_or_else(|_| rpc_error_with_id(StatusCode::BAD_GATEWAY, "failed to build response", rpc_id));
             }
             Ok(BufferedBody::Overflow(head, rest)) => {
                 // Oversize: outcome undeterminable; forward head + remainder
@@ -611,7 +619,7 @@ pub async fn mcp_proxy(
                 });
                 return builder
                     .body(Body::from_stream(head_stream.chain(rest)))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                    .unwrap_or_else(|_| rpc_error_with_id(StatusCode::BAD_GATEWAY, "failed to build response", rpc_id));
             }
             Err(e) => {
                 tracing::error!("upstream body read failed mid-response: {}", e);
@@ -622,14 +630,14 @@ pub async fn mcp_proxy(
                 if let Err(e) = sink.record_result(&call, &outcome) {
                     tracing::error!("audit result record failed: {}", e);
                 }
-                return rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed");
+                return rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream response failed", rpc_id);
             }
         }
     }
 
     builder
         .body(Body::from_stream(resp.bytes_stream()))
-        .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"))
+        .unwrap_or_else(|_| rpc_error_with_id(StatusCode::BAD_GATEWAY, "failed to build response", rpc_id))
 }
 
 /// Result of buffering an upstream response up to a byte cap.
@@ -1456,16 +1464,18 @@ async fn multi_initialize(
     headers: &HeaderMap,
     body: Bytes,
     agent: &crate::config::McpAgentConfig,
+    rpc_id: Option<&serde_json::Value>,
 ) -> Response {
     let Some(multi) = &state.multi_app_tokens else {
-        return rpc_error(
+        return rpc_error_with_id(
             StatusCode::INTERNAL_SERVER_ERROR,
             "multi-installation backend missing",
+            rpc_id,
         );
     };
     let owners = route_owners(agent);
     let Some(primary_owner) = owners.first().cloned() else {
-        return rpc_error(StatusCode::BAD_GATEWAY, "agent has no routable repository owners");
+        return rpc_error_with_id(StatusCode::BAD_GATEWAY, "agent has no routable repository owners", rpc_id);
     };
     let upstream = state.config.mcp.upstream();
 
@@ -1485,9 +1495,10 @@ async fn multi_initialize(
                 &upstream,
                 agent,
                 &routes,
-                rpc_error(
+                rpc_error_with_id(
                     StatusCode::BAD_GATEWAY,
                     "no GitHub App installation configured for repository owner",
+                    rpc_id,
                 ),
             )
             .await;
@@ -1502,7 +1513,7 @@ async fn multi_initialize(
                     &upstream,
                     agent,
                     &routes,
-                    rpc_error(StatusCode::BAD_GATEWAY, "upstream credential unavailable"),
+                    rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream credential unavailable", rpc_id),
                 )
                 .await;
             }
@@ -1519,7 +1530,7 @@ async fn multi_initialize(
                 &upstream,
                 agent,
                 &routes,
-                rpc_error(StatusCode::BAD_GATEWAY, "upstream credential misconfigured"),
+                rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream credential misconfigured", rpc_id),
             )
             .await;
         };
@@ -1540,7 +1551,7 @@ async fn multi_initialize(
                     &upstream,
                     agent,
                     &routes,
-                    rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed"),
+                    rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream request failed", rpc_id),
                 )
                 .await;
             }
@@ -1556,7 +1567,7 @@ async fn multi_initialize(
                 &upstream,
                 agent,
                 &routes,
-                rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed"),
+                rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream initialize failed", rpc_id),
             )
             .await;
         }
@@ -1600,7 +1611,7 @@ async fn multi_initialize(
                             &upstream,
                             agent,
                             &routes,
-                            rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed"),
+                            rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream initialize failed", rpc_id),
                         )
                         .await;
                     }
@@ -1615,7 +1626,7 @@ async fn multi_initialize(
                         &upstream,
                         agent,
                         &routes,
-                        rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed"),
+                        rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream initialize failed", rpc_id),
                     )
                     .await;
                 }
@@ -1629,7 +1640,7 @@ async fn multi_initialize(
                         &upstream,
                         agent,
                         &routes,
-                        rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed"),
+                        rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream request failed", rpc_id),
                     )
                     .await;
                 }
@@ -1638,7 +1649,7 @@ async fn multi_initialize(
     }
 
     let Some(primary) = primary_resp else {
-        return rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed");
+        return rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream initialize failed", rpc_id);
     };
 
     // Pin the whole envelope under the primary upstream session ID — the
@@ -1684,7 +1695,7 @@ async fn multi_initialize(
     }
     builder
         .body(Body::from_stream(primary.bytes_stream()))
-        .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"))
+        .unwrap_or_else(|_| rpc_error_with_id(StatusCode::BAD_GATEWAY, "failed to build response", rpc_id))
 }
 
 /// Abort a partially fanned-out initialize: best-effort DELETE of every
@@ -1739,6 +1750,7 @@ async fn multi_fanout(
     body: &Bytes,
     downstream_sid: &str,
     agent: Option<&crate::config::McpAgentConfig>,
+    rpc_id: Option<&serde_json::Value>,
 ) -> Option<Response> {
     let pin = state.mcp_sessions.get(downstream_sid).await?;
     if pin.agent_id.as_deref() != agent.map(|a| a.id.as_str()) {
@@ -1748,7 +1760,7 @@ async fn multi_fanout(
             agent.map(|a| a.id.as_str()),
             session_suffix(Some(downstream_sid))
         );
-        return Some(rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent"));
+        return Some(rpc_error_with_id(StatusCode::FORBIDDEN, "session not owned by this agent", rpc_id));
     }
     let PinnedCred::MultiApp { routes, primary } = &pin.cred else {
         return None;
@@ -1780,7 +1792,7 @@ async fn multi_fanout(
                 .delete(&upstream)
                 .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS))
         } else {
-            return Some(rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"));
+            return Some(rpc_error_with_id(StatusCode::METHOD_NOT_ALLOWED, "method not allowed", rpc_id));
         };
         match req.headers(h).send().await {
             Ok(resp) => {
@@ -1800,7 +1812,7 @@ async fn multi_fanout(
                     }
                     let bytes = resp.bytes().await.unwrap_or_default();
                     primary_result = Some(builder.body(Body::from(bytes)).unwrap_or_else(
-                        |_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"),
+                        |_| rpc_error_with_id(StatusCode::BAD_GATEWAY, "failed to build response", rpc_id),
                     ));
                 } else {
                     let _ = resp.bytes().await;
@@ -1817,7 +1829,7 @@ async fn multi_fanout(
         state.mcp_sessions.invalidate(downstream_sid).await;
     }
 
-    Some(primary_result.unwrap_or_else(|| rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed")))
+    Some(primary_result.unwrap_or_else(|| rpc_error_with_id(StatusCode::BAD_GATEWAY, "upstream request failed", rpc_id)))
 }
 
 /// RAII in-flight counter for per-agent write concurrency caps.
@@ -1858,10 +1870,12 @@ impl Drop for InFlightGuard {
 /// Phase 2a agent authentication.
 /// - No [[mcp.agents]] configured → Phase 1 network-trust mode: Ok(None).
 /// - Agents configured → every request must present a valid X-Octobroker-Key;
-///   missing or unknown keys get 401 with a JSON-RPC error body.
+///   missing or unknown keys get 401 with a JSON-RPC error body. The body
+///   echoes `rpc_id` when the request frame was parsed (#59).
 pub(crate) fn authenticate<'a>(
     state: &'a AppState,
     headers: &HeaderMap,
+    rpc_id: Option<&serde_json::Value>,
 ) -> Result<Option<&'a crate::config::McpAgentConfig>, Box<Response>> {
     let agents = &state.config.mcp.agents;
     if agents.is_empty() {
@@ -1869,7 +1883,7 @@ pub(crate) fn authenticate<'a>(
     }
     let Some(presented) = headers.get("x-octobroker-key").and_then(|v| v.to_str().ok()) else {
         tracing::warn!("MCP request rejected: missing X-Octobroker-Key");
-        return Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "X-Octobroker-Key header required")));
+        return Err(Box::new(rpc_error_with_id(StatusCode::UNAUTHORIZED, "X-Octobroker-Key header required", rpc_id)));
     };
     for agent in agents {
         if agent.keys.iter().any(|k| keys_match(k, presented)) {
@@ -1877,7 +1891,7 @@ pub(crate) fn authenticate<'a>(
         }
     }
     tracing::warn!("MCP request rejected: invalid X-Octobroker-Key");
-    Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "invalid X-Octobroker-Key")))
+    Err(Box::new(rpc_error_with_id(StatusCode::UNAUTHORIZED, "invalid X-Octobroker-Key", rpc_id)))
 }
 
 /// Compare keys via SHA-256 digests. Comparing fixed-length digests of both
@@ -1897,11 +1911,22 @@ fn audit_via(agent: Option<&crate::config::McpAgentConfig>, identity_id: &str) -
 }
 
 /// Minimal JSON-RPC error body for proxy-level failures, so MCP clients that
-/// only speak JSON-RPC degrade gracefully.
+/// only speak JSON-RPC degrade gracefully. Emits `id: null` — only correct
+/// when no request frame exists to correlate with (non-JSON-RPC endpoints,
+/// non-POST requests, unparseable bodies). For any request whose frame was
+/// parsed use `rpc_error_with_id` so the response echoes the request id.
 pub(crate) fn rpc_error(status: StatusCode, message: &str) -> Response {
+    rpc_error_with_id(status, message, None)
+}
+
+/// `rpc_error` echoing the parsed request id. An `id: null` error on an
+/// in-flight call is un-correlatable and leaves strict JSON-RPC clients
+/// (ACP agents, kiro-cli) waiting forever — the residual hang vector #58
+/// left for non-policy paths (#59).
+fn rpc_error_with_id(status: StatusCode, message: &str, rpc_id: Option<&serde_json::Value>) -> Response {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": null,
+        "id": rpc_id.cloned().unwrap_or(serde_json::Value::Null),
         "error": { "code": -32000, "message": message }
     });
     Response::builder()
@@ -2553,14 +2578,28 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // Error body is a JSON-RPC error object, not a bare status
+        // Error body is a JSON-RPC error object, not a bare status. Per #59
+        // it also echoes the request id so the response stays correlatable.
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], serde_json::json!(1));
         assert!(v["error"]["message"].is_string());
 
         // Upstream must never see a request for an unknown session
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_upstream_failure_echoes_request_id() {
+        // #59: an unreachable upstream answers an in-flight call with a
+        // correlated JSON-RPC error, never `id: null`.
+        let state = test_state(&["alice"]); // upstream = http://unused.invalid
+        let resp = mcp_app(state)
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_rpc_error(resp, StatusCode::BAD_GATEWAY, 5, "upstream request failed").await;
     }
 
     #[tokio::test]
@@ -2652,6 +2691,26 @@ data: "id":1,"result":{"tools":[]}}
     }
 
     #[tokio::test]
+    async fn test_auth_failure_echoes_request_id() {
+        // #59: even a rejected key gets a correlated error when the request
+        // frame was parseable — a stale key must not hang the client.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent("bot-a", "key-a", &["issue_read"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
+                &[("x-octobroker-key", "stale-key")],
+            ))
+            .await
+            .unwrap();
+        assert_rpc_error(resp, StatusCode::UNAUTHORIZED, 3, "Octobroker-Key").await;
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_agent_allowed_tool_passes_with_tools_header() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
@@ -2677,6 +2736,21 @@ data: "id":1,"result":{"tools":[]}}
         assert!(reqs[0].octobroker_key.is_none());
         // pooled token injected as usual
         assert_eq!(reqs[0].auth.as_deref(), Some("Bearer token-alice"));
+    }
+
+    /// Assert a protocol-level JSON-RPC error response: the given HTTP status,
+    /// an `error.message` containing `needle`, and an `id` that echoes the
+    /// request id. Regression guard for #59: an rpc_error with `id: null` on
+    /// an in-flight call is un-correlatable and hangs strict clients (the
+    /// same kiro-cli hang #58 fixed for policy denials).
+    async fn assert_rpc_error(resp: Response, status: StatusCode, expected_id: i64, needle: &str) {
+        assert_eq!(resp.status(), status);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], serde_json::json!(expected_id), "rpc_error must echo the request id");
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(needle), "expected {:?} in {:?}", needle, msg);
     }
 
     /// Assert the policy-denial shape: HTTP 200, correlated JSON-RPC id, and
@@ -2836,6 +2910,54 @@ data: "id":1,"result":{"tools":[]}}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_session_binding_403_echoes_request_id() {
+        // #59: the cross-agent 403 must carry the request id — an in-flight
+        // tools/call answered with `id: null` hangs strict JSON-RPC clients.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![
+                agent("bot-a", "key-a", &["issue_read"]),
+                agent("bot-b", "key-b", &["issue_read"]),
+            ],
+        );
+        // bot-a initializes and owns the session
+        mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#,
+                &[("x-octobroker-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+
+        // bot-b presents bot-a's session on an in-flight tools/call → 403
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
+                &[("x-octobroker-key", "key-b"), ("mcp-session-id", "mock-sess-1")],
+            ))
+            .await
+            .unwrap();
+        assert_rpc_error(resp, StatusCode::FORBIDDEN, 7, "not owned").await;
+
+        // JSON-RPC also permits string ids — they must echo verbatim
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":"req-9","method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
+                &[("x-octobroker-key", "key-b"), ("mcp-session-id", "mock-sess-1")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], serde_json::json!("req-9"));
+
+        // Upstream saw only the initialize
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3357,14 +3479,31 @@ data: "id":1,"result":{"tools":[]}}
         format!("http://{}", addr)
     }
 
+    /// Mock GitHub API whose mint endpoint always fails — exercises the
+    /// 502 "upstream credential unavailable" path (#59).
+    async fn spawn_failing_mint() -> String {
+        let app = axum::Router::new().route(
+            "/app/installations/42/access_tokens",
+            axum::routing::post(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
     async fn test_state_app_mode(upstream: &str) -> Arc<AppState> {
         let gh = spawn_mock_github().await;
+        test_state_app_backend(upstream, gh).await
+    }
+
+    async fn test_state_app_backend(upstream: &str, github_api: String) -> Arc<AppState> {
         let provider = crate::app_token::AppTokenProvider::new(
             "12345".into(),
             crate::app_token::tests::TEST_RSA_PEM,
             Some(42),
             None,
-            gh,
+            github_api,
         )
         .unwrap();
         // No PAT identities: App backend is the only credential source
@@ -3486,6 +3625,22 @@ data: "id":1,"result":{"tools":[]}}
         // Pin removed; upstream never called
         assert!(state.mcp_sessions.get("old-sess").await.is_none());
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mint_failure_502_echoes_request_id() {
+        // #59: a transient mint failure on an in-flight tools/call must be
+        // correlatable — `id: null` here hangs strict JSON-RPC clients.
+        let (url, _captured) = spawn_mock_upstream().await;
+        let state = test_state_app_backend(&url, spawn_failing_mint().await).await;
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_rpc_error(resp, StatusCode::BAD_GATEWAY, 9, "credential unavailable").await;
     }
 
     // ---- 2b-4: durable fail-closed audit for write calls ----
@@ -3830,7 +3985,9 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        // #59: the rejection must echo the request id so the in-flight call
+        // completes instead of hanging.
+        assert_rpc_error(resp, StatusCode::TOO_MANY_REQUESTS, 1, "concurrency limit").await;
         assert!(captured.lock().unwrap().is_empty());
         std::fs::remove_file(&path).ok();
     }
@@ -4231,6 +4388,10 @@ data: "id":1,"result":{"tools":[]}}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // #59: the failed-initialize error echoes the request id (0 here)
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], serde_json::json!(0), "rpc_error must echo the request id");
         // No session pinned
         assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_none());
         // Partial-initialize cleanup: every upstream session opened before
@@ -4309,7 +4470,8 @@ data: "id":1,"result":{"tools":[]}}
         captured.lock().unwrap().clear();
 
         // A different agent with a VALID key of its own, presenting b0's
-        // session on tools/call (routed path) → 403, upstream untouched
+        // session on tools/call (routed path) → 403, upstream untouched.
+        // #59: the 403 echoes the request id so the in-flight call completes.
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
@@ -4317,7 +4479,7 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_rpc_error(resp, StatusCode::FORBIDDEN, 1, "not owned").await;
         assert!(captured.lock().unwrap().is_empty());
 
         // Same for DELETE (fan-out path) → 403, pin survives
