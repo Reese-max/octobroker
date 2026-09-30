@@ -25,14 +25,23 @@ impl PatPool {
     pub fn new(configs: &[IdentityConfig]) -> Self {
         let identities: Vec<Identity> = configs
             .iter()
-            .map(|c| Identity { id: c.id.clone(), token: c.token.clone() })
+            .map(|c| Identity {
+                id: c.id.clone(),
+                token: c.token.clone(),
+            })
             .collect();
-        let states = configs.iter().map(|_| RateState {
-            remaining: None,
-            reset_at: None,
-            request_count: 0,
-        }).collect();
-        Self { identities, states: Mutex::new(states) }
+        let states = configs
+            .iter()
+            .map(|_| RateState {
+                remaining: None,
+                reset_at: None,
+                request_count: 0,
+            })
+            .collect();
+        Self {
+            identities,
+            states: Mutex::new(states),
+        }
     }
 
     /// Select the identity with the most remaining rate limit budget.
@@ -41,7 +50,10 @@ impl PatPool {
             return Err("no identities configured");
         }
         let mut states = self.states.lock().unwrap();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         let mut best_idx = 0;
         let mut best_score: i64 = i64::MIN;
@@ -69,7 +81,9 @@ impl PatPool {
     }
 
     pub fn update_rate(&self, id: &str, remaining: Option<u32>, reset_at: Option<u64>) {
-        let Some(idx) = self.identities.iter().position(|i| i.id == id) else { return };
+        let Some(idx) = self.identities.iter().position(|i| i.id == id) else {
+            return;
+        };
         let mut states = self.states.lock().unwrap();
         if let Some(r) = remaining {
             states[idx].remaining = Some(r);
@@ -81,15 +95,19 @@ impl PatPool {
 
     pub fn snapshot(&self) -> Vec<IdentitySnapshot> {
         let states = self.states.lock().unwrap();
-        self.identities.iter().enumerate().map(|(i, ident)| {
-            let state = &states[i];
-            IdentitySnapshot {
-                id: ident.id.clone(),
-                remaining: state.remaining,
-                reset_at: state.reset_at,
-                request_count: state.request_count,
-            }
-        }).collect()
+        self.identities
+            .iter()
+            .enumerate()
+            .map(|(i, ident)| {
+                let state = &states[i];
+                IdentitySnapshot {
+                    id: ident.id.clone(),
+                    remaining: state.remaining,
+                    reset_at: state.reset_at,
+                    request_count: state.request_count,
+                }
+            })
+            .collect()
     }
 }
 

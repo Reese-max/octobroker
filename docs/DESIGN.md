@@ -121,6 +121,14 @@ status alone is never treated as success. Argument values are never logged
 call; ambiguous outcomes are recorded as undeterminable and surfaced to the
 caller.
 
+The trail also records the **deny side**: a policy-refused `tools/call`
+(off-allowlist tool, disallowed or unresolvable repository, writes-disabled)
+appends a `decision:"deny"` record with agent, tool, repo, reason, and
+request id — the RFC's `allow/deny` decision field, since a refused attempt
+is exactly what the policy audit must keep. Deny records are best-effort:
+the refusal is already the safe outcome, so a sink failure loses only the
+line, never the deny.
+
 ## Known constraints & non-goals
 
 - **Single replica** (MCP): session pins are in-process. Horizontal scaling

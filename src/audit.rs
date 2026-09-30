@@ -13,8 +13,9 @@
 //! Privacy: argument VALUES are never recorded — only the argument key
 //! names plus the already-resolved repo target.
 //!
-//! Reads keep the existing best-effort tracing logs; this sink is only in
-//! the path of write-classified calls.
+//! Reads keep the existing best-effort tracing logs; this sink covers
+//! write-classified calls and policy-denied `tools/call`s (`decision:"deny"`,
+//! RFC #15 — a refused attempt is exactly what the policy audit must keep).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -36,6 +37,20 @@ pub struct CallInfo<'a> {
     pub repo: Option<&'a (String, String)>,
 }
 
+/// Everything identifying one policy-denied `tools/call`. Unlike `CallInfo`
+/// there is no `credential` — a denied call never resolves one.
+pub struct DenyInfo<'a> {
+    pub rpc_id: Option<&'a serde_json::Value>,
+    pub session: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub tool: &'a str,
+    pub repo: Option<&'a (String, String)>,
+    /// Argument key NAMES only — values are never recorded.
+    pub arg_keys: &'a [String],
+    /// The policy reason the call was refused.
+    pub reason: &'a str,
+}
+
 /// Parsed outcome of a buffered upstream response.
 #[derive(Debug, PartialEq)]
 pub struct CallOutcome {
@@ -55,7 +70,10 @@ impl AuditSink {
             .append(true)
             .open(path)
             .map_err(|e| format!("cannot open audit log {}: {}", path, e))?;
-        Ok(Self { file: Mutex::new(file), path: path.to_string() })
+        Ok(Self {
+            file: Mutex::new(file),
+            path: path.to_string(),
+        })
     }
 
     /// A sink whose writes always fail (read-only fd) — for fail-closed tests.
@@ -80,6 +98,27 @@ impl AuditSink {
             "repo": call.repo.map(|(o, r)| format!("{}/{}", o, r)),
             "arg_keys": arg_keys,
             "decision": "allow",
+        }))
+    }
+
+    /// Policy-denied `tools/call` record (RFC #15: the trail must capture the
+    /// allow/deny DECISION, not just allowed calls). Denied calls never
+    /// resolve a credential and never reach upstream — `cred` is deliberately
+    /// absent — but the attempt itself is exactly what a policy audit must
+    /// preserve. Best-effort at the call site: the call is already being
+    /// refused, so a sink failure only costs the audit line, never the deny.
+    pub fn record_deny(&self, deny: &DenyInfo) -> Result<(), String> {
+        self.append(serde_json::json!({
+            "ts": unix_now_ms(),
+            "phase": "request",
+            "rpc_id": deny.rpc_id,
+            "session": deny.session,
+            "agent": deny.agent,
+            "tool": deny.tool,
+            "repo": deny.repo.map(|(o, r)| format!("{}/{}", o, r)),
+            "arg_keys": deny.arg_keys,
+            "decision": "deny",
+            "reason": deny.reason,
         }))
     }
 
@@ -204,7 +243,11 @@ mod tests {
 
     fn tmp_path(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("octobroker-audit-{}-{}.jsonl", name, std::process::id()))
+            .join(format!(
+                "octobroker-audit-{}-{}.jsonl",
+                name,
+                std::process::id()
+            ))
             .to_str()
             .unwrap()
             .to_string()
@@ -227,11 +270,17 @@ mod tests {
         let sink = AuditSink::open(&path).unwrap();
         let repo = ("openabdev".to_string(), "octobroker".to_string());
 
-        sink.record_request(&call("create_issue", Some(&repo)), &["owner".into(), "title".into()])
-            .unwrap();
+        sink.record_request(
+            &call("create_issue", Some(&repo)),
+            &["owner".into(), "title".into()],
+        )
+        .unwrap();
         sink.record_result(
             &call("create_issue", Some(&repo)),
-            &CallOutcome { http_status: 200, tool_error: Some(false) },
+            &CallOutcome {
+                http_status: 200,
+                tool_error: Some(false),
+            },
         )
         .unwrap();
 
@@ -253,48 +302,111 @@ mod tests {
     }
 
     #[test]
+    fn test_record_deny() {
+        let path = tmp_path("deny");
+        let sink = AuditSink::open(&path).unwrap();
+        let repo = ("evil".to_string(), "other".to_string());
+        let keys = vec!["owner".to_string(), "repo".to_string(), "title".to_string()];
+        sink.record_deny(&DenyInfo {
+            rpc_id: Some(&serde_json::json!(7)),
+            session: Some("sess-9"),
+            agent: Some("bot-a"),
+            tool: "create_issue",
+            repo: Some(&repo),
+            arg_keys: &keys,
+            reason: "repository not permitted by agent policy",
+        })
+        .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r["phase"], "request");
+        assert_eq!(r["decision"], "deny");
+        assert_eq!(r["rpc_id"], 7);
+        assert_eq!(r["session"], "sess-9");
+        assert_eq!(r["agent"], "bot-a");
+        assert_eq!(r["tool"], "create_issue");
+        assert_eq!(r["repo"], "evil/other");
+        assert_eq!(r["reason"], "repository not permitted by agent policy");
+        // key names only — argument values are never recorded
+        assert_eq!(r["arg_keys"], serde_json::json!(["owner", "repo", "title"]));
+        // denied calls never resolve a credential — no cred field
+        assert!(r.get("cred").is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn test_open_bad_path_fails_loudly() {
-        let err = AuditSink::open("/nonexistent-dir/audit.jsonl").err().unwrap();
+        let err = AuditSink::open("/nonexistent-dir/audit.jsonl")
+            .err()
+            .unwrap();
         assert!(err.contains("cannot open audit log"));
     }
 
     #[test]
     fn test_parse_tool_outcome_plain_json() {
         assert_eq!(
-            parse_tool_outcome(Some("application/json"), br#"{"jsonrpc":"2.0","id":1,"result":{"isError":false,"content":[]}}"#),
+            parse_tool_outcome(
+                Some("application/json"),
+                br#"{"jsonrpc":"2.0","id":1,"result":{"isError":false,"content":[]}}"#
+            ),
             Some(false)
         );
         assert_eq!(
-            parse_tool_outcome(Some("application/json"), br#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[]}}"#),
+            parse_tool_outcome(
+                Some("application/json"),
+                br#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[]}}"#
+            ),
             Some(true)
         );
         // result without isError = success
         assert_eq!(
-            parse_tool_outcome(Some("application/json"), br#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+            parse_tool_outcome(
+                Some("application/json"),
+                br#"{"jsonrpc":"2.0","id":1,"result":{}}"#
+            ),
             Some(false)
         );
         // JSON-RPC error object = failure
         assert_eq!(
-            parse_tool_outcome(Some("application/json"), br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#),
+            parse_tool_outcome(
+                Some("application/json"),
+                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#
+            ),
             Some(true)
         );
         // garbage = undeterminable
-        assert_eq!(parse_tool_outcome(Some("application/json"), b"not json"), None);
+        assert_eq!(
+            parse_tool_outcome(Some("application/json"), b"not json"),
+            None
+        );
     }
 
     #[test]
     fn test_parse_tool_outcome_sse() {
         let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"isError\":true}}\n\n";
-        assert_eq!(parse_tool_outcome(Some("text/event-stream"), body), Some(true));
+        assert_eq!(
+            parse_tool_outcome(Some("text/event-stream"), body),
+            Some(true)
+        );
 
         // multiple frames: last data frame wins
         let body = b"data: {\"x\":1}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"isError\":false}}\n\n";
-        assert_eq!(parse_tool_outcome(Some("text/event-stream"), body), Some(false));
+        assert_eq!(
+            parse_tool_outcome(Some("text/event-stream"), body),
+            Some(false)
+        );
     }
 
     #[test]
     fn test_redacted_arg_keys() {
-        let args = serde_json::json!({"owner":"o","repo":"r","title":"secret text","body":"secret"});
+        let args =
+            serde_json::json!({"owner":"o","repo":"r","title":"secret text","body":"secret"});
         let mut keys = redacted_arg_keys(Some(&args));
         keys.sort();
         assert_eq!(keys, vec!["body", "owner", "repo", "title"]);

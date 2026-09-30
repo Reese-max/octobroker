@@ -77,12 +77,14 @@ enabled = false
 # Idle TTL for MCP session → identity pinning.
 # session_ttl_secs = 3600
 
-# Durable audit trail for write-classified MCP calls (Phase 2b).
-# REQUIRED before writes can be enabled. Two JSONL records per write call
-# (request pre-flight + result), fsync'd. FAIL-CLOSED: if the pre-flight
-# record cannot be persisted, the write call is rejected (503). The result
-# record captures the MCP tool outcome (result.isError) — HTTP 200 alone is
-# not a success signal. Argument VALUES are never recorded (key names only).
+# Durable audit trail for write-classified and policy-denied MCP calls
+# (Phase 2b + RFC #15). REQUIRED before writes can be enabled. Two JSONL
+# records per write call (request pre-flight + result), fsync'd, plus one
+# `decision:"deny"` record per policy-refused tools/call. FAIL-CLOSED: if
+# the pre-flight record cannot be persisted, the write call is rejected
+# (503). The result record captures the MCP tool outcome (result.isError) —
+# HTTP 200 alone is not a success signal. Argument VALUES are never
+# recorded (key names only).
 # [mcp.audit]
 # path = "/var/lib/octobroker/mcp-audit.jsonl"
 # max_result_bytes = 4194304  # response buffer cap for outcome extraction
