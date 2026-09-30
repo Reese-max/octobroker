@@ -43,9 +43,12 @@ struct AppState {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("octobroker=info".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("octobroker=info".parse().unwrap()),
+        )
         .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
-            time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]").unwrap(),
+            time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]")
+                .unwrap(),
         ))
         .init();
 
@@ -115,7 +118,9 @@ async fn main() {
         config.mcp.validate().expect("invalid [mcp] config");
         tracing::info!("MCP reverse proxy enabled → {}", config.mcp.upstream());
         if config.mcp.enable_writes {
-            tracing::warn!("MCP WRITE tools enabled for authenticated agents (audited, App-backed)");
+            tracing::warn!(
+                "MCP WRITE tools enabled for authenticated agents (audited, App-backed)"
+            );
         }
         app = app.route(
             "/mcp",
@@ -184,7 +189,10 @@ async fn proxy(
     }
 
     // Select identity from pool
-    let identity = state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let identity = state
+        .pool
+        .select()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     // Build GitHub API URL
     let mut url = format!("https://api.github.com{}", api_path);
@@ -194,9 +202,14 @@ async fn proxy(
     }
 
     // Forward request
-    let mut req = state.http.get(&url)
+    let mut req = state
+        .http
+        .get(&url)
         .header("Authorization", format!("Bearer {}", identity.token))
-        .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
+        .header(
+            "User-Agent",
+            concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+        )
         .header("Accept", "application/vnd.github+json");
 
     if let Some(version) = headers.get("x-github-api-version") {
@@ -209,16 +222,20 @@ async fn proxy(
     })?;
 
     // Update rate limit from response headers
-    let rate_remaining = resp.headers()
+    let rate_remaining = resp
+        .headers()
         .get("x-ratelimit-remaining")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u32>().ok());
-    let rate_reset = resp.headers()
+    let rate_reset = resp
+        .headers()
         .get("x-ratelimit-reset")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    state.pool.update_rate(&identity.id, rate_remaining, rate_reset);
+    state
+        .pool
+        .update_rate(&identity.id, rate_remaining, rate_reset);
 
     let status = resp.status();
     let body: Value = resp.json().await.map_err(|e| {
@@ -251,7 +268,8 @@ async fn proxy_raw(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let accept = headers.get("accept")
+    let accept = headers
+        .get("accept")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/vnd.github.v3.diff")
         .to_string();
@@ -261,7 +279,10 @@ async fn proxy_raw(
     // never served to a caller that would resolve to a different identity
     // (prevents cross-identity leakage when the pool holds PATs with
     // different repo access).
-    let identity = state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let identity = state
+        .pool
+        .select()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let cache_key = cache::build_raw_key(&api_path, &query, &accept, &identity.id);
 
     let mut url = format!("https://api.github.com{}", api_path);
@@ -275,36 +296,51 @@ async fn proxy_raw(
     let identity_id = identity.id.clone();
     let api_path_for_log = api_path.clone();
 
-    let result = state.cache.get_or_insert_raw(&cache_key, async move {
-        let resp = state_for_fetch.http.get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
-            .header("Accept", &accept)
-            .send()
-            .await
-            .map_err(|e| format!("github request failed: {e}"))?;
+    let result = state
+        .cache
+        .get_or_insert_raw(&cache_key, async move {
+            let resp = state_for_fetch
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header(
+                    "User-Agent",
+                    concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+                )
+                .header("Accept", &accept)
+                .send()
+                .await
+                .map_err(|e| format!("github request failed: {e}"))?;
 
-        let rate_remaining = resp.headers()
-            .get("x-ratelimit-remaining")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u32>().ok());
-        let rate_reset = resp.headers()
-            .get("x-ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-        state_for_fetch.pool.update_rate(&identity_id, rate_remaining, rate_reset);
+            let rate_remaining = resp
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u32>().ok());
+            let rate_reset = resp
+                .headers()
+                .get("x-ratelimit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            state_for_fetch
+                .pool
+                .update_rate(&identity_id, rate_remaining, rate_reset);
 
-        let status = resp.status();
-        let body = resp.text().await.map_err(|_| "failed to read response body".to_string())?;
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .map_err(|_| "failed to read response body".to_string())?;
 
-        if !status.is_success() {
-            tracing::warn!("github returned {}: {}", status, api_path_for_log);
-            // Encode the status so the caller can map it back to an HTTP error.
-            return Err(format!("upstream_status:{}", status.as_u16()));
-        }
+            if !status.is_success() {
+                tracing::warn!("github returned {}: {}", status, api_path_for_log);
+                // Encode the status so the caller can map it back to an HTTP error.
+                return Err(format!("upstream_status:{}", status.as_u16()));
+            }
 
-        Ok(body)
-    }).await;
+            Ok(body)
+        })
+        .await;
 
     match result {
         Ok(body) => {
@@ -342,7 +378,10 @@ async fn graphql_proxy(
 ) -> Result<Json<Value>, StatusCode> {
     let body_value: Value = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let query_str = body_value.get("query").and_then(|q| q.as_str()).unwrap_or("");
+    let query_str = body_value
+        .get("query")
+        .and_then(|q| q.as_str())
+        .unwrap_or("");
     let is_mutation = query_str.trim_start().starts_with("mutation");
 
     // For queries: check cache
@@ -356,7 +395,8 @@ async fn graphql_proxy(
 
     // Mutations: passthrough client's own auth. Queries: use pooled PAT.
     let (auth_header, identity_id) = if is_mutation {
-        let client_auth = headers.get("authorization")
+        let client_auth = headers
+            .get("authorization")
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| {
                 tracing::warn!("mutation rejected: no Authorization header from client");
@@ -366,13 +406,21 @@ async fn graphql_proxy(
         let id = resolve_token_user(&state, &client_auth).await;
         (client_auth, id)
     } else {
-        let identity = state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let identity = state
+            .pool
+            .select()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         (format!("Bearer {}", identity.token), identity.id.clone())
     };
 
-    let resp = state.http.post("https://api.github.com/graphql")
+    let resp = state
+        .http
+        .post("https://api.github.com/graphql")
         .header("Authorization", &auth_header)
-        .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
+        .header(
+            "User-Agent",
+            concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+        )
         .header("Content-Type", "application/json")
         .body(body.to_vec())
         .send()
@@ -383,15 +431,19 @@ async fn graphql_proxy(
         })?;
 
     if !is_mutation {
-        let rate_remaining = resp.headers()
+        let rate_remaining = resp
+            .headers()
             .get("x-ratelimit-remaining")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u32>().ok());
-        let rate_reset = resp.headers()
+        let rate_reset = resp
+            .headers()
             .get("x-ratelimit-reset")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
-        state.pool.update_rate(&identity_id, rate_remaining, rate_reset);
+        state
+            .pool
+            .update_rate(&identity_id, rate_remaining, rate_reset);
     }
 
     let status = resp.status();
@@ -406,10 +458,17 @@ async fn graphql_proxy(
     }
 
     if !is_mutation {
-        state.cache.insert(&cache_key, &resp_body, cache::RouteKind::Other).await;
+        state
+            .cache
+            .insert(&cache_key, &resp_body, cache::RouteKind::Other)
+            .await;
     }
 
-    tracing::info!("200 OK /graphql [via {}]{}", identity_id, if is_mutation { " (mutation)" } else { "" });
+    tracing::info!(
+        "200 OK /graphql [via {}]{}",
+        identity_id,
+        if is_mutation { " (mutation)" } else { "" }
+    );
     Ok(Json(resp_body))
 }
 
@@ -418,17 +477,23 @@ async fn resolve_token_user(state: &AppState, auth_header: &str) -> String {
     if let Some(user) = state.token_users.get(&key).await {
         return user;
     }
-    let user = match state.http.get("https://api.github.com/user")
+    let user = match state
+        .http
+        .get("https://api.github.com/user")
         .header("Authorization", auth_header)
-        .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
+        .header(
+            "User-Agent",
+            concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+        )
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<Value>().await.ok()
-                .and_then(|v| v["login"].as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| "unknown".to_string())
-        }
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v["login"].as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "unknown".to_string()),
         _ => "unknown".to_string(),
     };
     state.token_users.insert(key, user.clone()).await;
@@ -479,7 +544,12 @@ mod tests {
     async fn test_healthz() {
         let state = test_state(vec!["openabdev"]);
         let resp = app(state)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -489,7 +559,12 @@ mod tests {
     async fn test_forbidden_owner() {
         let state = test_state(vec!["openabdev"]);
         let resp = app(state)
-            .oneshot(Request::builder().uri("/repos/evil-org/repo/pulls/1").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/repos/evil-org/repo/pulls/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -499,7 +574,12 @@ mod tests {
     async fn test_raw_forbidden_owner() {
         let state = test_state(vec!["openabdev"]);
         let resp = app(state)
-            .oneshot(Request::builder().uri("/raw/repos/evil-org/repo/pulls/1").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/raw/repos/evil-org/repo/pulls/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -510,7 +590,12 @@ mod tests {
         // Non-repo paths like /rate_limit are allowed (will fail at GitHub but not 403)
         let state = test_state(vec!["openabdev"]);
         let resp = app(state)
-            .oneshot(Request::builder().uri("/rate_limit").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/rate_limit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         // Will be BAD_GATEWAY since fake token can't reach GitHub, but NOT FORBIDDEN
@@ -520,7 +605,10 @@ mod tests {
     #[test]
     fn test_is_allowed_path() {
         let owners = vec!["openabdev".to_string(), "oablab".to_string()];
-        assert!(is_allowed_path("/repos/openabdev/octobroker/pulls/1", &owners));
+        assert!(is_allowed_path(
+            "/repos/openabdev/octobroker/pulls/1",
+            &owners
+        ));
         assert!(is_allowed_path("/repos/oablab/chi/issues", &owners));
         assert!(!is_allowed_path("/repos/evil/repo/pulls/1", &owners));
         // Non-repo paths are allowed
@@ -544,7 +632,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(
             text.contains("not enabled"),

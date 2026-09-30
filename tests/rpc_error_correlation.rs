@@ -143,7 +143,11 @@ fn spawn_stub_mcp() -> StubMcp {
                     r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}"#,
                 )
             } else {
-                json_response(200, &[], r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#)
+                json_response(
+                    200,
+                    &[],
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#,
+                )
             };
             let _ = stream.write_all(resp.as_bytes());
         }
