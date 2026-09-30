@@ -120,6 +120,29 @@ pub struct McpConfig {
     /// pre-flight audit record cannot be persisted is rejected (fail-closed).
     #[serde(default)]
     pub audit: Option<AuditConfig>,
+    /// Human-approval management API (issue #51). Required whenever any
+    /// agent lists `tools_approval`; approval lifecycle records share the
+    /// [mcp.audit] JSONL file.
+    #[serde(default)]
+    pub approvals: Option<ApprovalsConfig>,
+}
+
+/// Human-approval gate configuration (issue #51).
+#[derive(Clone, Deserialize)]
+pub struct ApprovalsConfig {
+    /// Operator credential for the /approvals management API
+    /// (X-Octobroker-Operator-Key). Supports the same secret references as
+    /// agent keys. MUST NOT equal any agent key — approving a high-risk
+    /// write is a different trust decision than holding an agent's
+    /// bounded allowlist.
+    pub operator_key: String,
+    /// TTL (seconds) for pending and approved records alike.
+    #[serde(default = "default_approval_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+fn default_approval_ttl_secs() -> u64 {
+    900
 }
 
 /// Durable audit configuration.
@@ -188,6 +211,15 @@ pub struct McpAgentConfig {
     /// proxy; the same list is injected upstream as X-MCP-Tools.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Approval tier (issue #51): tools allowed only after a human operator
+    /// approves the individual call via the /approvals management API.
+    /// Each tools/call records a durable pending approval and returns a
+    /// structured tool error with the approval id; re-invoking with
+    /// identical arguments consumes the single-use, TTL-bounded approval.
+    /// Mutually exclusive with `tools` for the same name (startup fails on
+    /// overlap); requires enable_writes and [mcp.approvals].
+    #[serde(default)]
+    pub tools_approval: Vec<String>,
     /// Repository allowlist: `owner/repo` (exact) or `owner/*` entries.
     /// When non-empty, every tools/call must resolve to an allowlisted repo
     /// from its arguments; calls with no resolvable repo target are DENIED
@@ -221,6 +253,7 @@ impl Default for McpConfig {
             github_app: None,
             github_apps: Vec::new(),
             audit: None,
+            approvals: None,
         }
     }
 }
@@ -259,12 +292,68 @@ impl McpConfig {
             if !self.github_apps.is_empty() {
                 for agent in &self.agents {
                     if agent.repos.is_empty()
-                        && agent.tools.iter().any(|t| {
-                            crate::policy::classify_tool(t) == crate::policy::ToolKind::Write
-                        })
+                        && agent
+                            .tools
+                            .iter()
+                            .chain(agent.tools_approval.iter())
+                            .any(|t| {
+                                crate::policy::classify_tool(t) == crate::policy::ToolKind::Write
+                            })
                     {
                         return Err(format!(
                             "mcp agent '{}' allowlists write tools but has no `repos` — repo-less agents use pooled PATs and writes never run on pooled PATs",
+                            agent.id
+                        ));
+                    }
+                }
+            }
+        }
+        // Approval tier (issue #51): `tools_approval` is a third policy
+        // tier between allow and deny — allowed only after a human
+        // operator approves the individual call. Each tier must be
+        // unambiguous per tool, and the tier only makes sense with the
+        // full write stack (approved calls execute as writes).
+        for agent in &self.agents {
+            if let Some(dup) = agent
+                .tools
+                .iter()
+                .find(|t| agent.tools_approval.iter().any(|a| a == *t))
+            {
+                return Err(format!(
+                    "mcp agent '{}' lists '{}' in both tools and tools_approval — pick one policy tier per tool",
+                    agent.id, dup
+                ));
+            }
+            if !agent.tools_approval.is_empty() && self.approvals.is_none() {
+                return Err(format!(
+                    "mcp agent '{}' uses tools_approval but [mcp.approvals] is not configured — approval-tier tools need the operator endpoint",
+                    agent.id
+                ));
+            }
+        }
+        if self.agents.iter().any(|a| !a.tools_approval.is_empty()) && !self.enable_writes {
+            return Err(
+                "tools_approval requires enable_writes — an approved call executes as a write"
+                    .into(),
+            );
+        }
+        if let Some(ap) = &self.approvals {
+            if ap.operator_key.trim().is_empty() {
+                return Err("[mcp.approvals] operator_key must not be empty".into());
+            }
+            if self.audit.is_none() {
+                return Err(
+                    "[mcp.approvals] requires [mcp.audit] — approval records share the fail-closed audit JSONL"
+                        .into(),
+                );
+            }
+            // Operator auth must be a separate trust decision: an agent key
+            // must never double as the approval credential.
+            for agent in &self.agents {
+                for k in &agent.keys {
+                    if crate::mcp::keys_match(k, &ap.operator_key) {
+                        return Err(format!(
+                            "[mcp.approvals] operator_key duplicates agent '{}' key — operator auth must be separate from agent keys",
                             agent.id
                         ));
                     }
@@ -524,6 +613,9 @@ impl Config {
             entry.private_key = pem.replace("\\n", "\n");
             entry.owner = entry.owner.trim().to_lowercase();
         }
+        if let Some(ap) = &mut mcp.approvals {
+            ap.operator_key = resolve_secret(&ap.operator_key).await;
+        }
         Config {
             port: raw.port,
             identities,
@@ -724,6 +816,7 @@ mod tests {
             keys: vec!["k".into()],
             tools: vec![],
             repos: vec![],
+            tools_approval: vec![],
             git_credentials_read_only: None,
         });
         assert!(m.validate().unwrap_err().contains("github_app"));
@@ -780,6 +873,7 @@ mod tests {
                 key: None,
                 keys: vec!["k".into()],
                 tools: vec![],
+                tools_approval: vec![],
                 repos: repos.iter().map(|s| s.to_string()).collect(),
                 git_credentials_read_only: None,
             }
@@ -918,6 +1012,7 @@ mod tests {
                 key: None,
                 keys: vec!["k".into()],
                 tools: vec![],
+                tools_approval: vec![],
                 repos: vec!["openabdev/openab".into()],
                 git_credentials_read_only: None,
             }

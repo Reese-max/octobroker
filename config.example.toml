@@ -87,6 +87,17 @@ enabled = false
 # path = "/var/lib/octobroker/mcp-audit.jsonl"
 # max_result_bytes = 4194304  # response buffer cap for outcome extraction
 
+# Optional human-approval management API (issue #51) — REQUIRED whenever
+# any agent lists tools_approval. Every lifecycle transition (request,
+# decision, consume) is appended to the SAME [mcp.audit] JSONL, giving the
+# operator one durable forensic trail. operator_key authenticates the
+# /approvals endpoints via X-Octobroker-Operator-Key and must NOT equal
+# any agent key (startup fails if it does). ttl_secs bounds pending and
+# approved records alike.
+# [mcp.approvals]
+# operator_key = "env:OCTOBROKER_OPERATOR_KEY"
+# ttl_secs = 900
+
 # GitHub App credential backend (Phase 2b) — RECOMMENDED for production MCP.
 # When configured, the MCP path injects short-lived installation tokens
 # (minted lazily, auto-refreshed ~5 min before expiry) instead of pooled
@@ -138,6 +149,12 @@ enabled = false
 # key = "aws:secretsmanager:octobroker/mcp-keys:openab"   # or env:OCTOBROKER_KEY_OPENAB
 # # keys = ["env:OCTOBROKER_KEY_OPENAB", "env:OCTOBROKER_KEY_OPENAB_NEXT"]  # rotation
 # tools = ["issue_read", "list_issues", "pull_request_read"]
+# # Approval tier (issue #51): allowed in principle, but each individual
+# # tools/call is held pending until an operator approves it via
+# # /approvals. Single-use, TTL-bounded, pinned to the exact arguments —
+# # every deny rule still wins. Requires enable_writes + [mcp.approvals],
+# # and must not overlap with `tools`.
+# # tools_approval = ["merge_pull_request"]
 # # Repository allowlist: "owner/repo" exact or "owner/*" wildcard.
 # # Non-empty = every tools/call must resolve to a listed repo from its
 # # arguments; calls with no repo target (e.g. search_code, get_me) are

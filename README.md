@@ -370,7 +370,7 @@ repos = ["openabdev/octobroker", "openabdev/openab"]
 
 How the write path is bounded:
 
-- **Default-deny stack**: agent key → tool allowlist → write classification → repo allowlist (deny-if-unresolvable) → per-agent in-flight cap → fail-closed audit record → forward.
+- **Default-deny stack**: agent key → tool allowlist → write classification → repo allowlist (deny-if-unresolvable) → human-approval gate for `tools_approval` tools (below) → per-agent in-flight cap → fail-closed audit record → forward.
 - **Scoped credentials**: when an agent's `repos` are all exact entries under one owner, its installation token is minted with the API's `repositories` parameter — **GitHub itself enforces the repo boundary**, independent of octobroker's argument parsing. Wildcard or mixed-owner allowlists fall back to an installation-wide token (proxy-side checks still apply).
 - **Audit**: two fsync'd JSONL records per write (pre-flight + result). The result captures the MCP tool outcome (`result.isError`) — HTTP 200 alone is not treated as success. If the pre-flight record cannot be persisted, the write is rejected (503) without reaching GitHub. Argument values are never recorded.
 - **No auto-retry**: octobroker never retries a forwarded call; an ambiguous write outcome (e.g. connection lost mid-response) is recorded as undeterminable and surfaced to the client — retry decisions belong to the caller.
@@ -407,6 +407,78 @@ repos = ["openabdev/octobroker"]
 This is intentionally a narrow surface: octobroker does not expose arbitrary GraphQL or REST, and upstream GitHub MCP tools remain unchanged. Any future octobroker-owned tool must preserve the same explicit allowlist, repository binding, write gate, and audit requirements.
 
 The tool surface returned by `tools/list` shrinks to match the App's actual permissions (verified in the [#22 spike](https://github.com/openabdev/octobroker/issues/22)) — grant conservatively and expand as agents need more.
+
+#### Human approval tier: `tools_approval` (issue #51)
+
+`tools` is binary — a listed tool always executes. A second array,
+`tools_approval`, marks tools that are allowed *in principle* but must be
+approved by a human operator for each individual call:
+
+```toml
+[[mcp.agents]]
+id = "openab-bot"
+keys = ["env:OPENAB_BOT_KEY"]
+tools = ["issue_read", "create_issue", "add_issue_comment"]
+tools_approval = ["merge_pull_request"]
+repos = ["openabdev/*"]
+
+[mcp.approvals]
+operator_key = "env:OCTOBROKER_OPERATOR_KEY" # separate credential, never an agent key
+ttl_secs = 900                              # bounds pending AND approved records
+```
+
+Approval-tier tools require the same write stack as `enable_writes` (App
+credentials + audit): an approved call executes as a normal audited
+write. `tools` and `tools_approval` must not list the same tool name —
+startup fails on the overlap.
+
+**Call flow.** A `tools/call` on an approval-tier tool runs every deny
+rule first (tool allowlist, write gate, repository allowlist — denied
+calls never create approvals). It then durably records the pending
+request in the SAME audit JSONL (`phase: "approval_request"` carrying
+agent, tool, repo, argument key names, and a SHA-256 `args_hash` over the
+canonical argument JSON — never argument values) and returns a tool-level
+error that correlates the request id:
+
+```json
+{"result": {
+  "isError": true,
+  "content": [{"type": "text", "text":
+    "octobroker: this call requires human approval and is pending (approval_id=apv_…, expires_at=…). An operator must approve it via the /approvals management API; then retry the identical call."}],
+  "approval": {"id": "apv_…", "status": "pending", "expires_at": …}}}
+```
+
+Retrying the identical call returns the SAME approval id (deduped — one
+record per unique request) — the agent can wait, escalate, or poll. While
+pending, nothing executes, no upstream credential is minted, and no
+in-flight write slot is consumed.
+
+**Operator decision.** `/approvals` answers a local 404 when
+`[mcp.approvals]` is not configured; otherwise every request needs
+`X-Octobroker-Operator-Key` (startup rejects an operator key that
+duplicates any agent key — approving a high-risk write is a different
+trust decision than holding an agent's bounded allowlist):
+
+```
+GET  /approvals[?status=pending|approved|denied|consumed|expired|all]
+GET  /approvals/{id}
+POST /approvals/{id}/approve
+POST /approvals/{id}/deny
+```
+
+Decisions are single-shot (`409` on re-decision or expiry) and durable:
+`approval_decision` records are fsync'd before state changes, and the
+store replays the JSONL at startup so pending/approved state survives
+restarts.
+
+**Execution.** After approval, a re-invocation with IDENTICAL arguments
+consumes the approval: the hash pins (agent, tool, canonical args), so
+different arguments start a new pending request instead. Consume is the
+last durable step — after the in-flight cap and the audit preflight — so
+a `429`/`503` never burns an approval. Single-use: the next identical
+call needs a fresh approval. And deny rules win end-to-end: every retry
+re-runs the full policy check, so an approval never overrides the tool or
+repository allowlists.
 
 #### Multi-installation routing (one key, many orgs)
 

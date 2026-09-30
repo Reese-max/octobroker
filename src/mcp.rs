@@ -114,14 +114,21 @@ pub async fn mcp_proxy(
             resolved_repo = crate::policy::resolve_repo(f.arguments.as_ref());
         }
     }
+    // Set by the approval gate (below) when an operator has pre-approved
+    // this exact call; consumed at the point of no return before dispatch.
+    let mut approved_consume: Option<(String, String, String, String)> = None;
 
     // Policy enforcement for tools/call — before credential resolution, so
     // denied calls never mint or resolve an upstream credential.
     if let Some(frame) = &frame {
         if frame.method == "tools/call" {
             if let (Some(tool_name), Some(agent)) = (frame.tool.as_deref(), agent) {
-                // 1. Default-deny tool allowlist (authoritative)
-                if !agent.tools.iter().any(|t| t == tool_name) {
+                // 1. Default-deny tool allowlist (authoritative). The
+                //    approval tier counts as "allowed in principle" — the
+                //    human gate below decides whether the call may run.
+                if !agent.tools.iter().any(|t| t == tool_name)
+                    && !agent.tools_approval.iter().any(|t| t == tool_name)
+                {
                     tracing::warn!(
                         "MCP tools/call {} DENIED (not on allowlist) [agent={}]{}",
                         tool_name,
@@ -195,6 +202,79 @@ pub async fn mcp_proxy(
                                     "repository not permitted by agent policy",
                                 );
                             }
+                        }
+                    }
+                }
+                // 4. Human-approval tier (#51): allowed in principle, but
+                //    each individual call requires a prior operator
+                //    decision. Placed AFTER every deny rule so denied
+                //    calls never create approval records (deny wins), and
+                //    BEFORE credential resolution so a pending call never
+                //    mints a token. A pending request does not consume the
+                //    in-flight write cap (acquired below, post-gate).
+                if agent.tools_approval.iter().any(|t| t == tool_name) {
+                    let Some(store) = state.approvals.as_ref() else {
+                        // Startup validation guarantees the store exists
+                        // whenever tools_approval is non-empty.
+                        tracing::error!(
+                            "MCP tools/call {} DENIED (approval backend missing) [agent={}]{}",
+                            tool_name,
+                            agent.id,
+                            session_suffix(session_id.as_deref())
+                        );
+                        return rpc_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "approval backend unavailable",
+                        );
+                    };
+                    let args_hash =
+                        crate::approvals::args_hash(tool_name, frame.arguments.as_ref());
+                    let arg_keys = crate::audit::redacted_arg_keys(frame.arguments.as_ref());
+                    let repo_label = resolved_repo.as_ref().map(|(o, r)| format!("{}/{}", o, r));
+                    match store.gate(
+                        &agent.id,
+                        tool_name,
+                        &args_hash,
+                        &arg_keys,
+                        repo_label.as_deref(),
+                    ) {
+                        Ok(crate::approvals::GateDecision::Approved { id }) => {
+                            tracing::info!(
+                                "MCP tools/call {} operator-approved via {} [agent={}]{}",
+                                tool_name,
+                                id,
+                                agent.id,
+                                session_suffix(session_id.as_deref())
+                            );
+                            approved_consume =
+                                Some((id, agent.id.clone(), tool_name.to_string(), args_hash));
+                        }
+                        Ok(crate::approvals::GateDecision::Pending { id, expires_at }) => {
+                            tracing::warn!(
+                                "MCP tools/call {} PENDING approval {} [agent={}]{}",
+                                tool_name,
+                                id,
+                                agent.id,
+                                session_suffix(session_id.as_deref())
+                            );
+                            return tool_call_pending_approval(
+                                frame.rpc_id.as_ref(),
+                                &id,
+                                expires_at,
+                            );
+                        }
+                        Err(e) => {
+                            // FAIL-CLOSED: the durable pending record could
+                            // not be persisted, so no approval exists to
+                            // audit against — the call must not happen.
+                            tracing::error!(
+                                "approval store unavailable — rejecting call (fail-closed): {}",
+                                e
+                            );
+                            return rpc_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "approval backend unavailable — write rejected",
+                            );
                         }
                     }
                 }
@@ -359,6 +439,47 @@ pub async fn mcp_proxy(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "audit backend unavailable — write rejected",
             );
+        }
+    }
+
+    // Single-use consume of the operator approval — the LAST durable step
+    // before dispatch. It sits after the in-flight cap and the fail-closed
+    // audit preflight so an approval is never burned by infrastructure
+    // failures (429/503); a consume that cannot be persisted aborts the
+    // call (fail-closed).
+    if let Some((approval_id, c_agent, c_tool, c_hash)) = &approved_consume {
+        let Some(store) = state.approvals.as_ref() else {
+            return rpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approval backend unavailable",
+            );
+        };
+        match store.consume(approval_id, c_agent, c_tool, c_hash) {
+            Ok(_) => {}
+            Err(crate::approvals::ConsumeError::Persist(e)) => {
+                tracing::error!(
+                    "approval consume record not durable — rejecting call (fail-closed): {}",
+                    e
+                );
+                return rpc_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "approval backend unavailable — write rejected",
+                );
+            }
+            Err(e) => {
+                // Concurrent identical call burned it first, or it lapsed:
+                // the agent must request a fresh approval.
+                tracing::warn!(
+                    "approval {} not usable at consume time: {} [agent={}]",
+                    approval_id,
+                    e,
+                    c_agent
+                );
+                return tool_call_denied(
+                    frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+                    "approval is no longer valid — submit a new approval request",
+                );
+            }
         }
     }
 
@@ -572,12 +693,18 @@ pub async fn mcp_proxy(
             .map(str::to_string);
         match buffer_body(resp, MAX_BODY_BYTES).await {
             Ok(BufferedBody::Complete(bytes)) => {
-                let body = inject_custom_tools(
-                    &bytes,
-                    content_type.as_deref(),
-                    agent.map(|a| a.tools.as_slice()),
-                )
-                .unwrap_or(bytes);
+                // The advertised surface is the union of both policy tiers:
+                // approval-tier tools are callable (gated), so the agent
+                // may see them.
+                let allowed: Option<Vec<String>> = agent.map(|a| {
+                    a.tools
+                        .iter()
+                        .chain(a.tools_approval.iter())
+                        .cloned()
+                        .collect()
+                });
+                let body = inject_custom_tools(&bytes, content_type.as_deref(), allowed.as_deref())
+                    .unwrap_or(bytes);
                 return builder.body(Body::from(body)).unwrap_or_else(|_| {
                     rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")
                 });
@@ -848,6 +975,40 @@ fn tool_call_denied(rpc_id: Option<&serde_json::Value>, message: &str) -> Respon
         StatusCode::OK,
         format!("octobroker policy denied this call: {}", message),
     )
+}
+
+/// Approval-tier gate (#51): the call is policy-allowed but has no
+/// operator decision yet. Returned as a *successful* JSON-RPC response
+/// carrying a tool-level error — like `tool_call_denied`, so the request
+/// id correlates and the model can read the instruction — plus a
+/// structured `result.approval` object so programmatic clients can poll
+/// or display the pending state without parsing text.
+fn tool_call_pending_approval(
+    rpc_id: Option<&serde_json::Value>,
+    approval_id: &str,
+    expires_at: u64,
+) -> Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id.cloned().unwrap_or(serde_json::Value::Null),
+        "result": {
+            "isError": true,
+            "content": [{"type": "text", "text": format!(
+                "octobroker: this call requires human approval and is pending (approval_id={}, expires_at={}). An operator must approve it via the /approvals management API; then retry the identical call.",
+                approval_id, expires_at
+            )}],
+            "approval": {
+                "id": approval_id,
+                "status": "pending",
+                "expires_at": expires_at,
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static MCP tool response")
 }
 
 fn tool_response(
@@ -2016,7 +2177,7 @@ pub(crate) fn authenticate<'a>(
 /// Compare keys via SHA-256 digests. Comparing fixed-length digests of both
 /// values (rather than the strings themselves) means any timing variance in
 /// the equality check leaks nothing useful about the configured key.
-fn keys_match(configured: &str, presented: &str) -> bool {
+pub(crate) fn keys_match(configured: &str, presented: &str) -> bool {
     use sha2::{Digest, Sha256};
     Sha256::digest(configured.as_bytes()) == Sha256::digest(presented.as_bytes())
 }
@@ -2083,10 +2244,11 @@ fn build_upstream_headers(
         );
     }
     match agent {
-        Some(a) if !a.tools.is_empty() => {
+        Some(a) if !a.tools.is_empty() || !a.tools_approval.is_empty() => {
             let upstream_tools: Vec<&str> = a
                 .tools
                 .iter()
+                .chain(a.tools_approval.iter())
                 .map(String::as_str)
                 .filter(|tool| !is_local_tool(tool))
                 .collect();
@@ -2170,6 +2332,7 @@ mod tests {
             key: None,
             keys: vec![key.to_string()],
             tools: tools.iter().map(|s| s.to_string()).collect(),
+            tools_approval: Vec::new(),
             repos: Vec::new(),
             git_credentials_read_only: None,
         }
@@ -2228,6 +2391,7 @@ mod tests {
                     github_app: None,
                     github_apps: Vec::new(),
                     audit: None,
+                    approvals: None,
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
@@ -2237,6 +2401,7 @@ mod tests {
             multi_app_tokens: None,
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            approvals: None,
         })
     }
 
@@ -3660,6 +3825,7 @@ data: "id":1,"result":{"tools":[]}}
                     github_app: None, // provider injected directly below
                     github_apps: Vec::new(),
                     audit: None,
+                    approvals: None,
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
@@ -3669,6 +3835,7 @@ data: "id":1,"result":{"tools":[]}}
             multi_app_tokens: None,
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            approvals: None,
         })
     }
 
@@ -3813,6 +3980,7 @@ data: "id":1,"result":{"tools":[]}}
                         path: "unused".into(),
                         max_result_bytes: cap,
                     }),
+                    approvals: None,
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
@@ -3822,6 +3990,7 @@ data: "id":1,"result":{"tools":[]}}
             multi_app_tokens: None,
             audit: Some(sink),
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            approvals: None,
         })
     }
 
@@ -4017,6 +4186,7 @@ data: "id":1,"result":{"tools":[]}}
                         path: "unused".into(),
                         max_result_bytes: 1024 * 1024,
                     }),
+                    approvals: None,
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
@@ -4026,6 +4196,7 @@ data: "id":1,"result":{"tools":[]}}
             multi_app_tokens: None,
             audit: Some(sink),
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            approvals: None,
         })
     }
 
@@ -4154,6 +4325,404 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(captured.lock().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- issue #51: tools_approval human-approval tier ----
+
+    fn agent_with_approval(
+        id: &str,
+        key: &str,
+        tools: &[&str],
+        tools_approval: &[&str],
+        repos: &[&str],
+    ) -> config::McpAgentConfig {
+        let mut a = agent_with_repos(id, key, tools, repos);
+        a.tools_approval = tools_approval.iter().map(|s| s.to_string()).collect();
+        a
+    }
+
+    /// Writes-enabled state whose audit JSONL ALSO backs the durable
+    /// approval store — the production wiring (one file, two append
+    /// handles) for the tools_approval tier.
+    fn test_state_approvals(
+        upstream: &str,
+        sink_path: &str,
+        agents: Vec<config::McpAgentConfig>,
+        max_inflight: usize,
+    ) -> Arc<AppState> {
+        let sink = crate::audit::AuditSink::open(sink_path).unwrap();
+        let store = crate::approvals::ApprovalStore::open(sink_path, 900).unwrap();
+        let cache_config = config::CacheConfig::default();
+        let identities = vec![config::IdentityConfig {
+            id: "alice".into(),
+            token: "token-alice".into(),
+        }];
+        Arc::new(AppState {
+            pool: pool::PatPool::new(&identities),
+            cache: cache::Cache::new(&cache_config),
+            config: config::Config {
+                port: 8080,
+                identities,
+                allowed_owners: vec!["openabdev".to_string()],
+                cache: cache_config,
+                mcp: config::McpConfig {
+                    enabled: true,
+                    enable_writes: true,
+                    enable_git_credentials: false,
+                    git_credentials_read_only: false,
+                    upstream: Some(upstream.to_string()),
+                    toolsets: vec![],
+                    session_ttl_secs: 3600,
+                    max_inflight_writes: max_inflight,
+                    agents,
+                    github_app: None, // PAT creds acceptable for unit tests
+                    github_apps: Vec::new(),
+                    audit: Some(config::AuditConfig {
+                        path: "unused".into(),
+                        max_result_bytes: 1024 * 1024,
+                    }),
+                    approvals: Some(config::ApprovalsConfig {
+                        operator_key: "op-key".into(),
+                        ttl_secs: 900,
+                    }),
+                },
+            },
+            token_users: moka::future::Cache::builder().max_capacity(10).build(),
+            http: reqwest::Client::new(),
+            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+            app_tokens: None,
+            multi_app_tokens: None,
+            audit: Some(sink),
+            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            approvals: Some(store),
+        })
+    }
+
+    /// The pending shape: HTTP 200, correlated id, model-visible tool
+    /// error mentioning approval, and a structured result.approval id.
+    async fn assert_pending_approval(resp: Response, expected_id: i64) -> String {
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["id"],
+            serde_json::json!(expected_id),
+            "id must echo the request id"
+        );
+        assert_eq!(v["result"]["isError"], serde_json::json!(true));
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("requires human approval"), "text: {}", text);
+        assert_eq!(v["result"]["approval"]["status"], "pending");
+        let id = v["result"]["approval"]["id"].as_str().unwrap().to_string();
+        assert!(id.starts_with("apv_"), "approval id shape: {}", id);
+        id
+    }
+
+    const MERGE_CALL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"merge_pull_request","arguments":{"owner":"openabdev","repo":"octobroker","pull_number":15}}}"#;
+
+    #[tokio::test]
+    async fn test_approval_tier_returns_pending_and_durable_record() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-pending");
+        let state = test_state_approvals(
+            &url,
+            &path,
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &["issue_read"],
+                &["merge_pull_request"],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MERGE_CALL, &[("x-octobroker-key", "key-w")]))
+            .await
+            .unwrap();
+        let id = assert_pending_approval(resp, 1).await;
+
+        // The call never reached upstream and never minted a credential…
+        assert!(captured.lock().unwrap().is_empty());
+        // …but its durable pending record landed in the audit JSONL —
+        // arg KEYS only, never values.
+        let records = read_audit(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["phase"], "approval_request");
+        assert_eq!(records[0]["id"], id);
+        assert_eq!(records[0]["agent"], "bot-w");
+        assert_eq!(records[0]["tool"], "merge_pull_request");
+        assert_eq!(records[0]["repo"], "openabdev/octobroker");
+        assert_eq!(records[0]["status"], "pending");
+        assert!(!records[0].to_string().contains("\"pull_number\":15"));
+
+        // Identical retry dedups to the SAME pending approval.
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                &MERGE_CALL.replace("\"id\":1", "\"id\":2"),
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(assert_pending_approval(resp, 2).await, id);
+        assert_eq!(read_audit(&path).len(), 1, "deduped — still one record");
+
+        // And a normal allowlisted tool is unaffected.
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"octobroker","issue_number":1}}}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_approved_call_executes_once_then_requires_new_approval() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-once");
+        let state = test_state_approvals(
+            &url,
+            &path,
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &[],
+                &["merge_pull_request"],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MERGE_CALL, &[("x-octobroker-key", "key-w")]))
+            .await
+            .unwrap();
+        let id = assert_pending_approval(resp, 1).await;
+
+        // Operator approves (management API semantics — the store
+        // transition the /approvals endpoint performs).
+        state.approvals.as_ref().unwrap().decide(&id, true).unwrap();
+
+        // Identical re-invocation executes upstream exactly once…
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                &MERGE_CALL.replace("\"id\":1", "\"id\":2"),
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(v.get("error").is_none() && v["result"].is_object());
+        }
+        assert_eq!(captured.lock().unwrap().len(), 1);
+
+        // …and the single-use approval is spent: a third identical call
+        // starts a NEW pending request instead of executing.
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                &MERGE_CALL.replace("\"id\":1", "\"id\":3"),
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        let new_id = assert_pending_approval(resp, 3).await;
+        assert_ne!(new_id, id);
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "consumed approval did not re-execute"
+        );
+
+        // Durable trail: request, decision, consume, then the write's
+        // request/result pair, then the fresh pending request.
+        let records = read_audit(&path);
+        let phases: Vec<&str> = records
+            .iter()
+            .map(|r| r["phase"].as_str().unwrap())
+            .collect();
+        assert!(phases.contains(&"approval_decision"));
+        assert!(phases.contains(&"approval_consume"));
+        assert!(phases.contains(&"request"));
+        assert!(phases.contains(&"result"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_approval_is_pinned_to_exact_arguments() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-hash");
+        let state = test_state_approvals(
+            &url,
+            &path,
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &[],
+                &["merge_pull_request"],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MERGE_CALL, &[("x-octobroker-key", "key-w")]))
+            .await
+            .unwrap();
+        let id = assert_pending_approval(resp, 1).await;
+        state.approvals.as_ref().unwrap().decide(&id, true).unwrap();
+
+        // A DIFFERENT pull_number is a different args hash — the approval
+        // does not transfer; a fresh pending request is created instead.
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                &MERGE_CALL
+                    .replace("\"id\":1", "\"id\":2")
+                    .replace("pull_number\":15", "pull_number\":16"),
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        let id2 = assert_pending_approval(resp, 2).await;
+        assert_ne!(id2, id);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "mismatched args never executed"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_deny_wins_over_approval_tier() {
+        // Every deny rule still applies: a repo-denied call on an
+        // approval-tier tool is DENIED — it must not create an approval
+        // record or reach upstream, even if approvals exist for other
+        // calls.
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-denywins");
+        let state = test_state_approvals(
+            &url,
+            &path,
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &[],
+                &["merge_pull_request"],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"merge_pull_request","arguments":{"owner":"evil","repo":"other","pull_number":1}}}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_tool_denied(resp, 1, "repository not permitted").await;
+        assert!(captured.lock().unwrap().is_empty());
+        assert!(
+            read_audit(&path).is_empty(),
+            "denied calls never create approvals"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_pending_does_not_consume_inflight_cap_and_cap_preserves_approval() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-cap");
+        let state = test_state_approvals(
+            &url,
+            &path,
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &[],
+                &["merge_pull_request"],
+                &["openabdev/octobroker"],
+            )],
+            1,
+        );
+
+        // Saturate the agent's in-flight cap, then request: the gate runs
+        // BEFORE the cap, so a pending response is returned (not 429) and
+        // no cap slot is held by the pending request.
+        let held = InFlightGuard::try_acquire(&state.write_inflight, "bot-w", 1).unwrap();
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MERGE_CALL, &[("x-octobroker-key", "key-w")]))
+            .await
+            .unwrap();
+        let id = assert_pending_approval(resp, 1).await;
+        state.approvals.as_ref().unwrap().decide(&id, true).unwrap();
+
+        // Still saturated: the APPROVED call hits the cap (429) — and the
+        // approval is NOT burned, because consume happens after the cap.
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                &MERGE_CALL.replace("\"id\":1", "\"id\":2"),
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(captured.lock().unwrap().is_empty());
+        drop(held);
+
+        // Retry with a free slot: the same approval still executes.
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                &MERGE_CALL.replace("\"id\":1", "\"id\":3"),
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_approval_tier_tool_in_upstream_allowlist_header() {
+        // tools_approval names ride the same X-MCP-Tools policy injection:
+        // the upstream must allow the call when it is eventually executed.
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-tools-hdr");
+        let state = test_state_approvals(
+            &url,
+            &path,
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &["issue_read"],
+                &["merge_pull_request"],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reqs = captured.lock().unwrap();
+        assert_eq!(
+            reqs[0].tools_hdr.as_deref(),
+            Some("issue_read,merge_pull_request")
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -4342,6 +4911,7 @@ data: "id":1,"result":{"tools":[]}}
                         path: "unused".into(),
                         max_result_bytes: 1024 * 1024,
                     }),
+                    approvals: None,
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
@@ -4351,6 +4921,7 @@ data: "id":1,"result":{"tools":[]}}
             multi_app_tokens: Some(multi),
             audit: sink,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            approvals: None,
         })
     }
 

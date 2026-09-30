@@ -1,4 +1,6 @@
 mod app_token;
+mod approvals;
+mod approvals_api;
 mod audit;
 mod cache;
 mod config;
@@ -38,6 +40,10 @@ struct AppState {
     audit: Option<audit::AuditSink>,
     /// Per-agent in-flight write call counters (2b-5 concurrency cap).
     write_inflight: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    /// Durable human-approval store for the tools_approval policy tier
+    /// (#51). Shares the [mcp.audit] JSONL file. None = approval tier and
+    /// the /approvals management API are disabled.
+    approvals: Option<approvals::ApprovalStore>,
 }
 
 #[tokio::main]
@@ -91,6 +97,27 @@ async fn main() {
         sink
     });
 
+    // Human-approval store (issue #51): shares the audit JSONL so every
+    // lifecycle transition lands in the same durable forensic trail.
+    // Requires [mcp.audit] even when the MCP proxy itself is off — there is
+    // no durable path without it.
+    let approvals = config.mcp.approvals.as_ref().map(|ap| {
+        let audit_path = &config
+            .mcp
+            .audit
+            .as_ref()
+            .expect("[mcp.approvals] requires [mcp.audit] — approval records share the audit JSONL")
+            .path;
+        let store = approvals::ApprovalStore::open(audit_path, ap.ttl_secs)
+            .expect("invalid [mcp.approvals] config");
+        tracing::info!(
+            "MCP approval gate enabled → /approvals (records → {}, ttl={}s)",
+            audit_path,
+            ap.ttl_secs
+        );
+        store
+    });
+
     let state = Arc::new(AppState {
         pool,
         cache,
@@ -105,6 +132,7 @@ async fn main() {
         multi_app_tokens,
         audit,
         write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        approvals,
     });
 
     let mut app = base_router();
@@ -149,6 +177,16 @@ fn base_router() -> Router<Arc<AppState>> {
         .route("/stats", get(stats))
         .route("/graphql", post(graphql_proxy))
         .route("/git-credential", get(git_credential::git_credential))
+        // Human-approval management API (#51). Exact static routes win
+        // over the /{*path} catch-all; the handlers answer a local 404
+        // whenever [mcp.approvals] is not configured.
+        .route("/approvals", get(approvals_api::list_approvals))
+        .route("/approvals/{id}", get(approvals_api::get_approval))
+        .route(
+            "/approvals/{id}/approve",
+            post(approvals_api::approve_approval),
+        )
+        .route("/approvals/{id}/deny", post(approvals_api::deny_approval))
         .route("/raw/{*path}", get(proxy_raw))
         .route("/{*path}", get(proxy))
 }
@@ -532,6 +570,7 @@ mod tests {
             multi_app_tokens: None,
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            approvals: None,
         })
     }
 
@@ -553,6 +592,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_approvals_route_wins_over_catchall() {
+        // /approvals and /approvals/{id}[/{approve,deny}] must reach the
+        // management handlers — not the /{*path} GitHub catch-all. With no
+        // [mcp.approvals] config the handlers answer their own local 404,
+        // not the proxy's 403 for non-repo paths.
+        let state = test_state(vec!["openabdev"]);
+        for (method, uri) in [
+            ("GET", "/approvals"),
+            ("GET", "/approvals?status=pending"),
+            ("GET", "/approvals/apv_x"),
+            ("POST", "/approvals/apv_x/approve"),
+            ("POST", "/approvals/apv_x/deny"),
+        ] {
+            let resp = app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{} {}", method, uri);
+        }
     }
 
     #[tokio::test]

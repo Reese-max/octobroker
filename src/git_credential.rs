@@ -310,6 +310,7 @@ mod tests {
             key: None,
             keys: vec![key.into()],
             tools: vec![],
+            tools_approval: vec![],
             repos: repos.iter().map(|s| s.to_string()).collect(),
             git_credentials_read_only: None,
         }
@@ -392,6 +393,7 @@ mod tests {
                         github_app: None,
                         github_apps: entries,
                         audit: None,
+                        approvals: None,
                     },
                 },
                 token_users: moka::future::Cache::builder().max_capacity(10).build(),
@@ -401,6 +403,7 @@ mod tests {
                 multi_app_tokens: Some(multi),
                 audit: sink,
                 write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                approvals: None,
             }),
             mint_log,
         )
