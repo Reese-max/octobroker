@@ -170,6 +170,46 @@ pub struct GithubAppsEntry {
     pub owner: String,
 }
 
+/// One grant (policy v2, #35): a tool allowlist paired with a repository
+/// allowlist. A `tools/call` is authorized by a grant when the tool is in
+/// `tools` AND (the grant's `repos` is empty — matches any target — OR the
+/// resolved repository matches `repos`). At least one effective grant must
+/// match; the policy is otherwise default-deny.
+#[derive(Clone, Deserialize, Default)]
+pub struct McpGrantConfig {
+    /// Optional label recorded in audit records for traceability. Defaults
+    /// to `grants[<index>]`; the implicit flat grant is always `flat`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Exact tool names allowed by this grant. Empty = allows no tools.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Repository allowlist for this grant: `owner/repo` or `owner/*`
+    /// (case-insensitive). Empty = this grant matches any repository target,
+    /// including calls with no resolvable repo.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Optional mint-time permission scoping for the GitHub App installation
+    /// token: permission name → access level ("read" | "write" | "admin").
+    /// The token minted for an owner carries the union of `permissions`
+    /// across the grants covering it (highest access wins on conflicts). If
+    /// ANY covering grant leaves `permissions` unset the mint is unscoped —
+    /// that grant needs the installation's default permission set.
+    /// Omitted everywhere → minting is unchanged.
+    #[serde(default)]
+    pub permissions: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// Borrowed view of one effective grant — either an explicit `[[grants]]`
+/// entry or the flat `tools`/`repos` fields acting as a single implicit
+/// grant (id `"flat"`).
+pub struct GrantView<'a> {
+    pub id: String,
+    pub tools: &'a [String],
+    pub repos: &'a [String],
+    pub permissions: Option<&'a std::collections::BTreeMap<String, String>>,
+}
+
 /// One authenticated MCP agent: key(s) → identity → tool allowlist.
 #[derive(Clone, Deserialize)]
 pub struct McpAgentConfig {
@@ -185,15 +225,25 @@ pub struct McpAgentConfig {
     pub keys: Vec<String>,
     /// Default-deny tool allowlist (exact upstream tool names, e.g.
     /// "issue_read"). tools/call for anything not listed is rejected at the
-    /// proxy; the same list is injected upstream as X-MCP-Tools.
+    /// proxy; the same list is injected upstream as X-MCP-Tools. With
+    /// `grants`, the flat `tools`+`repos` fields act as one additional
+    /// implicit grant (fully backward compatible — union semantics).
     #[serde(default)]
     pub tools: Vec<String>,
     /// Repository allowlist: `owner/repo` (exact) or `owner/*` entries.
     /// When non-empty, every tools/call must resolve to an allowlisted repo
     /// from its arguments; calls with no resolvable repo target are DENIED
     /// (deny-if-unresolvable). Empty = no repository restriction.
+    /// With `grants`, see `tools` — the flat pair is one implicit grant.
     #[serde(default)]
     pub repos: Vec<String>,
+    /// Grant-based policy (policy v2, #35): each grant pairs a tool allowlist
+    /// with a repo allowlist, so one agent can be read-only on repo-A while
+    /// writing on repo-B. A tools/call must match ≥1 effective grant on both
+    /// axes; deny-if-unresolvable applies only when every grant carrying the
+    /// tool is repo-restricted.
+    #[serde(default)]
+    pub grants: Vec<McpGrantConfig>,
     /// Per-agent override of `[mcp] git_credentials_read_only`.
     /// `true` = this agent's /git-credential tokens are minted `contents:
     /// read` (clone/fetch, no push) regardless of the global default;
@@ -204,6 +254,154 @@ pub struct McpAgentConfig {
     /// agent-controlled.
     #[serde(default)]
     pub git_credentials_read_only: Option<bool>,
+}
+
+impl McpAgentConfig {
+    /// Every effective grant in evaluation order: the flat `tools`/`repos`
+    /// sugar first (id `"flat"`, present only when either field is set —
+    /// an entirely empty flat pair authorizes nothing and is not a grant),
+    /// then each `[[grants]]` entry in declaration order.
+    pub fn each_grant(&self) -> impl Iterator<Item = GrantView<'_>> + '_ {
+        let flat = (!self.tools.is_empty() || !self.repos.is_empty()).then(|| GrantView {
+            id: "flat".to_string(),
+            tools: &self.tools,
+            repos: &self.repos,
+            permissions: None,
+        });
+        flat.into_iter()
+            .chain(self.grants.iter().enumerate().map(|(i, g)| {
+                GrantView {
+                    id: g
+                        .id
+                        .as_deref()
+                        .filter(|id| !id.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("grants[{i}]")),
+                    tools: &g.tools,
+                    repos: &g.repos,
+                    permissions: g.permissions.as_ref(),
+                }
+            }))
+    }
+
+    /// True when `tool` appears in at least one effective grant.
+    pub fn tool_granted(&self, tool: &str) -> bool {
+        self.each_grant().any(|g| g.tools.iter().any(|t| t == tool))
+    }
+
+    /// First effective grant authorizing `tool` on `repo` — the grant whose
+    /// `tools` contains the tool AND whose `repos` is empty (any target,
+    /// including unresolvable ones) or contains the resolved repo. None when
+    /// no grant matches (deny).
+    pub fn matching_grant(&self, tool: &str, repo: Option<(&str, &str)>) -> Option<GrantView<'_>> {
+        self.each_grant()
+            .filter(|g| g.tools.iter().any(|t| t == tool))
+            .find(|g| {
+                g.repos.is_empty()
+                    || repo
+                        .map(|(o, r)| crate::policy::repo_allowed(g.repos, o, r))
+                        .unwrap_or(false)
+            })
+    }
+
+    /// Union of tools across all effective grants — declaration order,
+    /// deduplicated. This is the agent's full surface for `tools/list`
+    /// filtering and the `X-MCP-Tools` upstream header (design wrinkle 1).
+    pub fn allowed_tools(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for grant in self.each_grant() {
+            for t in grant.tools {
+                if !out.iter().any(|x| x == t) {
+                    out.push(t.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Union of repo entries across all effective grants — flat `repos` plus
+    /// every `[[grants]].repos`, in declaration order.
+    pub fn repo_entries(&self) -> impl Iterator<Item = &str> {
+        self.repos
+            .iter()
+            .chain(self.grants.iter().flat_map(|g| g.repos.iter()))
+            .map(String::as_str)
+    }
+
+    /// Owners covered by the agent's repo entries — the union drives
+    /// multi-installation routing (one upstream session per owner).
+    /// Malformed entries (no `owner/`) never contribute an owner.
+    pub fn route_owners(&self) -> Vec<String> {
+        let mut owners: Vec<String> = self
+            .repo_entries()
+            .filter_map(|e| e.split_once('/').map(|(o, _)| o.trim().to_lowercase()))
+            .filter(|o| !o.is_empty())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        owners
+    }
+
+    /// Mint-time permission envelope covering `owner` (None = every grant,
+    /// single-installation mode). Union merge across the grants that can
+    /// authorize calls on that owner: the highest access level wins on
+    /// conflicts. `None` = unscoped mint (installation defaults) — either no
+    /// covering grant sets `permissions`, or one covering grant leaves it
+    /// unset and therefore needs the App's full permission set.
+    pub fn permissions_envelope(&self, owner: Option<&str>) -> Option<serde_json::Value> {
+        let mut merged = std::collections::BTreeMap::<String, String>::new();
+        let mut any_scoped = false;
+        for grant in self.each_grant() {
+            // Grants that authorize no calls need no token permissions.
+            if grant.tools.is_empty() {
+                continue;
+            }
+            if let Some(o) = owner {
+                // A grant covers this owner when it is repo-unrestricted or
+                // names a repo under it.
+                let covers = grant.repos.is_empty()
+                    || grant.repos.iter().any(|e| {
+                        e.split_once('/')
+                            .is_some_and(|(go, _)| go.trim().eq_ignore_ascii_case(o))
+                    });
+                if !covers {
+                    continue;
+                }
+            }
+            // An explicitly empty `permissions = {}` means the same as an
+            // unset one — "no envelope" — not "zero permissions" (GitHub
+            // would mint a token that can do nothing).
+            let perms = grant.permissions.filter(|m| !m.is_empty())?;
+            any_scoped = true;
+            for (k, v) in perms {
+                merged
+                    .entry(k.clone())
+                    .and_modify(|e| {
+                        if perm_rank(v) > perm_rank(e) {
+                            e.clone_from(v);
+                        }
+                    })
+                    .or_insert_with(|| v.clone());
+            }
+        }
+        if any_scoped {
+            serde_json::to_value(merged).ok()
+        } else {
+            None
+        }
+    }
+}
+
+/// Ordering for merging GitHub App permission levels: higher wins.
+/// Values are validated at startup; unknown values rank highest so a
+/// misconfiguration widens rather than silently narrows.
+fn perm_rank(level: &str) -> u8 {
+    match level {
+        "read" => 1,
+        "write" => 2,
+        "admin" => 3,
+        _ => u8::MAX,
+    }
 }
 
 impl Default for McpConfig {
@@ -249,18 +447,20 @@ impl McpConfig {
                 return Err("enable_writes requires [mcp.github_app] or [[mcp.github_apps]] — writes never run on pooled PATs".into());
             }
             if self.audit.is_none() {
-                return Err("enable_writes requires [mcp.audit] — writes are fail-closed audited".into());
+                return Err(
+                    "enable_writes requires [mcp.audit] — writes are fail-closed audited".into(),
+                );
             }
             // Multi-installation mode: repo-less agents ride pooled PATs, and
             // writes never run on pooled PATs — an agent allowlisting a
-            // write-classified tool must be repository-scoped.
+            // write-classified tool must be repository-scoped (via flat
+            // `repos` or any grant's `repos`).
             if !self.github_apps.is_empty() {
                 for agent in &self.agents {
-                    if agent.repos.is_empty()
-                        && agent
-                            .tools
-                            .iter()
-                            .any(|t| crate::policy::classify_tool(t) == crate::policy::ToolKind::Write)
+                    if agent.route_owners().is_empty()
+                        && agent.allowed_tools().iter().any(|t| {
+                            crate::policy::classify_tool(t) == crate::policy::ToolKind::Write
+                        })
                     {
                         return Err(format!(
                             "mcp agent '{}' allowlists write tools but has no `repos` — repo-less agents use pooled PATs and writes never run on pooled PATs",
@@ -281,7 +481,10 @@ impl McpConfig {
                 return Err("enable_git_credentials requires [mcp.github_app] or [[mcp.github_apps]] — git credentials are App installation tokens, never PATs".into());
             }
             if self.audit.is_none() {
-                return Err("enable_git_credentials requires [mcp.audit] — issuance is fail-closed audited".into());
+                return Err(
+                    "enable_git_credentials requires [mcp.audit] — issuance is fail-closed audited"
+                        .into(),
+                );
             }
             if self
                 .github_app
@@ -297,7 +500,8 @@ impl McpConfig {
         }
         // Multi-app validation
         if !self.github_apps.is_empty() {
-            let mut seen_owners: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_owners: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for entry in &self.github_apps {
                 let normalized = entry.owner.trim().to_lowercase();
                 if normalized.is_empty() {
@@ -319,7 +523,7 @@ impl McpConfig {
                 return Err("[[mcp.github_apps]] requires [[mcp.agents]] — multi-installation routing is not available in network-trust mode".into());
             }
             for agent in &self.agents {
-                for repo_entry in &agent.repos {
+                for repo_entry in agent.repo_entries() {
                     // Strict form: `owner/name` or `owner/*` — no empty or
                     // whitespace-padded parts, no extra path segments.
                     // Sloppy entries would silently widen token scope
@@ -352,6 +556,23 @@ impl McpConfig {
                 }
             }
         }
+        // Grant permission levels are minted verbatim into the GitHub App
+        // installation-token `permissions` parameter — reject unknown access
+        // levels at startup rather than at first mint.
+        for agent in &self.agents {
+            for (gi, grant) in agent.grants.iter().enumerate() {
+                if let Some(perms) = &grant.permissions {
+                    for (key, level) in perms {
+                        if !matches!(level.as_str(), "read" | "write" | "admin") {
+                            return Err(format!(
+                                "mcp agent '{}' grant {} permission '{}' has invalid level '{}' — expected read, write, or admin",
+                                agent.id, gi, key, level
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -359,18 +580,40 @@ impl McpConfig {
 fn default_mcp_upstream() -> String {
     "https://api.githubcopilot.com/mcp/readonly".to_string()
 }
-fn default_mcp_session_ttl() -> u64 { 3600 }
-fn default_mcp_max_inflight_writes() -> usize { 4 }
+fn default_mcp_session_ttl() -> u64 {
+    3600
+}
+fn default_mcp_max_inflight_writes() -> usize {
+    4
+}
 
-fn default_port() -> u16 { 8080 }
-fn default_max_entries() -> u64 { 10000 }
-fn default_pr_ttl() -> u64 { 30 }
-fn default_run_ttl() -> u64 { 15 }
-fn default_raw_ttl() -> u64 { 30 }
-fn default_raw_max_bytes() -> u64 { 256 * 1024 * 1024 } // 256 MiB
-fn default_commit_ttl() -> u64 { 120 }
-fn default_repo_ttl() -> u64 { 300 }
-fn default_ttl() -> u64 { 60 }
+fn default_port() -> u16 {
+    8080
+}
+fn default_max_entries() -> u64 {
+    10000
+}
+fn default_pr_ttl() -> u64 {
+    30
+}
+fn default_run_ttl() -> u64 {
+    15
+}
+fn default_raw_ttl() -> u64 {
+    30
+}
+fn default_raw_max_bytes() -> u64 {
+    256 * 1024 * 1024
+} // 256 MiB
+fn default_commit_ttl() -> u64 {
+    120
+}
+fn default_repo_ttl() -> u64 {
+    300
+}
+fn default_ttl() -> u64 {
+    60
+}
 
 // Raw TOML structures (before secret resolution)
 #[derive(Deserialize)]
@@ -399,15 +642,19 @@ impl Config {
             match fs::read_to_string(&path) {
                 Ok(content) => {
                     tracing::info!("loading config from {}", path);
-                    let raw: RawConfig = toml::from_str(&content)
-                        .expect("failed to parse config file");
+                    let raw: RawConfig =
+                        toml::from_str(&content).expect("failed to parse config file");
                     let mut config = Self::from_raw(raw).await;
                     config.apply_env_overrides();
                     return config;
                 }
                 Err(e) => {
                     // Most likely a typo'd OCTOBROKER_CONFIG — don't fail silently
-                    tracing::warn!("cannot read config at {}: {} — falling back to env-only mode", path, e);
+                    tracing::warn!(
+                        "cannot read config at {}: {} — falling back to env-only mode",
+                        path,
+                        e
+                    );
                 }
             }
         }
@@ -426,7 +673,13 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_port());
 
-        let mut config = Config { port, identities, allowed_owners, cache: CacheConfig::default(), mcp: McpConfig::default() };
+        let mut config = Config {
+            port,
+            identities,
+            allowed_owners,
+            cache: CacheConfig::default(),
+            mcp: McpConfig::default(),
+        };
         config.apply_env_overrides();
         config
     }
@@ -498,10 +751,16 @@ impl Config {
 
     fn apply_env_overrides(&mut self) {
         if let Ok(v) = std::env::var("OCTOBROKER_PORT") {
-            if let Ok(p) = v.parse() { self.port = p; }
+            if let Ok(p) = v.parse() {
+                self.port = p;
+            }
         }
         if let Ok(v) = std::env::var("OCTOBROKER_ALLOWED_OWNERS") {
-            self.allowed_owners = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            self.allowed_owners = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         if let Ok(v) = std::env::var("OCTOBROKER_MCP_ENABLED") {
             self.mcp.enabled = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes");
@@ -527,8 +786,7 @@ impl Config {
 ///   (anything else) — used as literal value
 async fn resolve_secret(value: &str) -> String {
     if let Some(rest) = value.strip_prefix("env:") {
-        return std::env::var(rest)
-            .unwrap_or_else(|_| panic!("env var {} not set", rest));
+        return std::env::var(rest).unwrap_or_else(|_| panic!("env var {} not set", rest));
     }
     if let Some(rest) = value.strip_prefix("aws:secretsmanager:") {
         return resolve_aws_secret(rest).await;
@@ -541,20 +799,22 @@ async fn resolve_secret(value: &str) -> String {
 
 async fn resolve_aws_secret(spec: &str) -> String {
     // spec = "secret-name:json-key"
-    let (secret_name, json_key) = spec.split_once(':')
+    let (secret_name, json_key) = spec
+        .split_once(':')
         .expect("aws secret ref must be aws:secretsmanager:<name>:<key>");
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = aws_sdk_secretsmanager::Client::new(&config);
-    let resp = client.get_secret_value()
+    let resp = client
+        .get_secret_value()
         .secret_id(secret_name)
         .send()
         .await
         .expect("failed to fetch secret from AWS Secrets Manager");
-    let secret_string = resp.secret_string()
-        .expect("secret has no string value");
-    let parsed: serde_json::Value = serde_json::from_str(secret_string)
-        .expect("secret value is not valid JSON");
-    parsed[json_key].as_str()
+    let secret_string = resp.secret_string().expect("secret has no string value");
+    let parsed: serde_json::Value =
+        serde_json::from_str(secret_string).expect("secret value is not valid JSON");
+    parsed[json_key]
+        .as_str()
         .unwrap_or_else(|| panic!("key '{}' not found in secret '{}'", json_key, secret_name))
         .to_string()
 }
@@ -563,9 +823,11 @@ fn resolve_k8s_secret(spec: &str) -> String {
     // spec = "namespace/secret-name:key"
     // Reads from /var/run/secrets/kubernetes.io/serviceaccount/.. mounted path
     // or the standard projected volume path: /etc/secrets/<secret-name>/<key>
-    let (path_part, key) = spec.split_once(':')
+    let (path_part, key) = spec
+        .split_once(':')
         .expect("k8s secret ref must be k8s:<namespace>/<secret-name>:<key>");
-    let (_, secret_name) = path_part.split_once('/')
+    let (_, secret_name) = path_part
+        .split_once('/')
         .expect("k8s secret ref must include namespace/secret-name");
     let file_path = format!("/etc/secrets/{}/{}", secret_name, key);
     fs::read_to_string(&file_path)
@@ -596,7 +858,11 @@ mod tests {
         std::env::remove_var("OCTOBROKER_CONFIG");
         std::env::set_var("XDG_CONFIG_HOME", &tmp);
 
-        assert_eq!(Config::resolve_config_path(), None, "no file anywhere → env-only");
+        assert_eq!(
+            Config::resolve_config_path(),
+            None,
+            "no file anywhere → env-only"
+        );
 
         // ./config.toml in cwd is found
         fs::write(cwd_dir.join("config.toml"), "port = 1\n").unwrap();
@@ -662,21 +928,39 @@ mod tests {
 
     #[test]
     fn test_mcp_validate_write_gate() {
-        let mut m = McpConfig { enabled: true, enable_writes: true, ..Default::default() };
+        let mut m = McpConfig {
+            enabled: true,
+            enable_writes: true,
+            ..Default::default()
+        };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
         m.agents.push(McpAgentConfig {
-            id: "a".into(), key: None, keys: vec!["k".into()], tools: vec![], repos: vec![],
+            id: "a".into(),
+            key: None,
+            keys: vec!["k".into()],
+            tools: vec![],
+            repos: vec![],
+            grants: Vec::new(),
             git_credentials_read_only: None,
         });
         assert!(m.validate().unwrap_err().contains("github_app"));
         m.github_app = Some(GithubAppConfig {
-            app_id: "1".into(), private_key: "pem".into(), installation_id: Some(1), owner: None,
+            app_id: "1".into(),
+            private_key: "pem".into(),
+            installation_id: Some(1),
+            owner: None,
         });
         assert!(m.validate().unwrap_err().contains("audit"));
-        m.audit = Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 });
+        m.audit = Some(AuditConfig {
+            path: "/tmp/a.jsonl".into(),
+            max_result_bytes: 1024,
+        });
         assert!(m.validate().is_ok());
         // reads-only config never requires anything
-        let m = McpConfig { enabled: true, ..Default::default() };
+        let m = McpConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(m.validate().is_ok());
     }
 
@@ -684,9 +968,16 @@ mod tests {
     fn test_mcp_upstream_default_flips_with_writes() {
         let m = McpConfig::default();
         assert!(m.upstream().ends_with("/readonly"));
-        let m = McpConfig { enable_writes: true, ..Default::default() };
+        let m = McpConfig {
+            enable_writes: true,
+            ..Default::default()
+        };
         assert_eq!(m.upstream(), "https://api.githubcopilot.com/mcp/");
-        let m = McpConfig { upstream: Some("http://x/".into()), enable_writes: true, ..Default::default() };
+        let m = McpConfig {
+            upstream: Some("http://x/".into()),
+            enable_writes: true,
+            ..Default::default()
+        };
         assert_eq!(m.upstream(), "http://x/");
     }
 
@@ -707,6 +998,7 @@ mod tests {
                 keys: vec!["k".into()],
                 tools: vec![],
                 repos: repos.iter().map(|s| s.to_string()).collect(),
+                grants: Vec::new(),
                 git_credentials_read_only: None,
             }
         }
@@ -714,8 +1006,10 @@ mod tests {
         // mutually exclusive with the singular form
         let m = McpConfig {
             github_app: Some(GithubAppConfig {
-                app_id: "1".into(), private_key: "pem".into(),
-                installation_id: Some(1), owner: None,
+                app_id: "1".into(),
+                private_key: "pem".into(),
+                installation_id: Some(1),
+                owner: None,
             }),
             github_apps: vec![entry("openabdev")],
             agents: vec![multi_agent(&["openabdev/x"])],
@@ -740,7 +1034,10 @@ mod tests {
         assert!(m.validate().unwrap_err().contains("empty owner"));
 
         // agents required in multi mode (routing needs an envelope)
-        let m = McpConfig { github_apps: vec![entry("openabdev")], ..Default::default() };
+        let m = McpConfig {
+            github_apps: vec![entry("openabdev")],
+            ..Default::default()
+        };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
 
         // repo-less agents are allowed (legacy PAT read path)…
@@ -760,7 +1057,10 @@ mod tests {
             enable_git_credentials: false,
             github_apps: vec![entry("openabdev")],
             agents: vec![wa],
-            audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
+            audit: Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            }),
             ..Default::default()
         };
         assert!(m.validate().unwrap_err().contains("pooled PATs"));
@@ -771,7 +1071,10 @@ mod tests {
             agents: vec![multi_agent(&["openabdev/x", "oablab/chi"])],
             ..Default::default()
         };
-        assert!(m.validate().unwrap_err().contains("no [[mcp.github_apps]] entry"));
+        assert!(m
+            .validate()
+            .unwrap_err()
+            .contains("no [[mcp.github_apps]] entry"));
 
         // malformed repo entry rejected
         let m = McpConfig {
@@ -782,7 +1085,13 @@ mod tests {
         assert!(m.validate().unwrap_err().contains("malformed"));
 
         // sloppy entries that would widen scope or fail at runtime: rejected
-        for bad in ["openabdev/", "openabdev/repo/extra", "openabdev / repo", "openabdev/ repo", "/repo"] {
+        for bad in [
+            "openabdev/",
+            "openabdev/repo/extra",
+            "openabdev / repo",
+            "openabdev/ repo",
+            "/repo",
+        ] {
             let m = McpConfig {
                 github_apps: vec![entry("openabdev")],
                 agents: vec![multi_agent(&[bad])],
@@ -810,10 +1119,353 @@ mod tests {
             enable_git_credentials: false,
             github_apps: vec![entry("openabdev"), entry("oablab")],
             agents: vec![multi_agent(&["openabdev/openab", "oablab/chi"])],
-            audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
+            audit: Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            }),
             ..Default::default()
         };
         assert!(m.validate().is_ok());
+    }
+
+    /// Policy v2 (#35): an agent built from grant rows, exercising the
+    /// canonical shape — read-only on repo-a, a different tool set on
+    /// repo-b, plus a repo-unrestricted grant.
+    fn grants_agent() -> McpAgentConfig {
+        let m: McpConfig = toml::from_str(
+            r##"
+            enabled = true
+
+            [[agents]]
+            id = "bot"
+            keys = ["k"]
+
+            [[agents.grants]]
+            id = "repo-a-reader"
+            repos = ["openabdev/repo-a"]
+            tools = ["issue_read"]
+
+            [[agents.grants]]
+            repos = ["oablab/repo-b"]
+            tools = ["issue_read", "create_issue"]
+
+            [agents.grants.permissions]
+            contents = "read"
+            issues = "write"
+
+            [[agents.grants]]
+            repos = []
+            tools = ["get_me"]
+            "##,
+        )
+        .unwrap();
+        m.agents.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn test_agent_grants_toml_roundtrip() {
+        let m: McpConfig = toml::from_str(
+            r##"
+            enabled = true
+
+            [[agents]]
+            id = "bot"
+            keys = ["k"]
+
+            [[agents.grants]]
+            id = "repo-a-reader"
+            repos = ["openabdev/repo-a"]
+            tools = ["issue_read"]
+
+            [[agents.grants]]
+            repos = ["oablab/repo-b"]
+            tools = ["issue_read", "create_issue"]
+
+            [agents.grants.permissions]
+            contents = "read"
+            issues = "write"
+
+            [[agents]]
+            id = "flat"
+            keys = ["k2"]
+            tools = ["get_me"]
+            "##,
+        )
+        .unwrap();
+        let bot = &m.agents[0];
+        assert_eq!(bot.grants.len(), 2);
+        assert_eq!(bot.grants[0].id.as_deref(), Some("repo-a-reader"));
+        assert_eq!(bot.grants[0].repos, ["openabdev/repo-a"]);
+        assert_eq!(bot.grants[0].tools, ["issue_read"]);
+        assert_eq!(bot.grants[1].repos, ["oablab/repo-b"]);
+        let perms = bot.grants[1].permissions.as_ref().unwrap();
+        assert_eq!(perms["contents"], "read");
+        assert_eq!(perms["issues"], "write");
+        // no grants → empty vec (serde default)
+        assert!(m.agents[1].grants.is_empty());
+    }
+
+    #[test]
+    fn test_agent_grant_matching() {
+        let a = grants_agent();
+        // A grant matches only when tool AND repo both fit the SAME grant.
+        let g = a
+            .matching_grant("issue_read", Some(("openabdev", "repo-a")))
+            .unwrap();
+        assert_eq!(g.id, "repo-a-reader");
+        assert!(a
+            .matching_grant("issue_read", Some(("oablab", "repo-b")))
+            .is_some());
+        // Cross-product is denied: create_issue is only granted on repo-b.
+        assert!(a
+            .matching_grant("create_issue", Some(("openabdev", "repo-a")))
+            .is_none());
+        // Deny-if-unresolvable generalizes: every issue_read grant is
+        // repo-restricted, so no resolvable target → no match.
+        assert!(a.matching_grant("issue_read", None).is_none());
+        // A repo-unrestricted grant matches even with no resolved repo.
+        assert_eq!(a.matching_grant("get_me", None).unwrap().id, "grants[2]");
+        // Tool in no grant → no match.
+        assert!(a
+            .matching_grant("delete_file", Some(("openabdev", "repo-a")))
+            .is_none());
+        // Repo matching is case-insensitive (GitHub semantics).
+        assert!(a
+            .matching_grant("issue_read", Some(("OpenABdev", "Repo-A")))
+            .is_some());
+        // Wildcard owner forms work inside a grant too.
+        let w = grants_agent_with_wildcard();
+        assert!(w
+            .matching_grant("issue_read", Some(("openabdev", "anything")))
+            .is_some());
+        assert!(w
+            .matching_grant("issue_read", Some(("oablab", "chi")))
+            .is_none());
+    }
+
+    /// grants agent whose first grant covers `openabdev/*`.
+    fn grants_agent_with_wildcard() -> McpAgentConfig {
+        let m: McpConfig = toml::from_str(
+            r#"
+            enabled = true
+            [[agents]]
+            id = "bot"
+            keys = ["k"]
+            [[agents.grants]]
+            repos = ["openabdev/*"]
+            tools = ["issue_read"]
+            "#,
+        )
+        .unwrap();
+        m.agents.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn test_agent_grant_unions_and_flat_sugar() {
+        let a = grants_agent();
+        // tools/list + X-MCP-Tools see the union (declaration order, deduped).
+        assert_eq!(a.allowed_tools(), ["issue_read", "create_issue", "get_me"]);
+        assert_eq!(
+            a.repo_entries().collect::<Vec<_>>(),
+            ["openabdev/repo-a", "oablab/repo-b"]
+        );
+        assert_eq!(a.route_owners(), ["oablab", "openabdev"]);
+        assert!(a.tool_granted("create_issue"));
+        assert!(!a.tool_granted("frobnicate_widget"));
+
+        // Flat tools+repos are the implicit "flat" grant — identical
+        // semantics to declaring the same [[grants]] row.
+        let mut flat = McpAgentConfig {
+            id: "f".into(),
+            key: None,
+            keys: vec!["k".into()],
+            tools: vec!["issue_read".into()],
+            repos: vec!["openabdev/repo-a".into()],
+            grants: Vec::new(),
+            git_credentials_read_only: None,
+        };
+        assert_eq!(flat.each_grant().count(), 1);
+        assert_eq!(flat.each_grant().next().unwrap().id, "flat");
+        assert!(flat
+            .matching_grant("issue_read", Some(("openabdev", "repo-a")))
+            .is_some());
+        assert!(flat
+            .matching_grant("issue_read", Some(("openabdev", "other")))
+            .is_none());
+
+        // Flat fields + grants UNION — nothing regresses when both exist.
+        flat.grants.push(McpGrantConfig {
+            id: None,
+            tools: vec!["create_issue".into()],
+            repos: vec!["oablab/repo-b".into()],
+            permissions: None,
+        });
+        assert_eq!(
+            flat.matching_grant("issue_read", Some(("openabdev", "repo-a")))
+                .unwrap()
+                .id,
+            "flat"
+        );
+        assert_eq!(
+            flat.matching_grant("create_issue", Some(("oablab", "repo-b")))
+                .unwrap()
+                .id,
+            "grants[0]"
+        );
+        assert!(flat
+            .matching_grant("create_issue", Some(("openabdev", "repo-a")))
+            .is_none());
+        assert_eq!(flat.allowed_tools(), ["issue_read", "create_issue"]);
+
+        // tools=[] + repos=[] (deny-all agent) yields NO grant at all.
+        let empty = McpAgentConfig {
+            id: "e".into(),
+            key: None,
+            keys: vec!["k".into()],
+            tools: vec![],
+            repos: vec![],
+            grants: Vec::new(),
+            git_credentials_read_only: None,
+        };
+        assert_eq!(empty.each_grant().count(), 0);
+        assert!(empty.matching_grant("issue_read", None).is_none());
+    }
+
+    #[test]
+    fn test_agent_permissions_envelope() {
+        let a = grants_agent();
+        // Per-owner: only grants covering that owner contribute. repo-b's
+        // grant scopes issues=write+contents=read; the repo-a grant is not
+        // covering, and the get_me grant has no permissions → None means
+        // "mint unscoped" (that grant can call get_me on ANY repo, so the
+        // token must retain default permissions).
+        assert!(a.permissions_envelope(Some("oablab")).is_none());
+        assert!(a.permissions_envelope(Some("openabdev")).is_none());
+        assert!(a.permissions_envelope(None).is_none());
+
+        // Fully-scoped grants for one owner produce the minted envelope.
+        let scoped: McpConfig = toml::from_str(
+            r##"
+            enabled = true
+            [[agents]]
+            id = "bot"
+            keys = ["k"]
+            [[agents.grants]]
+            repos = ["openabdev/repo-a"]
+            tools = ["issue_read"]
+            [agents.grants.permissions]
+            contents = "read"
+            [[agents.grants]]
+            repos = ["openabdev/repo-b"]
+            tools = ["create_issue"]
+            [agents.grants.permissions]
+            contents = "write"
+            issues = "write"
+            "##,
+        )
+        .unwrap();
+        let s = &scoped.agents[0];
+        // Union across covering grants; higher access wins on conflict.
+        assert_eq!(
+            s.permissions_envelope(Some("openabdev")),
+            Some(serde_json::json!({"contents": "write", "issues": "write"}))
+        );
+        // A grant covering only other owners does not widen this mint.
+        assert!(s.permissions_envelope(Some("oablab")).is_none());
+        // No owner filter → all grants: same merged result here.
+        assert_eq!(
+            s.permissions_envelope(None),
+            Some(serde_json::json!({"contents": "write", "issues": "write"}))
+        );
+
+        // Grants with no permissions at all → None (installation defaults).
+        let plain = grants_agent_with_wildcard();
+        assert!(plain.permissions_envelope(Some("openabdev")).is_none());
+
+        // An explicitly EMPTY `permissions = {}` table is "unset", not
+        // "zero permissions" — the mint must stay unscoped.
+        let empty_map: McpConfig = toml::from_str(
+            r##"
+            enabled = true
+            [[agents]]
+            id = "bot"
+            keys = ["k"]
+            [[agents.grants]]
+            repos = ["openabdev/repo-a"]
+            tools = ["issue_read"]
+            [agents.grants.permissions]
+            "##,
+        )
+        .unwrap();
+        assert!(empty_map.agents[0]
+            .permissions_envelope(Some("openabdev"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_mcp_validate_grant_permission_levels() {
+        fn grant_agent(level: &str) -> McpAgentConfig {
+            let m: McpConfig = toml::from_str(&format!(
+                r##"
+                enabled = true
+                [[agents]]
+                id = "b0"
+                keys = ["k"]
+                [[agents.grants]]
+                repos = ["openabdev/repo-a"]
+                tools = ["issue_read"]
+                [agents.grants.permissions]
+                contents = "{level}"
+                "##,
+            ))
+            .unwrap();
+            m.agents.into_iter().next().unwrap()
+        }
+        for level in ["read", "write", "admin"] {
+            let m = McpConfig {
+                agents: vec![grant_agent(level)],
+                ..Default::default()
+            };
+            assert!(m.validate().is_ok(), "level {} must be accepted", level);
+        }
+        let m = McpConfig {
+            agents: vec![grant_agent("satisfy")],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("invalid level"));
+
+        // malformed repo entries inside a grant are caught like flat ones
+        let mut bad = multi_agent_for_test();
+        bad.grants.push(McpGrantConfig {
+            id: None,
+            tools: vec!["issue_read".into()],
+            repos: vec!["justanowner".into()],
+            permissions: None,
+        });
+        let m = McpConfig {
+            github_apps: vec![GithubAppsEntry {
+                app_id: "1".into(),
+                private_key: "pem".into(),
+                installation_id: Some(1),
+                owner: "openabdev".into(),
+            }],
+            agents: vec![bad],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("malformed"));
+    }
+
+    /// Reused by the grant validation test: an agent with no policy fields.
+    fn multi_agent_for_test() -> McpAgentConfig {
+        McpAgentConfig {
+            id: "b0".into(),
+            key: None,
+            keys: vec!["k".into()],
+            tools: vec![],
+            repos: vec![],
+            grants: Vec::new(),
+            git_credentials_read_only: None,
+        }
     }
 
     #[test]
@@ -825,11 +1477,15 @@ mod tests {
                 keys: vec!["k".into()],
                 tools: vec![],
                 repos: vec!["openabdev/openab".into()],
+                grants: Vec::new(),
                 git_credentials_read_only: None,
             }
         }
         fn audit() -> Option<AuditConfig> {
-            Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 })
+            Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            })
         }
         fn single(owner: Option<&str>) -> Option<GithubAppConfig> {
             Some(GithubAppConfig {
@@ -841,7 +1497,10 @@ mod tests {
         }
 
         // agents required
-        let m = McpConfig { enable_git_credentials: true, ..Default::default() };
+        let m = McpConfig {
+            enable_git_credentials: true,
+            ..Default::default()
+        };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
 
         // App backend required — never PATs

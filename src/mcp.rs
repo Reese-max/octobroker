@@ -103,8 +103,33 @@ pub async fn mcp_proxy(
     let agent_id = agent.map(|a| a.id.as_str());
 
     // Parse frame early so we can resolve the target owner for multi-app mode.
-    let frame = if method == Method::POST { parse_frame(&body) } else { None };
+    let frame = if method == Method::POST {
+        parse_frame(&body)
+    } else {
+        None
+    };
+    // JSON-RPC request payloads are objects. A body that parses as JSON but
+    // is NOT an object — most importantly a batch array like
+    // `[{"method":"tools/call",…}]` — never yields a frame, so it would
+    // otherwise bypass the entire policy stack below and be forwarded
+    // upstream as an opaque payload. Reject it outright; an upstream that
+    // honors batches must never see one. (Non-JSON bytes stay forwarded —
+    // they can't smuggle a frame the proxy can't read.)
+    if method == Method::POST
+        && frame.is_none()
+        && serde_json::from_slice::<serde_json::Value>(&body)
+            .map(|v| !v.is_object())
+            .unwrap_or(false)
+    {
+        return rpc_error(
+            StatusCode::BAD_REQUEST,
+            "invalid JSON-RPC request: object expected",
+        );
+    }
     let mut resolved_repo: Option<(String, String)> = None;
+    // Policy v2 (#35): the grant that authorized this tools/call — recorded
+    // in audit records for traceability.
+    let mut matched_grant: Option<String> = None;
     if let Some(f) = &frame {
         if f.method == "tools/call" {
             resolved_repo = crate::policy::resolve_repo(f.arguments.as_ref());
@@ -115,12 +140,30 @@ pub async fn mcp_proxy(
     // denied calls never mint or resolve an upstream credential.
     if let Some(frame) = &frame {
         if frame.method == "tools/call" {
-            if let (Some(tool_name), Some(agent)) = (frame.tool.as_deref(), agent) {
-                // 1. Default-deny tool allowlist (authoritative)
-                if !agent.tools.iter().any(|t| t == tool_name) {
+            if let Some(agent) = agent {
+                // A tools/call without a string `params.name` is malformed —
+                // under agent policy it is denied rather than forwarded
+                // (denied calls never mint a credential either).
+                let Some(tool_name) = frame.tool.as_deref() else {
+                    tracing::warn!(
+                        "MCP tools/call DENIED (missing params.name) [agent={}]{}",
+                        agent.id,
+                        session_suffix(session_id.as_deref())
+                    );
+                    return tool_call_denied(
+                        frame.rpc_id.as_ref(),
+                        "tool not permitted by agent policy",
+                    );
+                };
+                // 1. Default-deny tool axis: the tool must appear in at
+                //    least one effective grant (flat `tools`/`repos` is the
+                //    implicit `flat` grant).
+                if !agent.tool_granted(tool_name) {
                     tracing::warn!(
                         "MCP tools/call {} DENIED (not on allowlist) [agent={}]{}",
-                        tool_name, agent.id, session_suffix(session_id.as_deref())
+                        tool_name,
+                        agent.id,
+                        session_suffix(session_id.as_deref())
                     );
                     return tool_call_denied(
                         frame.rpc_id.as_ref(),
@@ -137,12 +180,11 @@ pub async fn mcp_proxy(
                 {
                     tracing::warn!(
                         "MCP tools/call {} DENIED (write tools not enabled) [agent={}]{}",
-                        tool_name, agent.id, session_suffix(session_id.as_deref())
+                        tool_name,
+                        agent.id,
+                        session_suffix(session_id.as_deref())
                     );
-                    return tool_call_denied(
-                        frame.rpc_id.as_ref(),
-                        "write tools are not enabled",
-                    );
+                    return tool_call_denied(frame.rpc_id.as_ref(), "write tools are not enabled");
                 }
                 // 2b. Multi-installation mode: repo-less agents ride pooled
                 //     PATs, and writes never run on pooled PATs — even when
@@ -150,43 +192,51 @@ pub async fn mcp_proxy(
                 //     validation; kept as defense-in-depth.)
                 if crate::policy::classify_tool(tool_name) == crate::policy::ToolKind::Write
                     && state.multi_app_tokens.is_some()
-                    && agent.repos.is_empty()
+                    && agent.route_owners().is_empty()
                 {
                     tracing::warn!(
                         "MCP tools/call {} DENIED (repo-less agent uses pooled PATs) [agent={}]{}",
-                        tool_name, agent.id, session_suffix(session_id.as_deref())
+                        tool_name,
+                        agent.id,
+                        session_suffix(session_id.as_deref())
                     );
                     return tool_call_denied(
                         frame.rpc_id.as_ref(),
                         "write tools require a repository-scoped agent",
                     );
                 }
-                // 3. Repository allowlist (deny-if-unresolvable)
-                if !agent.repos.is_empty() {
-                    match &resolved_repo {
-                        None => {
+                // 3. Repo axis (policy v2): at least one grant carrying the
+                //    tool must also cover the resolved repository. A
+                //    repo-empty grant matches any target, including
+                //    unresolvable ones; deny-if-unresolvable applies only
+                //    when every tool-bearing grant is repo-restricted.
+                let repo_target = resolved_repo
+                    .as_ref()
+                    .map(|(o, r)| (o.as_str(), r.as_str()));
+                match agent.matching_grant(tool_name, repo_target) {
+                    Some(g) => matched_grant = Some(g.id),
+                    None => {
+                        if let Some((owner, repo_name)) = &resolved_repo {
                             tracing::warn!(
-                                "MCP tools/call {} DENIED (no resolvable repo target) [agent={}]{}",
-                                tool_name, agent.id, session_suffix(session_id.as_deref())
+                                "MCP tools/call {} DENIED (repo {}/{} not allowlisted) [agent={}]{}",
+                                tool_name, owner, repo_name, agent.id,
+                                session_suffix(session_id.as_deref())
                             );
                             return tool_call_denied(
                                 frame.rpc_id.as_ref(),
-                                "call has no resolvable repository target",
+                                "repository not permitted by agent policy",
                             );
                         }
-                        Some((owner, repo_name)) => {
-                            if !crate::policy::repo_allowed(&agent.repos, owner, repo_name) {
-                                tracing::warn!(
-                                    "MCP tools/call {} DENIED (repo {}/{} not allowlisted) [agent={}]{}",
-                                    tool_name, owner, repo_name, agent.id,
-                                    session_suffix(session_id.as_deref())
-                                );
-                                return tool_call_denied(
-                                    frame.rpc_id.as_ref(),
-                                    "repository not permitted by agent policy",
-                                );
-                            }
-                        }
+                        tracing::warn!(
+                            "MCP tools/call {} DENIED (no resolvable repo target) [agent={}]{}",
+                            tool_name,
+                            agent.id,
+                            session_suffix(session_id.as_deref())
+                        );
+                        return tool_call_denied(
+                            frame.rpc_id.as_ref(),
+                            "call has no resolvable repository target",
+                        );
                     }
                 }
             }
@@ -225,7 +275,7 @@ pub async fn mcp_proxy(
                 // authenticate() already rejected keyless requests.
                 return rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required");
             };
-            if !agent.repos.is_empty() {
+            if !agent.route_owners().is_empty() {
                 return multi_initialize(&state, &headers, body, agent).await;
             }
         }
@@ -271,7 +321,8 @@ pub async fn mcp_proxy(
                     .unwrap_or_default();
                 tracing::info!(
                     "MCP tools/call {}{} [{}]{}",
-                    tool_name, repo_suffix,
+                    tool_name,
+                    repo_suffix,
                     audit_via(agent, &cred_label),
                     session_suffix(session_id.as_deref())
                 );
@@ -314,7 +365,8 @@ pub async fn mcp_proxy(
                 None => {
                     tracing::warn!(
                         "MCP write call rejected: agent {} at in-flight cap ({})",
-                        aid, cap
+                        aid,
+                        cap
                     );
                     return rpc_error(
                         StatusCode::TOO_MANY_REQUESTS,
@@ -331,6 +383,7 @@ pub async fn mcp_proxy(
             rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
             session: session_id.as_deref(),
             agent: agent_id,
+            grant: matched_grant.as_deref(),
             credential: &cred_label,
             tool: tool_name,
             repo: resolved_repo.as_ref(),
@@ -340,7 +393,10 @@ pub async fn mcp_proxy(
         if let Err(e) = sink.record_request(&call, &arg_keys) {
             // FAIL-CLOSED: a write whose audit record cannot be persisted
             // must not happen.
-            tracing::error!("audit unavailable — rejecting write call (fail-closed): {}", e);
+            tracing::error!(
+                "audit unavailable — rejecting write call (fail-closed): {}",
+                e
+            );
             return rpc_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "audit backend unavailable — write rejected",
@@ -359,10 +415,12 @@ pub async fn mcp_proxy(
     {
         let local = match local_tool.as_str() {
             MINIMIZE_COMMENT_TOOL => {
-                handle_minimize_comment(&state, &cred, frame.as_ref().unwrap(), GITHUB_GRAPHQL_URL).await
+                handle_minimize_comment(&state, &cred, frame.as_ref().unwrap(), GITHUB_GRAPHQL_URL)
+                    .await
             }
             _ => {
-                handle_commit_status_set(&state, &cred, frame.as_ref().unwrap(), GITHUB_API_URL).await
+                handle_commit_status_set(&state, &cred, frame.as_ref().unwrap(), GITHUB_API_URL)
+                    .await
             }
         };
         if let (Some(tool_name), Some(sink)) = (&write_call, &state.audit) {
@@ -370,6 +428,7 @@ pub async fn mcp_proxy(
                 rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
                 session: session_id.as_deref(),
                 agent: agent_id,
+                grant: matched_grant.as_deref(),
                 credential: &cred_label,
                 tool: tool_name,
                 repo: resolved_repo.as_ref(),
@@ -419,7 +478,10 @@ pub async fn mcp_proxy(
     // session. Secondary routes replace the downstream session ID with their
     // own; stateless routed calls carry no session at all. Tokens are never
     // mixed within one upstream session.
-    if let McpCredential::Routed { upstream_session, .. } = &cred {
+    if let McpCredential::Routed {
+        upstream_session, ..
+    } = &cred
+    {
         match upstream_session {
             Some(us) if Some(us.as_str()) != session_id.as_deref() => {
                 let Ok(v) = us.parse() else {
@@ -443,16 +505,20 @@ pub async fn mcp_proxy(
     };
 
     // Best-effort rate budget accounting, if upstream exposes it
-    let rate_remaining = resp.headers()
+    let rate_remaining = resp
+        .headers()
         .get("x-ratelimit-remaining")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u32>().ok());
-    let rate_reset = resp.headers()
+    let rate_reset = resp
+        .headers()
         .get("x-ratelimit-reset")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if let McpCredential::Pat(identity) = &cred {
-        state.pool.update_rate(&identity.id, rate_remaining, rate_reset);
+        state
+            .pool
+            .update_rate(&identity.id, rate_remaining, rate_reset);
 
         // Upstream throttled this identity: zero its budget so the pool
         // avoids it for new sessions until the reported (or default) reset.
@@ -461,24 +527,38 @@ pub async fn mcp_proxy(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            state.pool.update_rate(&identity.id, Some(0), Some(rate_reset.unwrap_or(now + 60)));
-            tracing::warn!("MCP upstream 429 for identity {} — budget zeroed", identity.id);
+            state
+                .pool
+                .update_rate(&identity.id, Some(0), Some(rate_reset.unwrap_or(now + 60)));
+            tracing::warn!(
+                "MCP upstream 429 for identity {} — budget zeroed",
+                identity.id
+            );
         }
     } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        tracing::warn!("MCP upstream 429 on App installation token ({})", cred_label);
+        tracing::warn!(
+            "MCP upstream 429 on App installation token ({})",
+            cred_label
+        );
     }
 
     // Pin new sessions: upstream returns Mcp-Session-Id on initialize.
     // The pin binds the session to the exact credential and the agent that
     // initialized it. Routed credentials are never pinned here — their
     // sessions are created by the multi-installation initialize fan-out.
-    if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+    if let Some(sid) = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+    {
         if state.mcp_sessions.get(sid).await.is_none() {
             if let Some(new_pin) = cred.to_pin(agent_id) {
                 tracing::info!(
                     "MCP session pinned to credential {}{}{}",
                     cred_label,
-                    agent_id.map(|a| format!(" [agent={}]", a)).unwrap_or_default(),
+                    agent_id
+                        .map(|a| format!(" [agent={}]", a))
+                        .unwrap_or_default(),
                     session_suffix(Some(sid))
                 );
                 state.mcp_sessions.insert(sid.to_string(), new_pin).await;
@@ -497,9 +577,13 @@ pub async fn mcp_proxy(
     // A secondary route's upstream echoes ITS session ID; the client must
     // only ever see the downstream session ID it initialized with.
     let downstream_sid_override: Option<&str> = match (&cred, session_id.as_deref()) {
-        (McpCredential::Routed { upstream_session: Some(us), .. }, Some(dsid)) if us != dsid => {
-            Some(dsid)
-        }
+        (
+            McpCredential::Routed {
+                upstream_session: Some(us),
+                ..
+            },
+            Some(dsid),
+        ) if us != dsid => Some(dsid),
         _ => None,
     };
     let mut builder = Response::builder().status(status);
@@ -520,7 +604,9 @@ pub async fn mcp_proxy(
     // response remains untouched for all other agents and requests.
     if frame.as_ref().map(|f| f.method.as_str()) == Some("tools/list")
         && state.config.mcp.enable_writes
-        && LOCAL_TOOLS.iter().any(|tool| custom_tool_enabled(agent, tool))
+        && LOCAL_TOOLS
+            .iter()
+            .any(|tool| custom_tool_enabled(agent, tool))
     {
         let content_type = resp
             .headers()
@@ -529,15 +615,12 @@ pub async fn mcp_proxy(
             .map(str::to_string);
         match buffer_body(resp, MAX_BODY_BYTES).await {
             Ok(BufferedBody::Complete(bytes)) => {
-                let body = inject_custom_tools(
-                    &bytes,
-                    content_type.as_deref(),
-                    agent.map(|a| a.tools.as_slice()),
-                )
-                .unwrap_or(bytes);
-                return builder
-                    .body(Body::from(body))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                let allowed = agent.map(|a| a.allowed_tools());
+                let body = inject_custom_tools(&bytes, content_type.as_deref(), allowed.as_deref())
+                    .unwrap_or(bytes);
+                return builder.body(Body::from(body)).unwrap_or_else(|_| {
+                    rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")
+                });
             }
             Ok(BufferedBody::Overflow(head, rest)) => {
                 let head_stream = futures_util::stream::once(async move {
@@ -545,7 +628,9 @@ pub async fn mcp_proxy(
                 });
                 return builder
                     .body(Body::from_stream(head_stream.chain(rest)))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                    .unwrap_or_else(|_| {
+                        rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")
+                    });
             }
             Err(e) => {
                 tracing::error!("tools/list response read failed: {}", e);
@@ -576,6 +661,7 @@ pub async fn mcp_proxy(
             rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
             session: session_id.as_deref(),
             agent: agent_id,
+            grant: matched_grant.as_deref(),
             credential: &cred_label,
             tool: tool_name,
             repo: resolved_repo.as_ref(),
@@ -583,8 +669,7 @@ pub async fn mcp_proxy(
 
         match buffer_body(resp, cap).await {
             Ok(BufferedBody::Complete(bytes)) => {
-                let tool_error =
-                    crate::audit::parse_tool_outcome(content_type.as_deref(), &bytes);
+                let tool_error = crate::audit::parse_tool_outcome(content_type.as_deref(), &bytes);
                 let outcome = crate::audit::CallOutcome {
                     http_status: status.as_u16(),
                     tool_error,
@@ -593,9 +678,9 @@ pub async fn mcp_proxy(
                     // The call already happened — cannot unwind. Loud error.
                     tracing::error!("audit result record failed (call already executed): {}", e);
                 }
-                return builder
-                    .body(Body::from(bytes))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                return builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+                    rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")
+                });
             }
             Ok(BufferedBody::Overflow(head, rest)) => {
                 // Oversize: outcome undeterminable; forward head + remainder
@@ -611,7 +696,9 @@ pub async fn mcp_proxy(
                 });
                 return builder
                     .body(Body::from_stream(head_stream.chain(rest)))
-                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+                    .unwrap_or_else(|_| {
+                        rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")
+                    });
             }
             Err(e) => {
                 tracing::error!("upstream body read failed mid-response: {}", e);
@@ -663,13 +750,8 @@ struct LocalToolResponse {
     tool_error: Option<bool>,
 }
 
-fn custom_tool_enabled(
-    agent: Option<&crate::config::McpAgentConfig>,
-    tool_name: &str,
-) -> bool {
-    agent
-        .map(|a| a.tools.iter().any(|tool| tool == tool_name))
-        .unwrap_or(false)
+fn custom_tool_enabled(agent: Option<&crate::config::McpAgentConfig>, tool_name: &str) -> bool {
+    agent.map(|a| a.tool_granted(tool_name)).unwrap_or(false)
 }
 
 fn local_tool_definition(name: &str) -> serde_json::Value {
@@ -775,9 +857,9 @@ fn inject_custom_tools(
             .map(|allowed| allowed.iter().any(|candidate| candidate == local))
             .unwrap_or(true);
         if enabled
-            && !tools.iter().any(|tool| {
-                tool.get("name").and_then(|name| name.as_str()) == Some(*local)
-            })
+            && !tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(|name| name.as_str()) == Some(*local))
         {
             tools.push(local_tool_definition(local));
         }
@@ -850,7 +932,10 @@ async fn execute_graphql(
         .http
         .post(graphql_url)
         .bearer_auth(cred.token())
-        .header("user-agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
+        .header(
+            "user-agent",
+            concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+        )
         .header("content-type", "application/json")
         .json(payload)
         .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
@@ -859,7 +944,8 @@ async fn execute_graphql(
         .map_err(|error| {
             tracing::error!("custom MCP GraphQL request failed: {}", error);
         })?;
-    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let body = response.json().await.map_err(|error| {
         tracing::error!("custom MCP GraphQL response parse failed: {}", error);
     })?;
@@ -881,10 +967,18 @@ async fn handle_minimize_comment(
     graphql_url: &str,
 ) -> LocalToolResponse {
     let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
-        return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "arguments must be an object");
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "arguments must be an object",
+        );
     };
     for key in ["owner", "repo", "node_id", "classifier"] {
-        if arguments.get(key).and_then(|value| value.as_str()).is_none() {
+        if arguments
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_none()
+        {
             return local_tool_error(
                 frame.rpc_id.as_ref(),
                 StatusCode::OK,
@@ -908,18 +1002,23 @@ async fn handle_minimize_comment(
         "query": "query VerifyComment($id: ID!) { viewer { login } node(id: $id) { ... on IssueComment { author { login } issue { repository { nameWithOwner } } } ... on PullRequestReviewComment { author { login } pullRequest { repository { nameWithOwner } } } } }",
         "variables": { "id": node_id }
     });
-    let (verify_status, verify_body) = match execute_graphql(state, cred, graphql_url, &verify_payload).await {
-        Ok(result) => result,
-        Err(()) => {
-            return local_tool_error(
-                frame.rpc_id.as_ref(),
-                StatusCode::BAD_GATEWAY,
-                "GitHub comment ownership check failed",
-            );
-        }
-    };
-    let viewer = verify_body.pointer("/data/viewer/login").and_then(|value| value.as_str());
-    let author = verify_body.pointer("/data/node/author/login").and_then(|value| value.as_str());
+    let (verify_status, verify_body) =
+        match execute_graphql(state, cred, graphql_url, &verify_payload).await {
+            Ok(result) => result,
+            Err(()) => {
+                return local_tool_error(
+                    frame.rpc_id.as_ref(),
+                    StatusCode::BAD_GATEWAY,
+                    "GitHub comment ownership check failed",
+                );
+            }
+        };
+    let viewer = verify_body
+        .pointer("/data/viewer/login")
+        .and_then(|value| value.as_str());
+    let author = verify_body
+        .pointer("/data/node/author/login")
+        .and_then(|value| value.as_str());
     let actual_repo = verify_body
         .pointer("/data/node/issue/repository/nameWithOwner")
         .or_else(|| verify_body.pointer("/data/node/pullRequest/repository/nameWithOwner"))
@@ -938,10 +1037,7 @@ async fn handle_minimize_comment(
             "comment is not authored by the current GitHub identity",
         );
     }
-    if actual_repo
-        .map(|value| value.eq_ignore_ascii_case(&expected_repo))
-        != Some(true)
-    {
+    if actual_repo.map(|value| value.eq_ignore_ascii_case(&expected_repo)) != Some(true) {
         tracing::warn!(
             "comment repository mismatch: expected {}, actual {:?}",
             expected_repo,
@@ -961,7 +1057,11 @@ async fn handle_minimize_comment(
     let (status, body) = match execute_graphql(state, cred, graphql_url, &payload).await {
         Ok(result) => result,
         Err(()) => {
-            tracing::error!("custom minimize_comment request failed for {}/{}", owner, repo);
+            tracing::error!(
+                "custom minimize_comment request failed for {}/{}",
+                owner,
+                repo
+            );
             return local_tool_error(
                 frame.rpc_id.as_ref(),
                 StatusCode::BAD_GATEWAY,
@@ -975,7 +1075,11 @@ async fn handle_minimize_comment(
         == Some(true);
     if !status.is_success() || body.get("errors").is_some() || !minimized {
         tracing::warn!("GitHub minimize_comment failed for {}/{}", owner, repo);
-        return local_tool_error(frame.rpc_id.as_ref(), status, "GitHub rejected comment minimization");
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            status,
+            "GitHub rejected comment minimization",
+        );
     }
 
     LocalToolResponse {
@@ -1019,10 +1123,18 @@ async fn handle_commit_status_set(
     api_base: &str,
 ) -> LocalToolResponse {
     let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
-        return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "arguments must be an object");
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "arguments must be an object",
+        );
     };
     for key in ["owner", "repo", "sha", "state", "context"] {
-        if arguments.get(key).and_then(|value| value.as_str()).is_none() {
+        if arguments
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_none()
+        {
             return local_tool_error(
                 frame.rpc_id.as_ref(),
                 StatusCode::OK,
@@ -1058,13 +1170,21 @@ async fn handle_commit_status_set(
         );
     }
     if context.trim().is_empty() {
-        return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "context must not be empty");
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "context must not be empty",
+        );
     }
 
     let mut payload = serde_json::json!({ "state": status_state, "context": context });
     if let Some(value) = arguments.get("description") {
         let Some(description) = value.as_str() else {
-            return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "description must be a string");
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::OK,
+                "description must be a string",
+            );
         };
         if description.chars().count() > 140 {
             return local_tool_error(
@@ -1077,7 +1197,11 @@ async fn handle_commit_status_set(
     }
     if let Some(value) = arguments.get("target_url") {
         let Some(target_url) = value.as_str() else {
-            return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "target_url must be a string");
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::OK,
+                "target_url must be a string",
+            );
         };
         if !(target_url.starts_with("https://") || target_url.starts_with("http://")) {
             return local_tool_error(
@@ -1100,7 +1224,10 @@ async fn handle_commit_status_set(
         .http
         .post(&url)
         .bearer_auth(cred.token())
-        .header("user-agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
+        .header(
+            "user-agent",
+            concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+        )
         .header("accept", "application/vnd.github+json")
         .header("x-github-api-version", "2022-11-28")
         .json(&payload)
@@ -1110,7 +1237,12 @@ async fn handle_commit_status_set(
     {
         Ok(response) => response,
         Err(error) => {
-            tracing::error!("custom commit_status request failed for {}/{}: {}", owner, repo, error);
+            tracing::error!(
+                "custom commit_status request failed for {}/{}: {}",
+                owner,
+                repo,
+                error
+            );
             return local_tool_error(
                 frame.rpc_id.as_ref(),
                 StatusCode::BAD_GATEWAY,
@@ -1118,7 +1250,8 @@ async fn handle_commit_status_set(
             );
         }
     };
-    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
     let created = status == StatusCode::CREATED
         && body.get("state").and_then(|value| value.as_str()) == Some(status_state);
@@ -1141,7 +1274,10 @@ async fn handle_commit_status_set(
             frame.rpc_id.as_ref(),
             false,
             StatusCode::OK,
-            format!("Commit status '{}' set to {} on {}", context, status_state, sha),
+            format!(
+                "Commit status '{}' set to {} on {}",
+                context, status_state, sha
+            ),
         ),
         http_status: status.as_u16(),
         tool_error: Some(false),
@@ -1225,14 +1361,19 @@ impl McpCredential {
     /// sessions are pinned by the multi-installation initialize fan-out.
     fn to_pin(&self, agent_id: Option<&str>) -> Option<SessionPin> {
         let cred = match self {
-            McpCredential::Pat(i) => PinnedCred::Pat { identity_id: i.id.clone() },
+            McpCredential::Pat(i) => PinnedCred::Pat {
+                identity_id: i.id.clone(),
+            },
             McpCredential::App(t) => PinnedCred::App {
                 token: t.token.clone(),
                 expires_at: t.expires_at,
             },
             McpCredential::Routed { .. } => return None,
         };
-        Some(SessionPin { agent_id: agent_id.map(str::to_string), cred })
+        Some(SessionPin {
+            agent_id: agent_id.map(str::to_string),
+            cred,
+        })
     }
 }
 
@@ -1319,7 +1460,8 @@ async fn pick_credential(
                     let Some(route) = routes.get(&key) else {
                         tracing::warn!(
                             "MCP request rejected: owner {} outside session envelope{}",
-                            key, session_suffix(Some(sid))
+                            key,
+                            session_suffix(Some(sid))
                         );
                         return Err(StatusCode::FORBIDDEN);
                     };
@@ -1339,7 +1481,7 @@ async fn pick_credential(
     // Repo-less agents fall through to the PAT pool (legacy read path).
     if let Some(multi) = &state.multi_app_tokens {
         if let Some(agent) = agent {
-            let owners = route_owners(agent);
+            let owners = agent.route_owners();
             if let Some(first_owner) = owners.first() {
                 let key = match route_owner {
                     Some(o) => o.to_lowercase(),
@@ -1349,7 +1491,8 @@ async fn pick_credential(
                     return Err(StatusCode::FORBIDDEN);
                 };
                 let envelope = scope_envelope_for_owner(agent, &key);
-                return match provider.token_scoped(&envelope).await {
+                let perms = agent.permissions_envelope(Some(&key));
+                return match provider.token_scoped(&envelope, perms.as_ref()).await {
                     Ok(t) => Ok(McpCredential::Routed {
                         owner: key,
                         token: t.token,
@@ -1369,7 +1512,8 @@ async fn pick_credential(
     // proxy-side repo check remains as defense-in-depth.
     if let Some(provider) = &state.app_tokens {
         let envelope = scope_envelope(agent);
-        return match provider.token_scoped(&envelope).await {
+        let perms = agent.and_then(|a| a.permissions_envelope(None));
+        return match provider.token_scoped(&envelope, perms.as_ref()).await {
             Ok(t) => Ok(McpCredential::App(t)),
             Err(e) => {
                 tracing::error!("App token mint failed: {}", e);
@@ -1384,59 +1528,57 @@ async fn pick_credential(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
-/// Repository names for a scoped token mint: only when the agent's repo
-/// allowlist consists entirely of exact `owner/repo` entries under a single
-/// owner (the installation's). Wildcards, mixed owners, or no restriction
-/// fall back to an installation-wide token.
+/// Repository names for a scoped token mint: only when every repo entry
+/// across the agent's effective grants consists of exact `owner/repo`
+/// entries under a single owner (the installation's). Wildcards, mixed
+/// owners, a repo-unrestricted grant, or no restriction at all fall back to
+/// an installation-wide token — the token must cover every repository the
+/// agent's grants could possibly reach.
 fn scope_envelope(agent: Option<&crate::config::McpAgentConfig>) -> Vec<String> {
     let Some(a) = agent else { return Vec::new() };
-    if a.repos.is_empty() {
-        return Vec::new();
-    }
     let mut owner0: Option<&str> = None;
     let mut names = Vec::new();
-    for entry in &a.repos {
-        match entry.split_once('/') {
-            Some((o, r)) if r != "*" && !r.is_empty() => {
-                if *owner0.get_or_insert(o) != o {
-                    return Vec::new(); // mixed owners → installation-wide
+    for grant in a.each_grant() {
+        if grant.repos.is_empty() {
+            // This grant authorizes calls regardless of the resolved repo —
+            // no repository narrowing is possible.
+            return Vec::new();
+        }
+        for entry in grant.repos {
+            match entry.split_once('/') {
+                Some((o, r)) if r != "*" && !r.is_empty() => {
+                    if *owner0.get_or_insert(o) != o {
+                        return Vec::new(); // mixed owners → installation-wide
+                    }
+                    names.push(r.to_string());
                 }
-                names.push(r.to_string());
+                _ => return Vec::new(), // wildcard/malformed → installation-wide
             }
-            _ => return Vec::new(), // wildcard/malformed → installation-wide
         }
     }
     names
 }
 
-/// Owners (lowercase, sorted, deduped) spanned by an agent's repo allowlist.
-/// In multi-installation mode this is the session's credential envelope; the
-/// first owner is the deterministic primary.
-fn route_owners(agent: &crate::config::McpAgentConfig) -> Vec<String> {
-    let mut owners: Vec<String> = agent
-        .repos
-        .iter()
-        .filter_map(|e| e.split_once('/').map(|(o, _)| o.trim().to_lowercase()))
-        .filter(|o| !o.is_empty())
-        .collect();
-    owners.sort();
-    owners.dedup();
-    owners
-}
-
 /// Scoped-mint envelope for ONE owner in multi-installation mode: the exact
-/// repo names the agent may touch under that owner. Any wildcard entry for
-/// the owner falls back to an installation-wide token (proxy-side checks
-/// still apply).
+/// repo names the agent may touch under that owner across all grants. Any
+/// wildcard entry — or any repo-unrestricted grant — falls back to an
+/// installation-wide token (proxy-side checks still apply).
 fn scope_envelope_for_owner(agent: &crate::config::McpAgentConfig, owner: &str) -> Vec<String> {
     let mut names = Vec::new();
-    for entry in &agent.repos {
-        if let Some((o, r)) = entry.split_once('/') {
-            if o.eq_ignore_ascii_case(owner) {
-                if r == "*" || r.is_empty() {
-                    return Vec::new(); // wildcard → installation-wide
+    for grant in agent.each_grant() {
+        if grant.repos.is_empty() {
+            // Repo-unrestricted grant: its tools may target any repo under
+            // this owner — the token cannot be narrowed.
+            return Vec::new();
+        }
+        for entry in grant.repos {
+            if let Some((o, r)) = entry.split_once('/') {
+                if o.eq_ignore_ascii_case(owner) {
+                    if r == "*" || r.is_empty() {
+                        return Vec::new(); // wildcard → installation-wide
+                    }
+                    names.push(r.to_string());
                 }
-                names.push(r.to_string());
             }
         }
     }
@@ -1463,14 +1605,16 @@ async fn multi_initialize(
             "multi-installation backend missing",
         );
     };
-    let owners = route_owners(agent);
+    let owners = agent.route_owners();
     let Some(primary_owner) = owners.first().cloned() else {
-        return rpc_error(StatusCode::BAD_GATEWAY, "agent has no routable repository owners");
+        return rpc_error(
+            StatusCode::BAD_GATEWAY,
+            "agent has no routable repository owners",
+        );
     };
     let upstream = state.config.mcp.upstream();
 
-    let mut routes: std::collections::HashMap<String, AppRoute> =
-        std::collections::HashMap::new();
+    let mut routes: std::collections::HashMap<String, AppRoute> = std::collections::HashMap::new();
     let mut primary_resp: Option<reqwest::Response> = None;
 
     for owner in &owners {
@@ -1478,7 +1622,8 @@ async fn multi_initialize(
             // Startup validation guarantees coverage; fail closed anyway.
             tracing::error!(
                 "no [[mcp.github_apps]] entry for owner {} — rejecting initialize [agent={}]",
-                owner, agent.id
+                owner,
+                agent.id
             );
             return abort_multi_initialize(
                 state,
@@ -1493,7 +1638,8 @@ async fn multi_initialize(
             .await;
         };
         let envelope = scope_envelope_for_owner(agent, owner);
-        let token = match provider.token_scoped(&envelope).await {
+        let perms = agent.permissions_envelope(Some(owner));
+        let token = match provider.token_scoped(&envelope, perms.as_ref()).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("App token mint failed for owner {}: {}", owner, e);
@@ -1622,7 +1768,8 @@ async fn multi_initialize(
                 Err(e) => {
                     tracing::error!(
                         "mcp upstream initialize read failed for owner {}: {}",
-                        owner, e
+                        owner,
+                        e
                     );
                     return abort_multi_initialize(
                         state,
@@ -1674,8 +1821,7 @@ async fn multi_initialize(
         );
     }
 
-    let status =
-        StatusCode::from_u16(primary.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = StatusCode::from_u16(primary.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     for name in RESP_HEADERS {
         if let Some(v) = primary.headers().get(*name) {
@@ -1699,7 +1845,9 @@ async fn abort_multi_initialize(
     error_resp: Response,
 ) -> Response {
     for (owner, route) in routes {
-        let Some(us) = &route.upstream_session else { continue };
+        let Some(us) = &route.upstream_session else {
+            continue;
+        };
         let Some(mut h) = build_upstream_headers(&HeaderMap::new(), &route.token, &[], Some(agent))
         else {
             continue;
@@ -1716,11 +1864,13 @@ async fn abort_multi_initialize(
         {
             Ok(_) => tracing::info!(
                 "aborted initialize: cleaned up upstream session for owner {} [agent={}]",
-                owner, agent.id
+                owner,
+                agent.id
             ),
             Err(e) => tracing::warn!(
                 "aborted initialize: failed to clean up upstream session for owner {}: {}",
-                owner, e
+                owner,
+                e
             ),
         }
     }
@@ -1748,7 +1898,10 @@ async fn multi_fanout(
             agent.map(|a| a.id.as_str()),
             session_suffix(Some(downstream_sid))
         );
-        return Some(rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent"));
+        return Some(rpc_error(
+            StatusCode::FORBIDDEN,
+            "session not owned by this agent",
+        ));
     }
     let PinnedCred::MultiApp { routes, primary } = &pin.cred else {
         return None;
@@ -1761,7 +1914,9 @@ async fn multi_fanout(
 
     let mut primary_result: Option<Response> = None;
     for (owner, route) in ordered {
-        let Some(us) = &route.upstream_session else { continue };
+        let Some(us) = &route.upstream_session else {
+            continue;
+        };
         let Some(mut h) = build_upstream_headers(headers, &route.token, &[], agent) else {
             tracing::error!("credential for owner {} is not a valid header value", owner);
             continue;
@@ -1780,7 +1935,10 @@ async fn multi_fanout(
                 .delete(&upstream)
                 .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS))
         } else {
-            return Some(rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"));
+            return Some(rpc_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
         };
         match req.headers(h).send().await {
             Ok(resp) => {
@@ -1799,9 +1957,9 @@ async fn multi_fanout(
                         }
                     }
                     let bytes = resp.bytes().await.unwrap_or_default();
-                    primary_result = Some(builder.body(Body::from(bytes)).unwrap_or_else(
-                        |_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"),
-                    ));
+                    primary_result = Some(builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+                        rpc_error(StatusCode::BAD_GATEWAY, "failed to build response")
+                    }));
                 } else {
                     let _ = resp.bytes().await;
                 }
@@ -1817,7 +1975,10 @@ async fn multi_fanout(
         state.mcp_sessions.invalidate(downstream_sid).await;
     }
 
-    Some(primary_result.unwrap_or_else(|| rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed")))
+    Some(
+        primary_result
+            .unwrap_or_else(|| rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed")),
+    )
 }
 
 /// RAII in-flight counter for per-agent write concurrency caps.
@@ -1839,7 +2000,10 @@ impl InFlightGuard {
             return None;
         }
         *count += 1;
-        Some(Self { map: map.clone(), key: key.to_string() })
+        Some(Self {
+            map: map.clone(),
+            key: key.to_string(),
+        })
     }
 }
 
@@ -1867,9 +2031,15 @@ pub(crate) fn authenticate<'a>(
     if agents.is_empty() {
         return Ok(None);
     }
-    let Some(presented) = headers.get("x-octobroker-key").and_then(|v| v.to_str().ok()) else {
+    let Some(presented) = headers
+        .get("x-octobroker-key")
+        .and_then(|v| v.to_str().ok())
+    else {
         tracing::warn!("MCP request rejected: missing X-Octobroker-Key");
-        return Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "X-Octobroker-Key header required")));
+        return Err(Box::new(rpc_error(
+            StatusCode::UNAUTHORIZED,
+            "X-Octobroker-Key header required",
+        )));
     };
     for agent in agents {
         if agent.keys.iter().any(|k| keys_match(k, presented)) {
@@ -1877,7 +2047,10 @@ pub(crate) fn authenticate<'a>(
         }
     }
     tracing::warn!("MCP request rejected: invalid X-Octobroker-Key");
-    Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "invalid X-Octobroker-Key")))
+    Err(Box::new(rpc_error(
+        StatusCode::UNAUTHORIZED,
+        "invalid X-Octobroker-Key",
+    )))
 }
 
 /// Compare keys via SHA-256 digests. Comparing fixed-length digests of both
@@ -1933,7 +2106,9 @@ fn build_upstream_headers(
     h.insert("authorization", format!("Bearer {}", token).parse().ok()?);
     h.insert(
         "user-agent",
-        concat!("octobroker/", env!("CARGO_PKG_VERSION")).parse().expect("static ua header"),
+        concat!("octobroker/", env!("CARGO_PKG_VERSION"))
+            .parse()
+            .expect("static ua header"),
     );
     for name in FWD_HEADERS {
         if let Some(v) = client.get(*name) {
@@ -1942,12 +2117,18 @@ fn build_upstream_headers(
     }
     // MCP Streamable HTTP requires clients to accept both content types
     if !h.contains_key("accept") {
-        h.insert("accept", "application/json, text/event-stream".parse().unwrap());
+        h.insert(
+            "accept",
+            "application/json, text/event-stream".parse().unwrap(),
+        );
     }
-    match agent {
-        Some(a) if !a.tools.is_empty() => {
-            let upstream_tools: Vec<&str> = a
-                .tools
+    // `X-MCP-Tools` upstream is the union of tools across the agent's
+    // grants (policy v2, #35) — tools/list and per-call proxy-side matching
+    // do the narrowing.
+    let agent_tools = agent.map(|a| a.allowed_tools());
+    match agent_tools.as_deref() {
+        Some(tools) if !tools.is_empty() => {
+            let upstream_tools: Vec<&str> = tools
                 .iter()
                 .map(String::as_str)
                 .filter(|tool| !is_local_tool(tool))
@@ -1996,7 +2177,12 @@ fn parse_frame(body: &[u8]) -> Option<Frame> {
     } else {
         (None, None)
     };
-    Some(Frame { method, rpc_id, tool, arguments })
+    Some(Frame {
+        method,
+        rpc_id,
+        tool,
+        arguments,
+    })
 }
 
 fn session_suffix(session_id: Option<&str>) -> String {
@@ -2028,6 +2214,7 @@ mod tests {
             keys: vec![key.to_string()],
             tools: tools.iter().map(|s| s.to_string()).collect(),
             repos: Vec::new(),
+            grants: Vec::new(),
             git_credentials_read_only: None,
         }
     }
@@ -2035,7 +2222,9 @@ mod tests {
     fn pin(identity: &str, agent: Option<&str>) -> SessionPin {
         SessionPin {
             agent_id: agent.map(str::to_string),
-            cred: PinnedCred::Pat { identity_id: identity.to_string() },
+            cred: PinnedCred::Pat {
+                identity_id: identity.to_string(),
+            },
         }
     }
 
@@ -2045,7 +2234,6 @@ mod tests {
             _ => panic!("expected PAT credential"),
         }
     }
-
 
     fn test_state_full(
         identity_ids: &[&str],
@@ -2101,7 +2289,11 @@ mod tests {
         for name in LOCAL_TOOLS {
             let definition = local_tool_definition(name);
             assert_eq!(definition["name"], *name);
-            assert!(name.starts_with("octobroker_"), "{} must be namespaced", name);
+            assert!(
+                name.starts_with("octobroker_"),
+                "{} must be namespaced",
+                name
+            );
             assert_eq!(
                 crate::policy::classify_tool(name),
                 crate::policy::ToolKind::Write,
@@ -2254,7 +2446,10 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(h.get("mcp-protocol-version").unwrap(), "2025-06-18");
         assert!(h.get("x-random-header").is_none());
         // default accept injected when client omits it
-        assert_eq!(h.get("accept").unwrap(), "application/json, text/event-stream");
+        assert_eq!(
+            h.get("accept").unwrap(),
+            "application/json, text/event-stream"
+        );
         assert!(h.get("x-mcp-toolsets").is_none());
     }
 
@@ -2277,9 +2472,14 @@ data: "id":1,"result":{"tools":[]}}
     #[tokio::test]
     async fn test_session_pinning_returns_pinned_identity() {
         let state = test_state(&["alice", "bob"]);
-        state.mcp_sessions.insert("sess-1".to_string(), pin("bob", None)).await;
+        state
+            .mcp_sessions
+            .insert("sess-1".to_string(), pin("bob", None))
+            .await;
 
-        let cred = pick_credential(&state, Some("sess-1"), None, None).await.unwrap();
+        let cred = pick_credential(&state, Some("sess-1"), None, None)
+            .await
+            .unwrap();
         assert_eq!(cred_pat_id(&cred), "bob");
         assert_eq!(cred.token(), "token-bob");
     }
@@ -2314,7 +2514,10 @@ data: "id":1,"result":{"tools":[]}}
         // Session pinned to an identity that no longer exists in the pool:
         // treated as terminated (404), pin removed — never identity rotation.
         let state = test_state(&["alice"]);
-        state.mcp_sessions.insert("sess-x".to_string(), pin("gone", None)).await;
+        state
+            .mcp_sessions
+            .insert("sess-x".to_string(), pin("gone", None))
+            .await;
         match pick_credential(&state, Some("sess-x"), None, None).await {
             Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
             Ok(_) => panic!("stale pin must not resolve an identity"),
@@ -2349,7 +2552,12 @@ data: "id":1,"result":{"tools":[]}}
         headers: HeaderMap,
         body: Bytes,
     ) -> Response {
-        let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let get = |n: &str| {
+            headers
+                .get(n)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
         let body_str = String::from_utf8_lossy(&body).to_string();
         captured.lock().unwrap().push(Captured {
             method: method.to_string(),
@@ -2408,7 +2616,9 @@ data: "id":1,"result":{"tools":[]}}
         axum::Router::new()
             .route(
                 "/mcp",
-                axum::routing::post(mcp_proxy).get(mcp_proxy).delete(mcp_proxy),
+                axum::routing::post(mcp_proxy)
+                    .get(mcp_proxy)
+                    .delete(mcp_proxy),
             )
             .with_state(state)
     }
@@ -2449,7 +2659,10 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_with(&["alice"], &url, &["issues", "pull_requests"]);
         let resp = mcp_app(state)
-            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[],
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2463,7 +2676,10 @@ data: "id":1,"result":{"tools":[]}}
         let (url, _captured) = spawn_mock_upstream().await;
         let state = test_state_with(&["alice"], &url, &[]);
         let resp = mcp_app(state.clone())
-            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#, &[]))
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#,
+                &[],
+            ))
             .await
             .unwrap();
 
@@ -2475,7 +2691,9 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "mock-sess-1");
 
         // SSE body streamed byte-identical
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(&body[..], MOCK_SSE_BODY.as_bytes());
 
         // Session pinned to the identity that served initialize (Phase 1
@@ -2496,7 +2714,10 @@ data: "id":1,"result":{"tools":[]}}
 
         let resp = app
             .clone()
-            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#, &[]))
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#,
+                &[],
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2554,7 +2775,9 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         // Error body is a JSON-RPC error object, not a bare status
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
         assert!(v["error"]["message"].is_string());
@@ -2606,7 +2829,10 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(&["alice"], &url, &[], vec![]);
         let resp = mcp_app(state)
-            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[],
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2617,16 +2843,23 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_agents_configured_missing_key_is_401() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
+            &["alice"],
+            &url,
+            &[],
             vec![agent("bot-a", "key-a", &["issue_read"])],
         );
         let resp = mcp_app(state)
-            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[],
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         // JSON-RPC error body
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v["error"]["message"].is_string());
         // Upstream never sees unauthenticated requests
@@ -2637,7 +2870,9 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_agents_configured_wrong_key_is_401() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
+            &["alice"],
+            &url,
+            &[],
             vec![agent("bot-a", "key-a", &["issue_read"])],
         );
         let resp = mcp_app(state)
@@ -2655,8 +2890,14 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_agent_allowed_tool_passes_with_tools_header() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &["issues"], // global toolsets must be ignored for agents
-            vec![agent("bot-a", "key-a", &["issue_read", "get_file_contents"])],
+            &["alice"],
+            &url,
+            &["issues"], // global toolsets must be ignored for agents
+            vec![agent(
+                "bot-a",
+                "key-a",
+                &["issue_read", "get_file_contents"],
+            )],
         );
         let resp = mcp_app(state)
             .oneshot(post_frame(
@@ -2670,7 +2911,10 @@ data: "id":1,"result":{"tools":[]}}
         let reqs = captured.lock().unwrap();
         assert_eq!(reqs.len(), 1);
         // exact per-tool allowlist injected upstream
-        assert_eq!(reqs[0].tools_hdr.as_deref(), Some("issue_read,get_file_contents"));
+        assert_eq!(
+            reqs[0].tools_hdr.as_deref(),
+            Some("issue_read,get_file_contents")
+        );
         // agent mode: global toolsets NOT injected
         assert!(reqs[0].toolsets.is_none());
         // the octobroker key itself never goes upstream
@@ -2685,9 +2929,15 @@ data: "id":1,"result":{"tools":[]}}
     /// forever on denied calls because the response was un-correlatable).
     async fn assert_tool_denied(resp: Response, expected_id: i64, needle: &str) {
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["id"], serde_json::json!(expected_id), "id must echo the request id");
+        assert_eq!(
+            v["id"],
+            serde_json::json!(expected_id),
+            "id must echo the request id"
+        );
         assert_eq!(v["result"]["isError"], serde_json::json!(true));
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains(needle), "expected {:?} in {:?}", needle, text);
@@ -2697,7 +2947,9 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_agent_denied_tool_is_tool_error_and_never_reaches_upstream() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
+            &["alice"],
+            &url,
+            &[],
             vec![agent("bot-a", "key-a", &["issue_read"])],
         );
         let resp = mcp_app(state)
@@ -2709,6 +2961,63 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         assert_tool_denied(resp, 1, "not permitted").await;
 
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batch_frame_rejected_before_policy_or_upstream() {
+        // A JSON array body never yields a frame — it must NOT ride through
+        // as an opaque payload (a batched tools/call would bypass every
+        // policy check). Rejected with 400 before credential resolution.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"],
+            &url,
+            &[],
+            vec![agent("bot-a", "key-a", &["issue_read"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}]"#,
+                &[("x-octobroker-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "batch must never reach upstream"
+        );
+        // Scalars / null are equally not JSON-RPC requests.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(&["alice"], &url, &[], vec![]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(r#""not a request""#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_without_name_denied_for_agent() {
+        // params.name absent or non-string → denied under agent policy
+        // (denied calls must never mint a credential or reach upstream).
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"],
+            &url,
+            &[],
+            vec![agent("bot-a", "key-a", &["issue_read"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"arguments":{}}}"#,
+                &[("x-octobroker-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_tool_denied(resp, 9, "not permitted").await;
         assert!(captured.lock().unwrap().is_empty());
     }
 
@@ -2732,7 +3041,9 @@ data: "id":1,"result":{"tools":[]}}
         // initialize / tools/list are not tools/call — allowlist doesn't apply
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
+            &["alice"],
+            &url,
+            &[],
             vec![agent("bot-a", "key-a", &["issue_read"])],
         );
         let resp = mcp_app(state.clone())
@@ -2746,7 +3057,10 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-                &[("x-octobroker-key", "key-a"), ("mcp-session-id", "mock-sess-1")],
+                &[
+                    ("x-octobroker-key", "key-a"),
+                    ("mcp-session-id", "mock-sess-1"),
+                ],
             ))
             .await
             .unwrap();
@@ -2758,7 +3072,9 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_multiple_agents_resolve_to_correct_policy() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
+            &["alice"],
+            &url,
+            &[],
             vec![
                 agent("bot-a", "key-a", &["issue_read"]),
                 agent("bot-b", "key-b", &["issue_read", "list_issues"]),
@@ -2795,7 +3111,9 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_session_binding_rejects_different_agent() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
+            &["alice"],
+            &url,
+            &[],
             vec![
                 agent("bot-a", "key-a", &["issue_read"]),
                 agent("bot-b", "key-b", &["issue_read"]),
@@ -2844,15 +3162,23 @@ data: "id":1,"result":{"tools":[]}}
         // authenticated agent (and vice versa) — mode changes invalidate.
         let (url, _captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
+            &["alice"],
+            &url,
+            &[],
             vec![agent("bot-a", "key-a", &["issue_read"])],
         );
-        state.mcp_sessions.insert("old-sess".to_string(), pin("alice", None)).await;
+        state
+            .mcp_sessions
+            .insert("old-sess".to_string(), pin("alice", None))
+            .await;
 
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-                &[("x-octobroker-key", "key-a"), ("mcp-session-id", "old-sess")],
+                &[
+                    ("x-octobroker-key", "key-a"),
+                    ("mcp-session-id", "old-sess"),
+                ],
             ))
             .await
             .unwrap();
@@ -2908,7 +3234,9 @@ data: "id":1,"result":{"tools":[]}}
         // not enabled → still denied, never reaches upstream.
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
+            &["alice"],
+            &url,
+            &[],
             vec![agent("bot-a", "key-a", &["issue_read", "create_issue"])],
         );
         let resp = mcp_app(state)
@@ -2926,8 +3254,15 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_repo_allowlist_allows_matching_repo() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
-            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/octobroker"])],
+            &["alice"],
+            &url,
+            &[],
+            vec![agent_with_repos(
+                "bot-a",
+                "key-a",
+                &["issue_read"],
+                &["openabdev/octobroker"],
+            )],
         );
         let resp = mcp_app(state)
             .oneshot(post_frame(
@@ -2944,8 +3279,15 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_repo_allowlist_denies_other_repo() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
-            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/octobroker"])],
+            &["alice"],
+            &url,
+            &[],
+            vec![agent_with_repos(
+                "bot-a",
+                "key-a",
+                &["issue_read"],
+                &["openabdev/octobroker"],
+            )],
         );
         let resp = mcp_app(state)
             .oneshot(post_frame(
@@ -2963,8 +3305,15 @@ data: "id":1,"result":{"tools":[]}}
         // search_code has no owner/repo arguments → deny-if-unresolvable
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
-            vec![agent_with_repos("bot-a", "key-a", &["search_code"], &["openabdev/*"])],
+            &["alice"],
+            &url,
+            &[],
+            vec![agent_with_repos(
+                "bot-a",
+                "key-a",
+                &["search_code"],
+                &["openabdev/*"],
+            )],
         );
         let resp = mcp_app(state)
             .oneshot(post_frame(
@@ -2981,8 +3330,15 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_repo_allowlist_wildcard_owner() {
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
-            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/*"])],
+            &["alice"],
+            &url,
+            &[],
+            vec![agent_with_repos(
+                "bot-a",
+                "key-a",
+                &["issue_read"],
+                &["openabdev/*"],
+            )],
         );
         let resp = mcp_app(state)
             .oneshot(post_frame(
@@ -3000,7 +3356,9 @@ data: "id":1,"result":{"tools":[]}}
         // Backward compat: 2a-style agent (no repos) can use repo-less tools
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
-            &["alice"], &url, &[],
+            &["alice"],
+            &url,
+            &[],
             vec![agent("bot-a", "key-a", &["search_code"])],
         );
         let resp = mcp_app(state)
@@ -3106,7 +3464,8 @@ data: "id":1,"result":{"tools":[]}}
         // The live API returns viewer "oab-octobroker[bot]" but Bot comment
         // authors carry the bare "oab-octobroker" login — the ownership check
         // must accept the App's own comments (empirically verified shape).
-        let (gql, mutations) = spawn_mock_graphql("oab-octobroker", "openabdev/octobroker", false).await;
+        let (gql, mutations) =
+            spawn_mock_graphql("oab-octobroker", "openabdev/octobroker", false).await;
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
         let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
@@ -3120,31 +3479,40 @@ data: "id":1,"result":{"tools":[]}}
 
     #[tokio::test]
     async fn test_minimize_rejects_human_authored_comment() {
-        let (gql, mutations) = spawn_mock_graphql("chaodu-agent", "openabdev/octobroker", false).await;
+        let (gql, mutations) =
+            spawn_mock_graphql("chaodu-agent", "openabdev/octobroker", false).await;
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
         let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
         assert_eq!(out.tool_error, Some(true));
-        assert!(mutations.lock().unwrap().is_empty(), "no mutation for foreign authors");
+        assert!(
+            mutations.lock().unwrap().is_empty(),
+            "no mutation for foreign authors"
+        );
     }
 
     #[tokio::test]
     async fn test_minimize_rejects_repo_mismatch() {
         // node_id belongs to another repository than the policy-checked
         // owner/repo arguments — must be refused before the mutation.
-        let (gql, mutations) = spawn_mock_graphql("oab-octobroker", "openabdev/other-repo", false).await;
+        let (gql, mutations) =
+            spawn_mock_graphql("oab-octobroker", "openabdev/other-repo", false).await;
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
         let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
         assert_eq!(out.http_status, StatusCode::FORBIDDEN.as_u16());
         assert_eq!(out.tool_error, Some(true));
-        assert!(mutations.lock().unwrap().is_empty(), "no cross-repo mutation");
+        assert!(
+            mutations.lock().unwrap().is_empty(),
+            "no cross-repo mutation"
+        );
     }
 
     #[tokio::test]
     async fn test_minimize_rejects_graphql_errors_and_bad_classifier() {
         // GraphQL soft errors (HTTP 200 + errors[]) fail closed.
-        let (gql, mutations) = spawn_mock_graphql("oab-octobroker", "openabdev/octobroker", true).await;
+        let (gql, mutations) =
+            spawn_mock_graphql("oab-octobroker", "openabdev/octobroker", true).await;
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
         let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
@@ -3186,7 +3554,8 @@ data: "id":1,"result":{"tools":[]}}
     ) -> (String, StatusesLog) {
         let log: StatusesLog = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let handler = move |uri: axum::http::Uri, axum::Json(body): axum::Json<serde_json::Value>| {
+        let handler = move |uri: axum::http::Uri,
+                            axum::Json(body): axum::Json<serde_json::Value>| {
             let log = log2.clone();
             let reply = reply_body.clone();
             async move {
@@ -3263,12 +3632,12 @@ data: "id":1,"result":{"tools":[]}}
             "context": "OpenAB PR Review",
         });
         let cases: Vec<(&str, serde_json::Value)> = vec![
-            ("state", serde_json::json!("broken")),          // not in enum
-            ("sha", serde_json::json!("f7c9378")),           // short sha
-            ("sha", serde_json::json!("../../evil")),        // path escape
-            ("owner", serde_json::json!("open/abdev")),      // path escape
-            ("repo", serde_json::json!("openab?x=1")),       // query injection
-            ("context", serde_json::json!("   ")),           // blank context
+            ("state", serde_json::json!("broken")),     // not in enum
+            ("sha", serde_json::json!("f7c9378")),      // short sha
+            ("sha", serde_json::json!("../../evil")),   // path escape
+            ("owner", serde_json::json!("open/abdev")), // path escape
+            ("repo", serde_json::json!("openab?x=1")),  // query injection
+            ("context", serde_json::json!("   ")),      // blank context
             ("target_url", serde_json::json!("javascript:alert(1)")),
             ("description", serde_json::json!("x".repeat(141))),
         ];
@@ -3276,9 +3645,14 @@ data: "id":1,"result":{"tools":[]}}
             let mut args = base.clone();
             args[key] = value;
             let frame = commit_status_frame(args);
-            let out = handle_commit_status_set(&state, &app_cred(), &frame, "http://127.0.0.1:1").await;
+            let out =
+                handle_commit_status_set(&state, &app_cred(), &frame, "http://127.0.0.1:1").await;
             assert_eq!(out.tool_error, Some(true), "case: {}", key);
-            assert_eq!(out.http_status, 200, "arg errors are tool errors, case: {}", key);
+            assert_eq!(
+                out.http_status, 200,
+                "arg errors are tool errors, case: {}",
+                key
+            );
         }
         // Missing required argument
         let frame = commit_status_frame(serde_json::json!({
@@ -3291,11 +3665,8 @@ data: "id":1,"result":{"tools":[]}}
     #[tokio::test]
     async fn test_commit_status_fails_closed_on_github_rejection() {
         // 422 (e.g. missing Commit statuses permission or bad sha) → error.
-        let (api, _log) = spawn_mock_statuses(
-            422,
-            serde_json::json!({"message": "Validation Failed"}),
-        )
-        .await;
+        let (api, _log) =
+            spawn_mock_statuses(422, serde_json::json!({"message": "Validation Failed"})).await;
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
         let frame = commit_status_frame(serde_json::json!({
             "owner": "openabdev", "repo": "openab", "sha": TEST_SHA,
@@ -3408,7 +3779,10 @@ data: "id":1,"result":{"tools":[]}}
         let state = test_state_app_mode(&url).await;
 
         let resp = mcp_app(state.clone())
-            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#, &[]))
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#,
+                &[],
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3437,7 +3811,10 @@ data: "id":1,"result":{"tools":[]}}
 
         // initialize → pin
         mcp_app(state.clone())
-            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#, &[]))
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#,
+                &[],
+            ))
             .await
             .unwrap();
         // follow-up on the same session
@@ -3492,14 +3869,27 @@ data: "id":1,"result":{"tools":[]}}
 
     fn audit_tmp(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("octobroker-mcp-audit-{}-{}.jsonl", name, std::process::id()))
-            .to_str().unwrap().to_string()
+            .join(format!(
+                "octobroker-mcp-audit-{}-{}.jsonl",
+                name,
+                std::process::id()
+            ))
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     /// Phase-1-mode state (writes pass through) with a real audit sink.
-    fn test_state_audited(upstream: &str, sink: crate::audit::AuditSink, cap: usize) -> Arc<AppState> {
+    fn test_state_audited(
+        upstream: &str,
+        sink: crate::audit::AuditSink,
+        cap: usize,
+    ) -> Arc<AppState> {
         let cache_config = config::CacheConfig::default();
-        let identities = vec![config::IdentityConfig { id: "alice".into(), token: "token-alice".into() }];
+        let identities = vec![config::IdentityConfig {
+            id: "alice".into(),
+            token: "token-alice".into(),
+        }];
         Arc::new(AppState {
             pool: pool::PatPool::new(&identities),
             cache: cache::Cache::new(&cache_config),
@@ -3520,7 +3910,10 @@ data: "id":1,"result":{"tools":[]}}
                     agents: vec![],
                     github_app: None,
                     github_apps: Vec::new(),
-                    audit: Some(config::AuditConfig { path: "unused".into(), max_result_bytes: cap }),
+                    audit: Some(config::AuditConfig {
+                        path: "unused".into(),
+                        max_result_bytes: cap,
+                    }),
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
@@ -3557,7 +3950,9 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // body still delivered intact
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(!body.is_empty());
 
         let records = read_audit(&path);
@@ -3610,7 +4005,9 @@ data: "id":1,"result":{"tools":[]}}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v["error"]["message"].as_str().unwrap().contains("audit"));
         // FAIL-CLOSED: upstream never saw the call
@@ -3655,7 +4052,9 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // full body still delivered despite the tiny buffer cap
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v.get("result").is_some());
 
@@ -3691,7 +4090,10 @@ data: "id":1,"result":{"tools":[]}}
         max_inflight: usize,
     ) -> Arc<AppState> {
         let cache_config = config::CacheConfig::default();
-        let identities = vec![config::IdentityConfig { id: "alice".into(), token: "token-alice".into() }];
+        let identities = vec![config::IdentityConfig {
+            id: "alice".into(),
+            token: "token-alice".into(),
+        }];
         Arc::new(AppState {
             pool: pool::PatPool::new(&identities),
             cache: cache::Cache::new(&cache_config),
@@ -3712,7 +4114,10 @@ data: "id":1,"result":{"tools":[]}}
                     agents,
                     github_app: None, // PAT creds acceptable for unit tests
                     github_apps: Vec::new(),
-                    audit: Some(config::AuditConfig { path: "unused".into(), max_result_bytes: 1024 * 1024 }),
+                    audit: Some(config::AuditConfig {
+                        path: "unused".into(),
+                        max_result_bytes: 1024 * 1024,
+                    }),
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
@@ -3731,8 +4136,14 @@ data: "id":1,"result":{"tools":[]}}
         let path = audit_tmp("write-enabled");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
         let state = test_state_writes_enabled(
-            &url, sink,
-            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/octobroker"])],
+            &url,
+            sink,
+            vec![agent_with_repos(
+                "bot-w",
+                "key-w",
+                &["create_issue"],
+                &["openabdev/octobroker"],
+            )],
             4,
         );
 
@@ -3753,7 +4164,54 @@ data: "id":1,"result":{"tools":[]}}
         let records = read_audit(&path);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["agent"], "bot-w");
+        assert_eq!(records[0]["grant"], "flat");
+        assert_eq!(records[1]["grant"], "flat");
         assert_eq!(records[1]["tool_error"], false);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_grant_scoped_write_records_grant_id() {
+        // Policy v2 (#35): the grant that authorized a write is recorded in
+        // BOTH audit phases — the records alone must answer "under which
+        // grant did this write run?".
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("write-grant");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let mut a = agent_with_repos("bot-g", "key-g", &[], &[]);
+        a.grants = vec![config::McpGrantConfig {
+            id: Some("openab-writer".into()),
+            tools: vec!["create_issue".into()],
+            repos: vec!["openabdev/octobroker".into()],
+            permissions: None,
+        }];
+        let state = test_state_writes_enabled(&url, sink, vec![a], 4);
+
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"octobroker","title":"t"}}}"#,
+                &[("x-octobroker-key", "key-g")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The same tool on a repo covered by NO grant → denied, no audit.
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"oablab","repo":"other","title":"t"}}}"#,
+                &[("x-octobroker-key", "key-g")],
+            ))
+            .await
+            .unwrap();
+        assert_tool_denied(resp, 4, "repository not permitted").await;
+
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        let records = read_audit(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["agent"], "bot-g");
+        assert_eq!(records[0]["grant"], "openab-writer");
+        assert_eq!(records[1]["grant"], "openab-writer");
         std::fs::remove_file(&path).ok();
     }
 
@@ -3763,8 +4221,14 @@ data: "id":1,"result":{"tools":[]}}
         let path = audit_tmp("write-denied");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
         let state = test_state_writes_enabled(
-            &url, sink,
-            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/octobroker"])],
+            &url,
+            sink,
+            vec![agent_with_repos(
+                "bot-w",
+                "key-w",
+                &["create_issue"],
+                &["openabdev/octobroker"],
+            )],
             4,
         );
         // wrong repo → denied even with writes enabled
@@ -3817,8 +4281,14 @@ data: "id":1,"result":{"tools":[]}}
         let path = audit_tmp("cap");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
         let state = test_state_writes_enabled(
-            &url, sink,
-            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/octobroker"])],
+            &url,
+            sink,
+            vec![agent_with_repos(
+                "bot-w",
+                "key-w",
+                &["create_issue"],
+                &["openabdev/octobroker"],
+            )],
             1,
         );
         // Saturate the cap by holding a guard, then issue a write
@@ -3871,7 +4341,12 @@ data: "id":1,"result":{"tools":[]}}
         headers: HeaderMap,
         body: Bytes,
     ) -> Response {
-        let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let get = |n: &str| {
+            headers
+                .get(n)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
         let body_str = String::from_utf8_lossy(&body).to_string();
         let auth = get("authorization");
         let session = get("mcp-session-id");
@@ -3884,9 +4359,7 @@ data: "id":1,"result":{"tools":[]}}
             session: session.clone(),
             body: body_str.clone(),
         });
-        if body_str.contains("fail_secondary")
-            && auth.as_deref() == Some("Bearer ghs_openabdev")
-        {
+        if body_str.contains("fail_secondary") && auth.as_deref() == Some("Bearer ghs_openabdev") {
             // JSON-RPC error INSIDE an HTTP 200 — a session id is present
             // but the initialization failed at the protocol level.
             return Response::builder()
@@ -3962,7 +4435,12 @@ data: "id":1,"result":{"tools":[]}}
             agent_with_repos(
                 "b0",
                 "key-b0",
-                &["issue_read", "list_issues", "create_issue", "add_issue_comment"],
+                &[
+                    "issue_read",
+                    "list_issues",
+                    "create_issue",
+                    "add_issue_comment",
+                ],
                 &["openabdev/openab", "oablab/chi"],
             ),
             // Second agent with a valid key of its own — for session
@@ -3981,6 +4459,31 @@ data: "id":1,"result":{"tools":[]}}
                 &["search_code", "issue_read", "create_issue"],
                 &[],
             ),
+            // Policy v2 (#35): b0's policy expressed as per-repo grants —
+            // the routes and mint envelopes must be identical to the flat
+            // form, and the per-grant tool/repository pairing enforced.
+            config::McpAgentConfig {
+                id: "b0g".into(),
+                key: None,
+                keys: vec!["key-b0g".into()],
+                tools: vec![],
+                repos: vec![],
+                grants: vec![
+                    config::McpGrantConfig {
+                        id: Some("openab-reader".into()),
+                        tools: vec!["issue_read".into(), "list_issues".into()],
+                        repos: vec!["openabdev/openab".into()],
+                        permissions: None,
+                    },
+                    config::McpGrantConfig {
+                        id: None,
+                        tools: vec!["issue_read".into()],
+                        repos: vec!["oablab/chi".into()],
+                        permissions: None,
+                    },
+                ],
+                git_credentials_read_only: None,
+            },
         ];
         let cache_config = config::CacheConfig::default();
         let has_sink = sink.is_some();
@@ -4029,11 +4532,16 @@ data: "id":1,"result":{"tools":[]}}
     #[test]
     fn test_route_owners_and_owner_envelope() {
         let a = agent_with_repos(
-            "a", "k", &[],
+            "a",
+            "k",
+            &[],
             &["openabdev/openab", "OABLAB/chi", "openabdev/octobroker"],
         );
-        assert_eq!(route_owners(&a), vec!["oablab", "openabdev"]);
-        assert_eq!(scope_envelope_for_owner(&a, "openabdev"), vec!["openab", "octobroker"]);
+        assert_eq!(a.route_owners(), vec!["oablab", "openabdev"]);
+        assert_eq!(
+            scope_envelope_for_owner(&a, "openabdev"),
+            vec!["openab", "octobroker"]
+        );
         assert_eq!(scope_envelope_for_owner(&a, "oablab"), vec!["chi"]);
         assert!(scope_envelope_for_owner(&a, "other").is_empty());
         // wildcard for the owner → installation-wide
@@ -4042,6 +4550,21 @@ data: "id":1,"result":{"tools":[]}}
         // other owners unaffected by that wildcard
         let m = agent_with_repos("a", "k", &[], &["openabdev/*", "oablab/chi"]);
         assert_eq!(scope_envelope_for_owner(&m, "oablab"), vec!["chi"]);
+        // Tool-less grants still contribute repos to the mint envelope:
+        // GitHub-side repo scoping covers every declared repo (defense in
+        // depth) even though only tool-bearing grants can authorize calls.
+        let mut tl = agent_with_repos("a", "k", &["issue_read"], &["openabdev/openab"]);
+        tl.grants = vec![config::McpGrantConfig {
+            id: None,
+            tools: vec![],
+            repos: vec!["openabdev/other".into()],
+            permissions: None,
+        }];
+        assert_eq!(
+            scope_envelope_for_owner(&tl, "openabdev"),
+            vec!["openab", "other"]
+        );
+        assert_eq!(scope_envelope(Some(&tl)), vec!["openab", "other"]);
     }
 
     #[tokio::test]
@@ -4055,14 +4578,19 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(resp.status(), StatusCode::OK);
         // Primary is the first sorted owner (oablab) — its upstream session
         // ID is the downstream session ID.
-        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-ghs_oablab");
+        assert_eq!(
+            resp.headers().get("mcp-session-id").unwrap(),
+            "sess-ghs_oablab"
+        );
 
         // One upstream initialize per installation, each with its own token
         {
             let reqs = captured.lock().unwrap();
             assert_eq!(reqs.len(), 2);
-            let auths: Vec<String> =
-                reqs.iter().map(|r| r.auth.clone().unwrap_or_default()).collect();
+            let auths: Vec<String> = reqs
+                .iter()
+                .map(|r| r.auth.clone().unwrap_or_default())
+                .collect();
             assert!(auths.contains(&"Bearer ghs_oablab".to_string()));
             assert!(auths.contains(&"Bearer ghs_openabdev".to_string()));
         }
@@ -4109,7 +4637,10 @@ data: "id":1,"result":{"tools":[]}}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-ghs_oablab");
+        assert_eq!(
+            resp.headers().get("mcp-session-id").unwrap(),
+            "sess-ghs_oablab"
+        );
 
         // oablab call → oablab token on the primary upstream session
         let resp = mcp_app(state)
@@ -4120,7 +4651,10 @@ data: "id":1,"result":{"tools":[]}}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-ghs_oablab");
+        assert_eq!(
+            resp.headers().get("mcp-session-id").unwrap(),
+            "sess-ghs_oablab"
+        );
 
         let reqs = captured.lock().unwrap();
         assert_eq!(reqs.len(), 2);
@@ -4128,6 +4662,79 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(reqs[0].session.as_deref(), Some("sess-ghs_openabdev"));
         assert_eq!(reqs[1].auth.as_deref(), Some("Bearer ghs_oablab"));
         assert_eq!(reqs[1].session.as_deref(), Some("sess-ghs_oablab"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_grants_fan_out_and_enforce_pairing() {
+        // Policy v2 (#35) + multi-installation: an agent whose repos live
+        // only inside [[grants]] fans out to one session per covering owner
+        // and enforces the per-grant tool/repo pairing per call.
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b0g")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Both grant owners fan out: one session per installation.
+        assert_eq!(
+            resp.headers().get("mcp-session-id").unwrap(),
+            "sess-ghs_oablab"
+        );
+        {
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 2);
+            let auths: Vec<String> = reqs
+                .iter()
+                .map(|r| r.auth.clone().unwrap_or_default())
+                .collect();
+            assert!(auths.contains(&"Bearer ghs_oablab".to_string()));
+            assert!(auths.contains(&"Bearer ghs_openabdev".to_string()));
+            // upstream sees the union of granted tools
+            for r in reqs.iter() {
+                assert_eq!(
+                    r.tools_hdr.as_deref(),
+                    Some("issue_read,list_issues"),
+                    "X-MCP-Tools must be the union across grants"
+                );
+            }
+        }
+        captured.lock().unwrap().clear();
+
+        // issue_read allowed on BOTH granted repos, routed to each owner.
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
+                &[("x-octobroker-key", "key-b0g"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // list_issues is granted on openabdev/openab but NOT oablab/chi —
+        // the cross-product must not authorize it on chi.
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_issues","arguments":{"owner":"oablab","repo":"chi"}}}"#,
+                &[("x-octobroker-key", "key-b0g"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_tool_denied(resp, 2, "repository not permitted").await;
+        // …but the same tool is fine on its own grant's repo.
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_issues","arguments":{"owner":"openabdev","repo":"openab"}}}"#,
+                &[("x-octobroker-key", "key-b0g"), ("mcp-session-id", "sess-ghs_oablab")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "only the two allowed calls reached upstream");
+        assert_eq!(reqs[0].auth.as_deref(), Some("Bearer ghs_openabdev"));
+        assert_eq!(reqs[0].session.as_deref(), Some("sess-ghs_openabdev"));
+        assert_eq!(reqs[1].auth.as_deref(), Some("Bearer ghs_openabdev"));
     }
 
     #[tokio::test]
@@ -4197,7 +4804,10 @@ data: "id":1,"result":{"tools":[]}}
                 "dsid".to_string(),
                 SessionPin {
                     agent_id: Some("b0".into()),
-                    cred: PinnedCred::MultiApp { routes, primary: "oablab".into() },
+                    cred: PinnedCred::MultiApp {
+                        routes,
+                        primary: "oablab".into(),
+                    },
                 },
             )
             .await;
@@ -4242,7 +4852,10 @@ data: "id":1,"result":{"tools":[]}}
             .iter()
             .filter(|r| r.method == "DELETE")
             .map(|r| {
-                (r.auth.clone().unwrap_or_default(), r.session.clone().unwrap_or_default())
+                (
+                    r.auth.clone().unwrap_or_default(),
+                    r.session.clone().unwrap_or_default(),
+                )
             })
             .collect();
         assert!(
@@ -4270,24 +4883,35 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-                &[("x-octobroker-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+                &[
+                    ("x-octobroker-key", "key-b0"),
+                    ("mcp-session-id", "sess-ghs_oablab"),
+                ],
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // Never leak an upstream session ID downstream
-        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-ghs_oablab");
+        assert_eq!(
+            resp.headers().get("mcp-session-id").unwrap(),
+            "sess-ghs_oablab"
+        );
 
         // Every installation's upstream session received the notification
         // with its own credential and its own session ID
         {
             let reqs = captured.lock().unwrap();
             assert_eq!(reqs.len(), 2);
-            assert!(reqs.iter().all(|r| r.body.contains("notifications/initialized")));
+            assert!(reqs
+                .iter()
+                .all(|r| r.body.contains("notifications/initialized")));
             let pairs: Vec<(String, String)> = reqs
                 .iter()
                 .map(|r| {
-                    (r.auth.clone().unwrap_or_default(), r.session.clone().unwrap_or_default())
+                    (
+                        r.auth.clone().unwrap_or_default(),
+                        r.session.clone().unwrap_or_default(),
+                    )
                 })
                 .collect();
             assert!(pairs.contains(&("Bearer ghs_oablab".into(), "sess-ghs_oablab".into())));
@@ -4373,7 +4997,10 @@ data: "id":1,"result":{"tools":[]}}
             let pairs: Vec<(String, String)> = reqs
                 .iter()
                 .map(|r| {
-                    (r.auth.clone().unwrap_or_default(), r.session.clone().unwrap_or_default())
+                    (
+                        r.auth.clone().unwrap_or_default(),
+                        r.session.clone().unwrap_or_default(),
+                    )
                 })
                 .collect();
             assert!(pairs.contains(&("Bearer ghs_oablab".into(), "sess-ghs_oablab".into())));
@@ -4395,7 +5022,10 @@ data: "id":1,"result":{"tools":[]}}
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-token-alice");
+        assert_eq!(
+            resp.headers().get("mcp-session-id").unwrap(),
+            "sess-token-alice"
+        );
         {
             let reqs = captured.lock().unwrap();
             assert_eq!(reqs.len(), 1, "repo-less agent must not fan out");

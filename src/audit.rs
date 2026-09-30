@@ -31,6 +31,10 @@ pub struct CallInfo<'a> {
     pub rpc_id: Option<&'a serde_json::Value>,
     pub session: Option<&'a str>,
     pub agent: Option<&'a str>,
+    /// The grant that authorized this call (policy v2, #35) — `"flat"` for
+    /// the implicit `tools`/`repos` sugar grant, `grants[N]` or the grant's
+    /// `id` for explicit grants. `None` in Phase 1 (no agent).
+    pub grant: Option<&'a str>,
     pub credential: &'a str,
     pub tool: &'a str,
     pub repo: Option<&'a (String, String)>,
@@ -55,7 +59,10 @@ impl AuditSink {
             .append(true)
             .open(path)
             .map_err(|e| format!("cannot open audit log {}: {}", path, e))?;
-        Ok(Self { file: Mutex::new(file), path: path.to_string() })
+        Ok(Self {
+            file: Mutex::new(file),
+            path: path.to_string(),
+        })
     }
 
     /// A sink whose writes always fail (read-only fd) — for fail-closed tests.
@@ -75,6 +82,7 @@ impl AuditSink {
             "rpc_id": call.rpc_id,
             "session": call.session,
             "agent": call.agent,
+            "grant": call.grant,
             "cred": call.credential,
             "tool": call.tool,
             "repo": call.repo.map(|(o, r)| format!("{}/{}", o, r)),
@@ -92,6 +100,7 @@ impl AuditSink {
             "rpc_id": call.rpc_id,
             "session": call.session,
             "agent": call.agent,
+            "grant": call.grant,
             "tool": call.tool,
             "http_status": outcome.http_status,
             "tool_error": outcome.tool_error,
@@ -204,7 +213,11 @@ mod tests {
 
     fn tmp_path(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("octobroker-audit-{}-{}.jsonl", name, std::process::id()))
+            .join(format!(
+                "octobroker-audit-{}-{}.jsonl",
+                name,
+                std::process::id()
+            ))
             .to_str()
             .unwrap()
             .to_string()
@@ -215,6 +228,7 @@ mod tests {
             rpc_id: None,
             session: Some("sess-1"),
             agent: Some("bot-a"),
+            grant: Some("flat"),
             credential: "github-app",
             tool,
             repo,
@@ -227,11 +241,17 @@ mod tests {
         let sink = AuditSink::open(&path).unwrap();
         let repo = ("openabdev".to_string(), "octobroker".to_string());
 
-        sink.record_request(&call("create_issue", Some(&repo)), &["owner".into(), "title".into()])
-            .unwrap();
+        sink.record_request(
+            &call("create_issue", Some(&repo)),
+            &["owner".into(), "title".into()],
+        )
+        .unwrap();
         sink.record_result(
             &call("create_issue", Some(&repo)),
-            &CallOutcome { http_status: 200, tool_error: Some(false) },
+            &CallOutcome {
+                http_status: 200,
+                tool_error: Some(false),
+            },
         )
         .unwrap();
 
@@ -246,7 +266,9 @@ mod tests {
         assert_eq!(lines[0]["repo"], "openabdev/octobroker");
         assert_eq!(lines[0]["arg_keys"], serde_json::json!(["owner", "title"]));
         assert_eq!(lines[0]["agent"], "bot-a");
+        assert_eq!(lines[0]["grant"], "flat");
         assert_eq!(lines[1]["phase"], "result");
+        assert_eq!(lines[1]["grant"], "flat");
         assert_eq!(lines[1]["http_status"], 200);
         assert_eq!(lines[1]["tool_error"], false);
         std::fs::remove_file(&path).ok();
@@ -254,47 +276,71 @@ mod tests {
 
     #[test]
     fn test_open_bad_path_fails_loudly() {
-        let err = AuditSink::open("/nonexistent-dir/audit.jsonl").err().unwrap();
+        let err = AuditSink::open("/nonexistent-dir/audit.jsonl")
+            .err()
+            .unwrap();
         assert!(err.contains("cannot open audit log"));
     }
 
     #[test]
     fn test_parse_tool_outcome_plain_json() {
         assert_eq!(
-            parse_tool_outcome(Some("application/json"), br#"{"jsonrpc":"2.0","id":1,"result":{"isError":false,"content":[]}}"#),
+            parse_tool_outcome(
+                Some("application/json"),
+                br#"{"jsonrpc":"2.0","id":1,"result":{"isError":false,"content":[]}}"#
+            ),
             Some(false)
         );
         assert_eq!(
-            parse_tool_outcome(Some("application/json"), br#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[]}}"#),
+            parse_tool_outcome(
+                Some("application/json"),
+                br#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[]}}"#
+            ),
             Some(true)
         );
         // result without isError = success
         assert_eq!(
-            parse_tool_outcome(Some("application/json"), br#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+            parse_tool_outcome(
+                Some("application/json"),
+                br#"{"jsonrpc":"2.0","id":1,"result":{}}"#
+            ),
             Some(false)
         );
         // JSON-RPC error object = failure
         assert_eq!(
-            parse_tool_outcome(Some("application/json"), br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#),
+            parse_tool_outcome(
+                Some("application/json"),
+                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#
+            ),
             Some(true)
         );
         // garbage = undeterminable
-        assert_eq!(parse_tool_outcome(Some("application/json"), b"not json"), None);
+        assert_eq!(
+            parse_tool_outcome(Some("application/json"), b"not json"),
+            None
+        );
     }
 
     #[test]
     fn test_parse_tool_outcome_sse() {
         let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"isError\":true}}\n\n";
-        assert_eq!(parse_tool_outcome(Some("text/event-stream"), body), Some(true));
+        assert_eq!(
+            parse_tool_outcome(Some("text/event-stream"), body),
+            Some(true)
+        );
 
         // multiple frames: last data frame wins
         let body = b"data: {\"x\":1}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"isError\":false}}\n\n";
-        assert_eq!(parse_tool_outcome(Some("text/event-stream"), body), Some(false));
+        assert_eq!(
+            parse_tool_outcome(Some("text/event-stream"), body),
+            Some(false)
+        );
     }
 
     #[test]
     fn test_redacted_arg_keys() {
-        let args = serde_json::json!({"owner":"o","repo":"r","title":"secret text","body":"secret"});
+        let args =
+            serde_json::json!({"owner":"o","repo":"r","title":"secret text","body":"secret"});
         let mut keys = redacted_arg_keys(Some(&args));
         keys.sort();
         assert_eq!(keys, vec!["body", "owner", "repo", "title"]);

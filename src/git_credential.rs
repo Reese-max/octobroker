@@ -37,9 +37,7 @@ pub async fn git_credential(
     // when the endpoint is enabled, so network-trust mode (None) is denied.
     let agent = match authenticate(&state, &headers) {
         Ok(Some(a)) => a,
-        Ok(None) => {
-            return rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required")
-        }
+        Ok(None) => return rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required"),
         Err(resp) => return *resp,
     };
 
@@ -47,23 +45,28 @@ pub async fn git_credential(
     // strict charset (GitHub logins: alphanumeric + hyphen; repo names:
     // alphanumeric + `-_.`). Percent-encoded or exotic input is rejected
     // here — before the allowlist, audit preflight, or any mint attempt.
-    let Some((owner, name)) = params
-        .get("repo")
-        .and_then(|r| r.split_once('/'))
-        .filter(|(o, n)| {
-            !o.is_empty()
-                && !n.is_empty()
-                && o.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                && n.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        })
+    let Some((owner, name)) =
+        params
+            .get("repo")
+            .and_then(|r| r.split_once('/'))
+            .filter(|(o, n)| {
+                !o.is_empty()
+                    && !n.is_empty()
+                    && o.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    && n.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            })
     else {
-        return rpc_error(StatusCode::BAD_REQUEST, "repo=<owner>/<name> query required");
+        return rpc_error(
+            StatusCode::BAD_REQUEST,
+            "repo=<owner>/<name> query required",
+        );
     };
 
     // Repository-scoped agents only — a repo-less agent has no installation
-    // envelope, and git credentials are never PAT-backed.
-    if agent.repos.is_empty() {
+    // envelope, and git credentials are never PAT-backed. Repo entries from
+    // flat `repos` and every grant count equally (policy v2, #35).
+    if agent.repo_entries().next().is_none() {
         tracing::warn!(
             "git-credential DENIED (repo-less agent) [agent={}]",
             agent.id
@@ -73,10 +76,13 @@ pub async fn git_credential(
             "git credentials require a repository-scoped agent",
         );
     }
-    if !crate::policy::repo_allowed(&agent.repos, owner, name) {
+    let repo_allowlist: Vec<String> = agent.repo_entries().map(str::to_string).collect();
+    if !crate::policy::repo_allowed(&repo_allowlist, owner, name) {
         tracing::warn!(
             "git-credential DENIED (repo {}/{} not allowlisted) [agent={}]",
-            owner, name, agent.id
+            owner,
+            name,
+            agent.id
         );
         return rpc_error(
             StatusCode::FORBIDDEN,
@@ -93,7 +99,8 @@ pub async fn git_credential(
             None => {
                 tracing::warn!(
                     "git-credential DENIED (no installation for owner {}) [agent={}]",
-                    owner, agent.id
+                    owner,
+                    agent.id
                 );
                 return rpc_error(
                     StatusCode::FORBIDDEN,
@@ -162,7 +169,9 @@ pub async fn git_credential(
     if let Err(e) = provider.verify_owner(owner).await {
         tracing::error!(
             "git-credential owner verification failed for {}/{}: {}",
-            owner, name, e
+            owner,
+            name,
+            e
         );
         if let Err(audit_err) = sink.record_git_credential_result(
             &agent.id,
@@ -174,7 +183,10 @@ pub async fn git_credential(
         ) {
             tracing::error!("git-credential failure result audit failed: {}", audit_err);
         }
-        return rpc_error(StatusCode::FORBIDDEN, "installation owner verification failed");
+        return rpc_error(
+            StatusCode::FORBIDDEN,
+            "installation owner verification failed",
+        );
     }
 
     // Git-specific token: exactly one repository, with a cache namespace
@@ -183,10 +195,7 @@ pub async fn git_credential(
     let token = match provider.token_git(name, read_only).await {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!(
-                "git-credential mint failed for {}/{}: {}",
-                owner, name, e
-            );
+            tracing::error!("git-credential mint failed for {}/{}: {}", owner, name, e);
             if let Err(audit_err) = sink.record_git_credential_result(
                 &agent.id,
                 &cred_label,
@@ -289,10 +298,7 @@ mod tests {
                 "/app/installations/{id}/access_tokens",
                 axum::routing::post(mint),
             )
-            .route(
-                "/app/installations/{id}",
-                axum::routing::get(installation),
-            )
+            .route("/app/installations/{id}", axum::routing::get(installation))
             .with_state(log.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -307,6 +313,7 @@ mod tests {
             keys: vec![key.into()],
             tools: vec![],
             repos: repos.iter().map(|s| s.to_string()).collect(),
+            grants: Vec::new(),
             git_credentials_read_only: None,
         }
     }
@@ -356,48 +363,64 @@ mod tests {
         let cache_config = config::CacheConfig::default();
         (
             Arc::new(AppState {
-            pool: pool::PatPool::new(&[]),
-            cache: cache::Cache::new(&cache_config),
-            config: config::Config {
-                port: 8080,
-                identities: vec![],
-                allowed_owners: vec![],
-                cache: cache_config,
-                mcp: config::McpConfig {
-                    enabled: true,
-                    enable_writes: false,
-                    enable_git_credentials: enabled,
-                    git_credentials_read_only: read_only,
-                    upstream: None,
-                    toolsets: vec![],
-                    session_ttl_secs: 3600,
-                    max_inflight_writes: 4,
-                    agents: vec![
-                        agent(
-                            "b0",
-                            "key-b0",
-                            &["openabdev/openab", "oablab/chi", "mislabeled/repo"],
-                        ),
-                        agent("norepo", "key-norepo", &[]),
-                        agent("other", "key-other", &["otherorg/thing"]),
-                        // Per-agent overrides: pinned read-only / pinned
-                        // push-capable regardless of the global flag.
-                        agent_override("pinned-ro", "key-ro", &["openabdev/openab"], true),
-                        agent_override("pinned-rw", "key-rw", &["openabdev/openab"], false),
-                    ],
-                    github_app: None,
-                    github_apps: entries,
-                    audit: None,
+                pool: pool::PatPool::new(&[]),
+                cache: cache::Cache::new(&cache_config),
+                config: config::Config {
+                    port: 8080,
+                    identities: vec![],
+                    allowed_owners: vec![],
+                    cache: cache_config,
+                    mcp: config::McpConfig {
+                        enabled: true,
+                        enable_writes: false,
+                        enable_git_credentials: enabled,
+                        git_credentials_read_only: read_only,
+                        upstream: None,
+                        toolsets: vec![],
+                        session_ttl_secs: 3600,
+                        max_inflight_writes: 4,
+                        agents: vec![
+                            agent(
+                                "b0",
+                                "key-b0",
+                                &["openabdev/openab", "oablab/chi", "mislabeled/repo"],
+                            ),
+                            // Policy v2 (#35): repos arrive via [[grants]]
+                            // only — git credentials see the union.
+                            config::McpAgentConfig {
+                                id: "b0-grants".into(),
+                                key: None,
+                                keys: vec!["key-b0g".into()],
+                                tools: vec![],
+                                repos: vec![],
+                                grants: vec![config::McpGrantConfig {
+                                    id: Some("reader".into()),
+                                    tools: vec!["issue_read".into()],
+                                    repos: vec!["oablab/chi".into()],
+                                    permissions: None,
+                                }],
+                                git_credentials_read_only: None,
+                            },
+                            agent("norepo", "key-norepo", &[]),
+                            agent("other", "key-other", &["otherorg/thing"]),
+                            // Per-agent overrides: pinned read-only / pinned
+                            // push-capable regardless of the global flag.
+                            agent_override("pinned-ro", "key-ro", &["openabdev/openab"], true),
+                            agent_override("pinned-rw", "key-rw", &["openabdev/openab"], false),
+                        ],
+                        github_app: None,
+                        github_apps: entries,
+                        audit: None,
+                    },
                 },
-            },
-            token_users: moka::future::Cache::builder().max_capacity(10).build(),
-            http: reqwest::Client::new(),
-            mcp_sessions: moka::future::Cache::builder().max_capacity(10).build(),
-            app_tokens: None,
-            multi_app_tokens: Some(multi),
-            audit: sink,
-            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        }),
+                token_users: moka::future::Cache::builder().max_capacity(10).build(),
+                http: reqwest::Client::new(),
+                mcp_sessions: moka::future::Cache::builder().max_capacity(10).build(),
+                app_tokens: None,
+                multi_app_tokens: Some(multi),
+                audit: sink,
+                write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            }),
             mint_log,
         )
     }
@@ -420,7 +443,11 @@ mod tests {
 
     fn audit_tmp(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("octobroker-gitcred-{}-{}.jsonl", name, std::process::id()))
+            .join(format!(
+                "octobroker-gitcred-{}-{}.jsonl",
+                name,
+                std::process::id()
+            ))
             .to_str()
             .unwrap()
             .to_string()
@@ -463,7 +490,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["username"], "x-access-token");
         assert_eq!(v["password"], "ghs_git_openabdev");
@@ -516,7 +545,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["username"], "x-access-token");
         assert!(v["expires_at"].as_u64().unwrap() > 0);
@@ -603,13 +634,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["password"], "ghs_git_oablab");
         let minted = mint_log.lock().unwrap();
         assert_eq!(minted.len(), 1);
         assert_eq!(minted[0].0, 42, "must route to the oablab installation");
         assert_eq!(minted[0].1["repositories"], serde_json::json!(["chi"]));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_grant_repos_authorize_credentials() {
+        // Policy v2 (#35): an agent whose repos come from [[grants]] (flat
+        // `repos` empty) is repository-scoped and gets credentials only for
+        // repositories listed in its grants.
+        let path = audit_tmp("grants");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let (state, mint_log) = test_state(true, false, Some(sink)).await;
+        let resp = app(state.clone())
+            .oneshot(req("oablab/chi", Some("key-b0g")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["password"], "ghs_git_oablab");
+        // A repo in no grant is denied — even under an installed owner.
+        let resp = app(state)
+            .oneshot(req("openabdev/openab", Some("key-b0g")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let minted = mint_log.lock().unwrap();
+        assert_eq!(minted.len(), 1, "only the allowed repo may mint");
         std::fs::remove_file(&path).ok();
     }
 
