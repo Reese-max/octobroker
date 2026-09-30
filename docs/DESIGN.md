@@ -77,7 +77,12 @@ Sessions (`Mcp-Session-Id`) are pinned to `(credential, agent)` at
   no-op (the session remains usable), and unknown sessions get 400 not 404.
   Nothing about session validity is delegated upstream.
 - Pins are in-process memory → single replica while MCP is enabled; config
-  change = restart = all sessions revoked (the current revocation story).
+  change = restart = all sessions revoked. Revocation is otherwise lazy —
+  tokens age out at their ~1h TTL — unless the opt-in webhook listener
+  (`[webhooks] github_secret`, `POST /webhooks/github`) is enabled: it drops
+  the affected installation's token cache and pinned sessions on
+  `installation` suspend/delete, deselects via `installation_repositories`,
+  and `github_app_authorization` revocation events.
 
 ## Policy model
 

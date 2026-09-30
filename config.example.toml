@@ -152,3 +152,21 @@ enabled = false
 # id = "ci-agent"
 # key = "env:OCTOBROKER_KEY_CI"
 # tools = ["get_file_contents", "list_commits"]
+
+# GitHub webhook listener — optional, off by default (issue #50).
+# When github_secret is set, POST /webhooks/github accepts signature-verified
+# GitHub App webhook deliveries and invalidates affected credential caches
+# immediately:
+#   installation suspend/deleted        → drop that installation's token
+#                                         cache (MCP + git) and kill its
+#                                         pinned upstream sessions
+#   installation_repositories removed   → drop cached tokens whose repo
+#                                         scope intersects the removed repos
+#   github_app_authorization revoked    → same treatment for every
+#                                         configured App
+# Without it, revocation latency stays at the minted-token TTL (~1h) + restart.
+# Ingress note: receiving webhooks requires a publicly reachable endpoint
+# (or a relay/queue forwarding signed payloads) — it trades against the
+# egress-only deployment posture, hence opt-in.
+# [webhooks]
+# github_secret = "env:OCTOBROKER_GITHUB_WEBHOOK_SECRET"

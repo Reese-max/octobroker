@@ -187,6 +187,8 @@ export OCTOBROKER_PORT=8080
 export OCTOBROKER_ALLOWED_OWNERS=openclaw,openabdev
 export OCTOBROKER_PAT_ALICE=ghp_xxx
 export OCTOBROKER_PAT_BOB=ghp_yyy
+# Optional: enables the signature-verified GitHub webhook listener
+export OCTOBROKER_GITHUB_WEBHOOK_SECRET=whsec_xxx
 ```
 
 PATs are discovered from any env var matching `OCTOBROKER_PAT_<ID>=<token>`.
@@ -602,6 +604,43 @@ Deployment notes:
 - Run a **single replica** while MCP is enabled — session pins live in process memory. A rolling deploy terminates sessions; clients recover by re-initializing.
 - Inside a trusted network, any workload that can reach `/mcp` gets the same read-only access (same trust model as octobroker's REST reads). Put TLS and agent authentication in front before any write-capable phase.
 - If the hosted endpoint is unreachable from your network, point `upstream` at a self-hosted [`github-mcp-server`](https://github.com/github/github-mcp-server) instead — same protocol and headers.
+
+### Credential revocation (`POST /webhooks/github`) — opt-in
+
+By default octobroker learns about revocation lazily: a suspended or deleted
+App installation leaves already-minted tokens usable until they expire
+(≤1h), and pinned MCP sessions keep flowing until restart. Setting
+`[webhooks] github_secret` enables a signature-verified GitHub App webhook
+listener that collapses that window to ~seconds:
+
+```toml
+[webhooks]
+github_secret = "env:OCTOBROKER_GITHUB_WEBHOOK_SECRET"
+```
+
+Configure the same secret on the App's **Webhook** settings and point its
+webhook URL at `https://<octobroker>/webhooks/github`. Deliveries are
+verified against `X-Hub-Signature-256` (HMAC-SHA256 over the raw body);
+anything else is rejected **401** before the payload is parsed.
+
+Handled events:
+
+| Event (action) | Effect |
+|---|---|
+| `installation` (suspend, deleted) | Drop that installation's entire token cache (MCP + git purposes) and kill its pinned MCP sessions — clients re-initialize transparently |
+| `installation_repositories` (removed) | Drop cached tokens whose repo scope intersects the removed repositories (installation-wide tokens included); pinned sessions keep their token, which stays valid for whatever it still covers |
+| `github_app_authorization` (revoked) | The payload names no installation, so **every** configured App gets the suspension treatment |
+
+Everything else (`ping`, `installation.created`, unrelated events) is
+acknowledged 200 and invalidates nothing. In multi-app mode only the named
+installation's provider/sessions are affected; PAT-pinned sessions are
+never touched by any event. Without a configured secret the route is
+registered but fails closed with 404 — current behavior, i.e. revocation
+latency = minted-token TTL (~1h) + restart.
+
+Deployment trade-off: receiving webhooks requires **ingress** from GitHub —
+a publicly reachable endpoint, or a relay/queue that forwards signed
+payloads — which cuts against the egress-only posture, hence opt-in.
 
 ### Management
 
