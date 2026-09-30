@@ -157,14 +157,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "obk"
-version = "0.1.0"
-dependencies = [
- "reqwest",
- "serde_json",
-]
-
-[[package]]
 name = "http"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -428,6 +420,14 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "obk"
+version = "0.1.1"
+dependencies = [
+ "reqwest",
+ "serde_json",
 ]
 
 [[package]]
