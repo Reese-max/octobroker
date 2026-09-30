@@ -8,6 +8,7 @@ pub struct Config {
     pub allowed_owners: Vec<String>,
     pub cache: CacheConfig,
     pub mcp: McpConfig,
+    pub webhooks: WebhooksConfig,
 }
 
 #[derive(Clone)]
@@ -120,6 +121,21 @@ pub struct McpConfig {
     /// pre-flight audit record cannot be persisted is rejected (fail-closed).
     #[serde(default)]
     pub audit: Option<AuditConfig>,
+}
+
+/// GitHub webhook listener configuration (issue #50). When `github_secret`
+/// is set, `POST /webhooks/github` accepts signature-verified GitHub App
+/// webhook deliveries and invalidates affected credential caches
+/// immediately instead of waiting for token TTL/restart.
+#[derive(Clone, Default, Deserialize)]
+pub struct WebhooksConfig {
+    /// Shared secret configured on the GitHub App's webhook, used to verify
+    /// `X-Hub-Signature-256` (HMAC-SHA256 over the raw request body).
+    /// Supports the same secret references as tokens (env:/aws:/k8s:).
+    /// None = listener disabled: every delivery fails closed with 404 and
+    /// revocation latency stays at the minted-token TTL (~1h) + restart.
+    #[serde(default)]
+    pub github_secret: Option<String>,
 }
 
 /// Durable audit configuration.
@@ -249,7 +265,9 @@ impl McpConfig {
                 return Err("enable_writes requires [mcp.github_app] or [[mcp.github_apps]] — writes never run on pooled PATs".into());
             }
             if self.audit.is_none() {
-                return Err("enable_writes requires [mcp.audit] — writes are fail-closed audited".into());
+                return Err(
+                    "enable_writes requires [mcp.audit] — writes are fail-closed audited".into(),
+                );
             }
             // Multi-installation mode: repo-less agents ride pooled PATs, and
             // writes never run on pooled PATs — an agent allowlisting a
@@ -257,10 +275,9 @@ impl McpConfig {
             if !self.github_apps.is_empty() {
                 for agent in &self.agents {
                     if agent.repos.is_empty()
-                        && agent
-                            .tools
-                            .iter()
-                            .any(|t| crate::policy::classify_tool(t) == crate::policy::ToolKind::Write)
+                        && agent.tools.iter().any(|t| {
+                            crate::policy::classify_tool(t) == crate::policy::ToolKind::Write
+                        })
                     {
                         return Err(format!(
                             "mcp agent '{}' allowlists write tools but has no `repos` — repo-less agents use pooled PATs and writes never run on pooled PATs",
@@ -281,7 +298,10 @@ impl McpConfig {
                 return Err("enable_git_credentials requires [mcp.github_app] or [[mcp.github_apps]] — git credentials are App installation tokens, never PATs".into());
             }
             if self.audit.is_none() {
-                return Err("enable_git_credentials requires [mcp.audit] — issuance is fail-closed audited".into());
+                return Err(
+                    "enable_git_credentials requires [mcp.audit] — issuance is fail-closed audited"
+                        .into(),
+                );
             }
             if self
                 .github_app
@@ -297,7 +317,8 @@ impl McpConfig {
         }
         // Multi-app validation
         if !self.github_apps.is_empty() {
-            let mut seen_owners: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_owners: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for entry in &self.github_apps {
                 let normalized = entry.owner.trim().to_lowercase();
                 if normalized.is_empty() {
@@ -359,18 +380,40 @@ impl McpConfig {
 fn default_mcp_upstream() -> String {
     "https://api.githubcopilot.com/mcp/readonly".to_string()
 }
-fn default_mcp_session_ttl() -> u64 { 3600 }
-fn default_mcp_max_inflight_writes() -> usize { 4 }
+fn default_mcp_session_ttl() -> u64 {
+    3600
+}
+fn default_mcp_max_inflight_writes() -> usize {
+    4
+}
 
-fn default_port() -> u16 { 8080 }
-fn default_max_entries() -> u64 { 10000 }
-fn default_pr_ttl() -> u64 { 30 }
-fn default_run_ttl() -> u64 { 15 }
-fn default_raw_ttl() -> u64 { 30 }
-fn default_raw_max_bytes() -> u64 { 256 * 1024 * 1024 } // 256 MiB
-fn default_commit_ttl() -> u64 { 120 }
-fn default_repo_ttl() -> u64 { 300 }
-fn default_ttl() -> u64 { 60 }
+fn default_port() -> u16 {
+    8080
+}
+fn default_max_entries() -> u64 {
+    10000
+}
+fn default_pr_ttl() -> u64 {
+    30
+}
+fn default_run_ttl() -> u64 {
+    15
+}
+fn default_raw_ttl() -> u64 {
+    30
+}
+fn default_raw_max_bytes() -> u64 {
+    256 * 1024 * 1024
+} // 256 MiB
+fn default_commit_ttl() -> u64 {
+    120
+}
+fn default_repo_ttl() -> u64 {
+    300
+}
+fn default_ttl() -> u64 {
+    60
+}
 
 // Raw TOML structures (before secret resolution)
 #[derive(Deserialize)]
@@ -385,6 +428,8 @@ struct RawConfig {
     cache: CacheConfig,
     #[serde(default)]
     mcp: McpConfig,
+    #[serde(default)]
+    webhooks: WebhooksConfig,
 }
 
 #[derive(Deserialize)]
@@ -399,15 +444,19 @@ impl Config {
             match fs::read_to_string(&path) {
                 Ok(content) => {
                     tracing::info!("loading config from {}", path);
-                    let raw: RawConfig = toml::from_str(&content)
-                        .expect("failed to parse config file");
+                    let raw: RawConfig =
+                        toml::from_str(&content).expect("failed to parse config file");
                     let mut config = Self::from_raw(raw).await;
                     config.apply_env_overrides();
                     return config;
                 }
                 Err(e) => {
                     // Most likely a typo'd OCTOBROKER_CONFIG — don't fail silently
-                    tracing::warn!("cannot read config at {}: {} — falling back to env-only mode", path, e);
+                    tracing::warn!(
+                        "cannot read config at {}: {} — falling back to env-only mode",
+                        path,
+                        e
+                    );
                 }
             }
         }
@@ -426,7 +475,14 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_port());
 
-        let mut config = Config { port, identities, allowed_owners, cache: CacheConfig::default(), mcp: McpConfig::default() };
+        let mut config = Config {
+            port,
+            identities,
+            allowed_owners,
+            cache: CacheConfig::default(),
+            mcp: McpConfig::default(),
+            webhooks: WebhooksConfig::default(),
+        };
         config.apply_env_overrides();
         config
     }
@@ -487,24 +543,42 @@ impl Config {
             entry.private_key = pem.replace("\\n", "\n");
             entry.owner = entry.owner.trim().to_lowercase();
         }
+        let mut webhooks = raw.webhooks;
+        if let Some(secret) = webhooks.github_secret.take() {
+            // An empty secret is not a secret at all: treat it as
+            // unconfigured rather than let a trivially forgeable HMAC key
+            // (empty or whitespace) enable the endpoint.
+            webhooks.github_secret =
+                Some(resolve_secret(&secret).await).filter(|s| !s.trim().is_empty());
+        }
         Config {
             port: raw.port,
             identities,
             allowed_owners: raw.allowed_owners,
             cache: raw.cache,
             mcp,
+            webhooks,
         }
     }
 
     fn apply_env_overrides(&mut self) {
         if let Ok(v) = std::env::var("OCTOBROKER_PORT") {
-            if let Ok(p) = v.parse() { self.port = p; }
+            if let Ok(p) = v.parse() {
+                self.port = p;
+            }
         }
         if let Ok(v) = std::env::var("OCTOBROKER_ALLOWED_OWNERS") {
-            self.allowed_owners = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            self.allowed_owners = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         if let Ok(v) = std::env::var("OCTOBROKER_MCP_ENABLED") {
             self.mcp.enabled = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(v) = std::env::var("OCTOBROKER_GITHUB_WEBHOOK_SECRET") {
+            self.webhooks.github_secret = Some(v).filter(|s| !s.trim().is_empty());
         }
     }
 
@@ -527,8 +601,7 @@ impl Config {
 ///   (anything else) — used as literal value
 async fn resolve_secret(value: &str) -> String {
     if let Some(rest) = value.strip_prefix("env:") {
-        return std::env::var(rest)
-            .unwrap_or_else(|_| panic!("env var {} not set", rest));
+        return std::env::var(rest).unwrap_or_else(|_| panic!("env var {} not set", rest));
     }
     if let Some(rest) = value.strip_prefix("aws:secretsmanager:") {
         return resolve_aws_secret(rest).await;
@@ -541,20 +614,22 @@ async fn resolve_secret(value: &str) -> String {
 
 async fn resolve_aws_secret(spec: &str) -> String {
     // spec = "secret-name:json-key"
-    let (secret_name, json_key) = spec.split_once(':')
+    let (secret_name, json_key) = spec
+        .split_once(':')
         .expect("aws secret ref must be aws:secretsmanager:<name>:<key>");
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = aws_sdk_secretsmanager::Client::new(&config);
-    let resp = client.get_secret_value()
+    let resp = client
+        .get_secret_value()
         .secret_id(secret_name)
         .send()
         .await
         .expect("failed to fetch secret from AWS Secrets Manager");
-    let secret_string = resp.secret_string()
-        .expect("secret has no string value");
-    let parsed: serde_json::Value = serde_json::from_str(secret_string)
-        .expect("secret value is not valid JSON");
-    parsed[json_key].as_str()
+    let secret_string = resp.secret_string().expect("secret has no string value");
+    let parsed: serde_json::Value =
+        serde_json::from_str(secret_string).expect("secret value is not valid JSON");
+    parsed[json_key]
+        .as_str()
         .unwrap_or_else(|| panic!("key '{}' not found in secret '{}'", json_key, secret_name))
         .to_string()
 }
@@ -563,9 +638,11 @@ fn resolve_k8s_secret(spec: &str) -> String {
     // spec = "namespace/secret-name:key"
     // Reads from /var/run/secrets/kubernetes.io/serviceaccount/.. mounted path
     // or the standard projected volume path: /etc/secrets/<secret-name>/<key>
-    let (path_part, key) = spec.split_once(':')
+    let (path_part, key) = spec
+        .split_once(':')
         .expect("k8s secret ref must be k8s:<namespace>/<secret-name>:<key>");
-    let (_, secret_name) = path_part.split_once('/')
+    let (_, secret_name) = path_part
+        .split_once('/')
         .expect("k8s secret ref must include namespace/secret-name");
     let file_path = format!("/etc/secrets/{}/{}", secret_name, key);
     fs::read_to_string(&file_path)
@@ -596,7 +673,11 @@ mod tests {
         std::env::remove_var("OCTOBROKER_CONFIG");
         std::env::set_var("XDG_CONFIG_HOME", &tmp);
 
-        assert_eq!(Config::resolve_config_path(), None, "no file anywhere → env-only");
+        assert_eq!(
+            Config::resolve_config_path(),
+            None,
+            "no file anywhere → env-only"
+        );
 
         // ./config.toml in cwd is found
         fs::write(cwd_dir.join("config.toml"), "port = 1\n").unwrap();
@@ -662,21 +743,38 @@ mod tests {
 
     #[test]
     fn test_mcp_validate_write_gate() {
-        let mut m = McpConfig { enabled: true, enable_writes: true, ..Default::default() };
+        let mut m = McpConfig {
+            enabled: true,
+            enable_writes: true,
+            ..Default::default()
+        };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
         m.agents.push(McpAgentConfig {
-            id: "a".into(), key: None, keys: vec!["k".into()], tools: vec![], repos: vec![],
+            id: "a".into(),
+            key: None,
+            keys: vec!["k".into()],
+            tools: vec![],
+            repos: vec![],
             git_credentials_read_only: None,
         });
         assert!(m.validate().unwrap_err().contains("github_app"));
         m.github_app = Some(GithubAppConfig {
-            app_id: "1".into(), private_key: "pem".into(), installation_id: Some(1), owner: None,
+            app_id: "1".into(),
+            private_key: "pem".into(),
+            installation_id: Some(1),
+            owner: None,
         });
         assert!(m.validate().unwrap_err().contains("audit"));
-        m.audit = Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 });
+        m.audit = Some(AuditConfig {
+            path: "/tmp/a.jsonl".into(),
+            max_result_bytes: 1024,
+        });
         assert!(m.validate().is_ok());
         // reads-only config never requires anything
-        let m = McpConfig { enabled: true, ..Default::default() };
+        let m = McpConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(m.validate().is_ok());
     }
 
@@ -684,9 +782,16 @@ mod tests {
     fn test_mcp_upstream_default_flips_with_writes() {
         let m = McpConfig::default();
         assert!(m.upstream().ends_with("/readonly"));
-        let m = McpConfig { enable_writes: true, ..Default::default() };
+        let m = McpConfig {
+            enable_writes: true,
+            ..Default::default()
+        };
         assert_eq!(m.upstream(), "https://api.githubcopilot.com/mcp/");
-        let m = McpConfig { upstream: Some("http://x/".into()), enable_writes: true, ..Default::default() };
+        let m = McpConfig {
+            upstream: Some("http://x/".into()),
+            enable_writes: true,
+            ..Default::default()
+        };
         assert_eq!(m.upstream(), "http://x/");
     }
 
@@ -714,8 +819,10 @@ mod tests {
         // mutually exclusive with the singular form
         let m = McpConfig {
             github_app: Some(GithubAppConfig {
-                app_id: "1".into(), private_key: "pem".into(),
-                installation_id: Some(1), owner: None,
+                app_id: "1".into(),
+                private_key: "pem".into(),
+                installation_id: Some(1),
+                owner: None,
             }),
             github_apps: vec![entry("openabdev")],
             agents: vec![multi_agent(&["openabdev/x"])],
@@ -740,7 +847,10 @@ mod tests {
         assert!(m.validate().unwrap_err().contains("empty owner"));
 
         // agents required in multi mode (routing needs an envelope)
-        let m = McpConfig { github_apps: vec![entry("openabdev")], ..Default::default() };
+        let m = McpConfig {
+            github_apps: vec![entry("openabdev")],
+            ..Default::default()
+        };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
 
         // repo-less agents are allowed (legacy PAT read path)…
@@ -760,7 +870,10 @@ mod tests {
             enable_git_credentials: false,
             github_apps: vec![entry("openabdev")],
             agents: vec![wa],
-            audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
+            audit: Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            }),
             ..Default::default()
         };
         assert!(m.validate().unwrap_err().contains("pooled PATs"));
@@ -771,7 +884,10 @@ mod tests {
             agents: vec![multi_agent(&["openabdev/x", "oablab/chi"])],
             ..Default::default()
         };
-        assert!(m.validate().unwrap_err().contains("no [[mcp.github_apps]] entry"));
+        assert!(m
+            .validate()
+            .unwrap_err()
+            .contains("no [[mcp.github_apps]] entry"));
 
         // malformed repo entry rejected
         let m = McpConfig {
@@ -782,7 +898,13 @@ mod tests {
         assert!(m.validate().unwrap_err().contains("malformed"));
 
         // sloppy entries that would widen scope or fail at runtime: rejected
-        for bad in ["openabdev/", "openabdev/repo/extra", "openabdev / repo", "openabdev/ repo", "/repo"] {
+        for bad in [
+            "openabdev/",
+            "openabdev/repo/extra",
+            "openabdev / repo",
+            "openabdev/ repo",
+            "/repo",
+        ] {
             let m = McpConfig {
                 github_apps: vec![entry("openabdev")],
                 agents: vec![multi_agent(&[bad])],
@@ -810,7 +932,10 @@ mod tests {
             enable_git_credentials: false,
             github_apps: vec![entry("openabdev"), entry("oablab")],
             agents: vec![multi_agent(&["openabdev/openab", "oablab/chi"])],
-            audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
+            audit: Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            }),
             ..Default::default()
         };
         assert!(m.validate().is_ok());
@@ -829,7 +954,10 @@ mod tests {
             }
         }
         fn audit() -> Option<AuditConfig> {
-            Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 })
+            Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            })
         }
         fn single(owner: Option<&str>) -> Option<GithubAppConfig> {
             Some(GithubAppConfig {
@@ -841,7 +969,10 @@ mod tests {
         }
 
         // agents required
-        let m = McpConfig { enable_git_credentials: true, ..Default::default() };
+        let m = McpConfig {
+            enable_git_credentials: true,
+            ..Default::default()
+        };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
 
         // App backend required — never PATs

@@ -52,6 +52,11 @@ pub struct AppTokenProvider {
     /// intentionally isolated: a repo-scoped MCP token may carry broader App
     /// permissions and must never satisfy a git credential request.
     cached: Mutex<HashMap<String, AppToken>>,
+    /// Monotonic generation bumped by every invalidation. A mint that was
+    /// in-flight when invalidation ran must not repopulate the cache with a
+    /// credential the revocation just killed — the mint's result is checked
+    /// against this generation before being cached.
+    cache_gen: std::sync::atomic::AtomicU64,
     /// Per-key singleflight locks: concurrent misses for the SAME cache key
     /// wait for one mint; distinct keys (different repos or purposes) mint
     /// in parallel so one slow mint cannot stall unrelated issuance.
@@ -108,6 +113,7 @@ impl AppTokenProvider {
                 .build()
                 .map_err(|e| format!("http client build failed: {}", e))?,
             cached: Mutex::new(HashMap::new()),
+            cache_gen: std::sync::atomic::AtomicU64::new(0),
             mint_locks: Mutex::new(HashMap::new()),
             verified_owner: Mutex::new(None),
         })
@@ -186,9 +192,18 @@ impl AppTokenProvider {
                 return Ok(t.clone());
             }
         }
+        let gen = self.cache_gen.load(std::sync::atomic::Ordering::SeqCst);
         let result = self.mint(&envelope, permissions.as_ref()).await;
         if let Ok(fresh) = &result {
-            self.cached.lock().unwrap().insert(key.clone(), fresh.clone());
+            let mut cached = self.cached.lock().unwrap();
+            if self.cache_gen.load(std::sync::atomic::Ordering::SeqCst) == gen {
+                cached.insert(key.clone(), fresh.clone());
+            } else {
+                // Invalidated while this mint was in flight: the token is
+                // still returned to the caller (its fate is decided by
+                // GitHub) but must not re-enter the killed cache.
+                tracing::info!("discarding token minted during a credential invalidation");
+            }
         }
         // Evict the singleflight entry whether the mint succeeded or failed:
         // waiters already holding this Arc still serialize behind it and
@@ -196,6 +211,67 @@ impl AppTokenProvider {
         // bounds the map to in-flight mints instead of every key ever seen.
         self.evict_mint_lock(&key, &key_lock);
         result
+    }
+
+    /// Does this provider serve the installation identified by
+    /// (id, account login)? A known installation id — explicit config or
+    /// discovered on first mint — is authoritative and matched by id only:
+    /// an id-less provider (owner-discovery mode, nothing minted yet) falls
+    /// back to the account login. Owner matching against a KNOWN id would
+    /// over-invalidate: one account can host many Apps' installations.
+    pub fn serves_installation(&self, installation_id: u64, account_login: Option<&str>) -> bool {
+        match *self.installation_id.lock().unwrap() {
+            Some(id) => id == installation_id,
+            None => self
+                .owner
+                .as_deref()
+                .zip(account_login)
+                .is_some_and(|(o, l)| o.eq_ignore_ascii_case(l)),
+        }
+    }
+
+    /// Drop every cached token (installation suspended/deleted, or the
+    /// App's authorization revoked). Returns how many entries were evicted.
+    pub fn invalidate_all(&self) -> usize {
+        self.cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.cached.lock().unwrap().drain().count()
+    }
+
+    /// Drop cached tokens whose repository scope intersects `repos`
+    /// (repository names, case-insensitive). An installation-wide token's
+    /// scope covered every repo the installation could see — including the
+    /// just-removed ones — so an empty envelope always intersects and is
+    /// evicted too. Returns how many entries were evicted.
+    pub fn invalidate_repos(&self, repos: &[String]) -> usize {
+        let removed: std::collections::HashSet<String> = repos
+            .iter()
+            .map(|r| r.trim().to_lowercase())
+            .filter(|r| !r.is_empty())
+            .collect();
+        if removed.is_empty() {
+            return 0;
+        }
+        self.cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut cached = self.cached.lock().unwrap();
+        let keys: Vec<String> = cached.keys().cloned().collect();
+        let mut evicted = 0;
+        for key in keys {
+            // Cache keys are "<purpose>:<comma-sorted repo names>" where the
+            // purpose itself may contain ':' (e.g. "git:contents=write") and
+            // an empty envelope means installation-wide. Repository names
+            // cannot contain ':' so rsplit is unambiguous.
+            let envelope = key.rsplit_once(':').map(|(_, e)| e).unwrap_or("");
+            let intersects = envelope.is_empty()
+                || envelope
+                    .split(',')
+                    .any(|r| removed.contains(&r.to_lowercase()));
+            if intersects && cached.remove(&key).is_some() {
+                evicted += 1;
+            }
+        }
+        evicted
     }
 
     /// Remove a singleflight entry only if it is still OUR generation.
@@ -240,7 +316,10 @@ impl AppTokenProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", jwt))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")));
+            .header(
+                "User-Agent",
+                concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+            );
         if !body.is_empty() {
             req = req.json(&body);
         }
@@ -268,10 +347,17 @@ impl AppTokenProvider {
         tracing::info!(
             "minted GitHub App installation token (installation={}, scope={}, expires in {}s)",
             installation_id,
-            if repositories.is_empty() { "installation-wide".to_string() } else { repositories.join(",") },
+            if repositories.is_empty() {
+                "installation-wide".to_string()
+            } else {
+                repositories.join(",")
+            },
             expires_at.saturating_sub(unix_now())
         );
-        Ok(AppToken { token: tr.token, expires_at })
+        Ok(AppToken {
+            token: tr.token,
+            expires_at,
+        })
     }
 
     /// Verify that this provider's installation belongs to `expected_owner`.
@@ -298,7 +384,10 @@ impl AppTokenProvider {
             .get(&url)
             .header("Authorization", format!("Bearer {}", jwt))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
+            .header(
+                "User-Agent",
+                concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+            )
             .send()
             .await
             .map_err(|e| format!("installation owner verification failed: {}", e))?;
@@ -342,7 +431,10 @@ impl AppTokenProvider {
                 .get(&path)
                 .header("Authorization", format!("Bearer {}", jwt))
                 .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
+                .header(
+                    "User-Agent",
+                    concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+                )
                 .send()
                 .await
                 .map_err(|e| format!("installation discovery failed: {}", e))?;
@@ -351,7 +443,11 @@ impl AppTokenProvider {
                     .json()
                     .await
                     .map_err(|e| format!("installation response parse failed: {}", e))?;
-                tracing::info!("discovered App installation {} for owner {}", inst.id, owner);
+                tracing::info!(
+                    "discovered App installation {} for owner {}",
+                    inst.id,
+                    owner
+                );
                 *self.installation_id.lock().unwrap() = Some(inst.id);
                 return Ok(inst.id);
             }
@@ -430,9 +526,18 @@ impl MultiAppTokenProvider {
     }
 
     /// All configured owners (normalized lowercase).
-    #[cfg(test)]
     pub fn owners(&self) -> impl Iterator<Item = &String> {
         self.providers.keys()
+    }
+
+    /// Owners whose provider serves the named installation — at most one in
+    /// practice (owners are unique, each bound to its own installation).
+    pub fn serving_owners(&self, installation_id: u64, account_login: Option<&str>) -> Vec<String> {
+        self.providers
+            .iter()
+            .filter(|(_, p)| p.serves_installation(installation_id, account_login))
+            .map(|(o, _)| o.clone())
+            .collect()
     }
 }
 
@@ -452,18 +557,18 @@ pub(crate) mod tests {
 
     #[test]
     fn test_new_requires_installation_or_owner() {
-        let err =
-            AppTokenProvider::new("123".into(), TEST_RSA_PEM, None, None, "http://x".into())
-                .err()
-                .unwrap();
+        let err = AppTokenProvider::new("123".into(), TEST_RSA_PEM, None, None, "http://x".into())
+            .err()
+            .unwrap();
         assert!(err.contains("installation_id or owner"));
     }
 
     #[test]
     fn test_new_rejects_bad_pem() {
-        let err = AppTokenProvider::new("123".into(), "not a pem", Some(1), None, "http://x".into())
-            .err()
-            .unwrap();
+        let err =
+            AppTokenProvider::new("123".into(), "not a pem", Some(1), None, "http://x".into())
+                .err()
+                .unwrap();
         assert!(err.contains("invalid GitHub App private key"));
     }
 
@@ -484,8 +589,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_sign_jwt_shape() {
-        let p = AppTokenProvider::new("12345".into(), TEST_RSA_PEM, Some(1), None, "http://x".into())
-            .unwrap();
+        let p = AppTokenProvider::new(
+            "12345".into(),
+            TEST_RSA_PEM,
+            Some(1),
+            None,
+            "http://x".into(),
+        )
+        .unwrap();
         let jwt = p.sign_jwt().unwrap();
         // header.payload.signature, non-trivial signature length
         let parts: Vec<&str> = jwt.split('.').collect();
@@ -504,12 +615,11 @@ pub(crate) mod tests {
             "/app/installations/42/access_tokens",
             post(|| async {
                 MINTS.fetch_add(1, Ordering::SeqCst);
-                let exp = time::OffsetDateTime::from_unix_timestamp(
-                    (super::unix_now() + 3600) as i64,
-                )
-                .unwrap()
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap();
+                let exp =
+                    time::OffsetDateTime::from_unix_timestamp((super::unix_now() + 3600) as i64)
+                        .unwrap()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap();
                 axum::Json(serde_json::json!({
                     "token": format!("ghs_mock_{}", MINTS.load(Ordering::SeqCst)),
                     "expires_at": exp,
@@ -543,7 +653,10 @@ pub(crate) mod tests {
         // Force near-expiry → refresh mints again
         p.cached.lock().unwrap().insert(
             "mcp:".to_string(),
-            AppToken { token: "ghs_mock_1".into(), expires_at: unix_now() + 10 },
+            AppToken {
+                token: "ghs_mock_1".into(),
+                expires_at: unix_now() + 10,
+            },
         );
         let t3 = p.token().await.unwrap();
         assert_eq!(t3.token, "ghs_mock_2");
@@ -557,7 +670,10 @@ pub(crate) mod tests {
         assert_eq!(s2.token, "ghs_mock_3");
         assert_eq!(MINTS.load(Ordering::SeqCst), 3);
         // different envelope mints separately
-        let s3 = p.token_scoped(&["octobroker".into(), "openab".into()]).await.unwrap();
+        let s3 = p
+            .token_scoped(&["octobroker".into(), "openab".into()])
+            .await
+            .unwrap();
         assert_eq!(s3.token, "ghs_mock_4");
         assert_eq!(MINTS.load(Ordering::SeqCst), 4);
     }
@@ -612,7 +728,10 @@ pub(crate) mod tests {
         // never be satisfied by (or satisfy) the write token above.
         let git_ro = p.token_git("openab", true).await.unwrap();
         assert_ne!(git.token, git_ro.token);
-        assert_eq!(p.token_git("openab", true).await.unwrap().token, git_ro.token);
+        assert_eq!(
+            p.token_git("openab", true).await.unwrap().token,
+            git_ro.token
+        );
 
         let seen = bodies.lock().unwrap();
         assert_eq!(
@@ -795,7 +914,10 @@ pub(crate) mod tests {
         // "badrepo*" fails to mint; "goodrepo" succeeds.
         async fn mint(Json(body): Json<serde_json::Value>) -> axum::response::Response {
             let repos = body["repositories"].as_array().cloned().unwrap_or_default();
-            if repos.iter().any(|r| r.as_str().unwrap().starts_with("badrepo")) {
+            if repos
+                .iter()
+                .any(|r| r.as_str().unwrap().starts_with("badrepo"))
+            {
                 return axum::response::Response::builder()
                     .status(422)
                     .body(axum::body::Body::from("{\"message\":\"not found\"}"))
@@ -828,26 +950,28 @@ pub(crate) mod tests {
         .unwrap();
 
         p.token_git("goodrepo", false).await.unwrap();
-        assert!(p.mint_locks.lock().unwrap().is_empty(), "evicted on success");
+        assert!(
+            p.mint_locks.lock().unwrap().is_empty(),
+            "evicted on success"
+        );
 
         // A wildcard-allowlisted agent can request arbitrary names; failed
         // mints must not leave lock entries behind (unbounded growth).
         for i in 0..5 {
-            p.token_git(&format!("badrepo{}", i), false).await.unwrap_err();
+            p.token_git(&format!("badrepo{}", i), false)
+                .await
+                .unwrap_err();
         }
-        assert!(p.mint_locks.lock().unwrap().is_empty(), "evicted on failure");
+        assert!(
+            p.mint_locks.lock().unwrap().is_empty(),
+            "evicted on failure"
+        );
     }
 
     #[test]
     fn test_evict_mint_lock_is_generation_guarded() {
-        let p = AppTokenProvider::new(
-            "123".into(),
-            TEST_RSA_PEM,
-            Some(1),
-            None,
-            "http://x".into(),
-        )
-        .unwrap();
+        let p = AppTokenProvider::new("123".into(), TEST_RSA_PEM, Some(1), None, "http://x".into())
+            .unwrap();
         let gen_a = std::sync::Arc::new(tokio::sync::Mutex::new(()));
         let gen_b = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 
