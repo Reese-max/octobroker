@@ -118,7 +118,8 @@ mod tests {
 
     #[test]
     fn test_resolve_repo() {
-        let args = serde_json::json!({"owner": "openabdev", "repo": "octobroker", "issue_number": 15});
+        let args =
+            serde_json::json!({"owner": "openabdev", "repo": "octobroker", "issue_number": 15});
         assert_eq!(
             resolve_repo(Some(&args)),
             Some(("openabdev".to_string(), "octobroker".to_string()))
@@ -128,10 +129,19 @@ mod tests {
         assert_eq!(resolve_repo(None), None);
         assert_eq!(resolve_repo(Some(&serde_json::json!({}))), None);
         assert_eq!(resolve_repo(Some(&serde_json::json!({"owner": "x"}))), None);
-        assert_eq!(resolve_repo(Some(&serde_json::json!({"owner": "", "repo": "y"}))), None);
-        assert_eq!(resolve_repo(Some(&serde_json::json!({"owner": 1, "repo": 2}))), None);
+        assert_eq!(
+            resolve_repo(Some(&serde_json::json!({"owner": "", "repo": "y"}))),
+            None
+        );
+        assert_eq!(
+            resolve_repo(Some(&serde_json::json!({"owner": 1, "repo": 2}))),
+            None
+        );
         // query-only tools have no repo target
-        assert_eq!(resolve_repo(Some(&serde_json::json!({"query": "foo"}))), None);
+        assert_eq!(
+            resolve_repo(Some(&serde_json::json!({"query": "foo"}))),
+            None
+        );
     }
 
     #[test]
