@@ -805,6 +805,130 @@ async fn test_multi_mode_repos_removed_scoped_to_named_installation() {
     assert!(state.mcp_sessions.get("sess-openabdev").await.is_some());
 }
 
+/// Git-purpose cache keys embed a purpose that itself contains a colon
+/// ("git:contents=write:openab"), so the envelope is only recoverable with a
+/// RIGHTMOST split. A leftmost split would silently keep serving
+/// write-capable git tokens for a deselected repository.
+#[tokio::test]
+async fn test_repos_removed_evicts_git_purpose_token() {
+    let (api, mint) = spawn_mint_api().await;
+    let state = single_state(Some(SECRET), &api);
+    let provider = state.app_tokens.as_ref().unwrap();
+
+    let write = provider.token_git("openab", false).await.unwrap();
+    let read_only = provider.token_git("chi", true).await.unwrap();
+    assert_eq!(mints(&mint), 2);
+
+    let payload = json!({
+        "action": "removed",
+        "installation": {"id": 42, "account": {"login": "openabdev"}},
+        "repositories_removed": [{"name": "openab", "full_name": "openabdev/openab"}]
+    });
+    let resp = base_router()
+        .with_state(state.clone())
+        .oneshot(signed_req("installation_repositories", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The intersecting git credential is dropped ...
+    let write2 = provider.token_git("openab", false).await.unwrap();
+    assert_ne!(write.token, write2.token);
+    // ... while another repository's git token still hits the cache.
+    let read_only2 = provider.token_git("chi", true).await.unwrap();
+    assert_eq!(read_only.token, read_only2.token);
+    assert_eq!(mints(&mint), 3, "exactly one re-mint");
+}
+
+/// Intersection is case-insensitive: an operator-configured envelope
+/// ("OpenAB") must still match GitHub's canonical repository name
+/// ("openab") in the delivery.
+#[tokio::test]
+async fn test_repos_removed_matches_envelope_case_insensitively() {
+    let (api, mint) = spawn_mint_api().await;
+    let state = single_state(Some(SECRET), &api);
+    let provider = state.app_tokens.as_ref().unwrap();
+
+    let mixed_case = provider.token_scoped(&["OpenAB".into()]).await.unwrap();
+    assert_eq!(mints(&mint), 1);
+
+    let payload = json!({
+        "action": "removed",
+        "installation": {"id": 42, "account": {"login": "openabdev"}},
+        "repositories_removed": [{"name": "openab", "full_name": "openabdev/openab"}]
+    });
+    let resp = base_router()
+        .with_state(state.clone())
+        .oneshot(signed_req("installation_repositories", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let after = provider.token_scoped(&["OpenAB".into()]).await.unwrap();
+    assert_ne!(mixed_case.token, after.token);
+    assert_eq!(mints(&mint), 2);
+}
+
+/// A mint that was in-flight when a repository deselect landed must not
+/// repopulate the killed entry either — the generation guard covers
+/// `installation_repositories`, not just full-installation invalidation.
+#[tokio::test]
+async fn test_mint_in_flight_after_repo_deselect_does_not_repopulate() {
+    use axum::{extract::State as AxumState, routing::post, Json, Router};
+
+    async fn slow_mint(AxumState(n): AxumState<MintCount>) -> Json<Value> {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let n = n.fetch_add(1, Ordering::SeqCst) + 1;
+        Json(json!({"token": format!("ghs_slow_{}", n), "expires_at": rfc3339_in(3600)}))
+    }
+    let count: MintCount = Arc::new(AtomicU64::new(0));
+    let api_app = Router::new()
+        .route("/app/installations/{id}/access_tokens", post(slow_mint))
+        .with_state(count.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, api_app).await.unwrap() });
+    let api = format!("http://{}", addr);
+
+    let state = single_state(Some(SECRET), &api);
+    let inflight = {
+        let s = state.clone();
+        tokio::spawn(async move {
+            s.app_tokens
+                .as_ref()
+                .unwrap()
+                .token_scoped(&["openab".into()])
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let payload = json!({
+        "action": "removed",
+        "installation": {"id": 42, "account": {"login": "openabdev"}},
+        "repositories_removed": [{"name": "openab", "full_name": "openabdev/openab"}]
+    });
+    let resp = base_router()
+        .with_state(state.clone())
+        .oneshot(signed_req("installation_repositories", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The in-flight caller still gets its token, but the killed entry must
+    // not be re-cached behind the deselect.
+    let t = inflight.await.unwrap().unwrap();
+    let t2 = state
+        .app_tokens
+        .as_ref()
+        .unwrap()
+        .token_scoped(&["openab".into()])
+        .await
+        .unwrap();
+    assert_ne!(t.token, t2.token);
+    assert_eq!(mints(&count), 2, "killed cache entry must re-mint");
+}
+
 /// `github_app_authorization.revoked` with no App backend configured (PAT-only
 /// deployment) is a no-op that must NOT touch PAT-pinned sessions.
 #[tokio::test]
