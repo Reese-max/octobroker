@@ -735,7 +735,17 @@ async fn test_multi_mode_repos_removed_scoped_to_named_installation() {
         .token_scoped(&["chi".into()])
         .await
         .unwrap();
-    assert_eq!(mints(&mint), 3);
+    // The sibling installation ALSO holds a cached token scoped to the
+    // repository being removed. Without this entry the test cannot tell
+    // installation scoping from repository-name matching: the sibling's
+    // only envelope would not intersect and would survive either way.
+    let sibling_openab = multi
+        .get("oablab")
+        .unwrap()
+        .token_scoped(&["openab".into()])
+        .await
+        .unwrap();
+    assert_eq!(mints(&mint), 4);
     state
         .mcp_sessions
         .insert("sess-openabdev".into(), pin_multi(&["openabdev"]))
@@ -769,17 +779,29 @@ async fn test_multi_mode_repos_removed_scoped_to_named_installation() {
         .await
         .unwrap();
     assert_eq!(openab_kept.token, kept.token);
-    // ... and the other installation is untouched even though it serves a
-    // repository with the same name (oablab/chi) — scoping is by
-    // installation, not by repository name.
+    // ... and the OTHER installation keeps BOTH envelopes, including the
+    // one scoped to the very repository that was deselected — a
+    // deselect of openabdev/openab says nothing about oablab/openab, so
+    // scoping is by installation, not by repository name.
     let chi2 = multi
         .get("oablab")
         .unwrap()
         .token_scoped(&["chi".into()])
         .await
         .unwrap();
+    let sibling_openab2 = multi
+        .get("oablab")
+        .unwrap()
+        .token_scoped(&["openab".into()])
+        .await
+        .unwrap();
     assert_eq!(chi.token, chi2.token);
-    assert_eq!(mints(&mint), 4, "exactly one re-mint");
+    assert_eq!(
+        sibling_openab.token, sibling_openab2.token,
+        "a sibling installation's cached token must survive a deselect \
+         aimed at another installation"
+    );
+    assert_eq!(mints(&mint), 5, "exactly one re-mint");
     assert!(state.mcp_sessions.get("sess-openabdev").await.is_some());
 }
 
