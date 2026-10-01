@@ -139,14 +139,32 @@ fn signature_valid(secret: &str, headers: &HeaderMap, body: &[u8]) -> bool {
     else {
         return false;
     };
-    if sig.len() != 64 || !sig.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // Decode over BYTES, never over `str` slices: every step below is
+    // total (no indexing panic, no unwrap) so a malformed header can only
+    // ever return false — a panic here would kill a tokio worker thread.
+    let raw = sig.as_bytes();
+    if raw.len() != 64 {
         return false;
     }
-    let expected: Vec<u8> = (0..32)
-        .map(|i| u8::from_str_radix(&sig[i * 2..i * 2 + 2], 16).unwrap())
-        .collect();
+    let mut expected = [0u8; 32];
+    for (i, slot) in expected.iter_mut().enumerate() {
+        match (hex_digit(raw[i * 2]), hex_digit(raw[i * 2 + 1])) {
+            (Some(hi), Some(lo)) => *slot = (hi << 4) | lo,
+            _ => return false,
+        }
+    }
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
     ring::hmac::verify(&key, body, &expected).is_ok()
+}
+
+/// One hex digit (either case) → its value. None for anything else.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn respond(body: Value) -> Response {
@@ -358,6 +376,52 @@ mod tests {
         }
         // Missing header entirely.
         assert!(!signature_valid("secret", &HeaderMap::new(), body));
+    }
+
+    #[test]
+    fn test_hex_digit_total_and_case_insensitive() {
+        // Every decode step is total: no indexing panic, no unwrap, and any
+        // non-hex byte simply rejects the signature.
+        assert_eq!(hex_digit(b'0'), Some(0));
+        assert_eq!(hex_digit(b'9'), Some(9));
+        assert_eq!(hex_digit(b'a'), Some(10));
+        assert_eq!(hex_digit(b'f'), Some(15));
+        assert_eq!(hex_digit(b'A'), Some(10));
+        assert_eq!(hex_digit(b'F'), Some(15));
+        for bad in [b'g', b'G', b'-', b' ', 0x80, b'/'] {
+            assert_eq!(hex_digit(bad), None, "byte {:?}", bad);
+        }
+
+        // Uppercase hex is the same MAC — GitHub sends lowercase, but a
+        // hand-rolled relay must not be rejected for letter case.
+        let body = b"hello";
+        let lower = sign_body(b"secret", body);
+        let upper = format!(
+            "sha256={}",
+            lower.trim_start_matches("sha256=").to_uppercase()
+        );
+        assert!(signature_valid("secret", &headers_with_sig(&upper), body));
+
+        // Padded / wrong-length hex never reaches the decoder.
+        for bad in [
+            format!("{} ", lower),
+            format!(" {}", lower),
+            format!("{}=x", lower),
+            format!("sha256={}", &lower["sha256=".len()..][..63]),
+        ] {
+            assert!(
+                !signature_valid("secret", &headers_with_sig(&bad), body),
+                "must reject {:?}",
+                bad
+            );
+        }
+    }
+
+    fn sign_body(secret: &[u8], body: &[u8]) -> String {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+        let tag = ring::hmac::sign(&key, body);
+        let hex: String = tag.as_ref().iter().map(|b| format!("{:02x}", b)).collect();
+        format!("sha256={}", hex)
     }
 
     #[test]

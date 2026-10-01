@@ -708,6 +708,178 @@ async fn test_get_webhook_is_405() {
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
+/// Multi mode + repo deselection: only the named installation's intersecting
+/// tokens are evicted, and its sibling installation keeps both its cache and
+/// its pinned session. (The multi-app branch of the intersection sweep.)
+#[tokio::test]
+async fn test_multi_mode_repos_removed_scoped_to_named_installation() {
+    let (api, mint) = spawn_mint_api().await;
+    let state = multi_state(Some(SECRET), &api);
+    let multi = state.multi_app_tokens.as_ref().unwrap();
+
+    let openab = multi
+        .get("openabdev")
+        .unwrap()
+        .token_scoped(&["openab".into()])
+        .await
+        .unwrap();
+    let openab_kept = multi
+        .get("openabdev")
+        .unwrap()
+        .token_scoped(&["chi".into()])
+        .await
+        .unwrap();
+    let chi = multi
+        .get("oablab")
+        .unwrap()
+        .token_scoped(&["chi".into()])
+        .await
+        .unwrap();
+    assert_eq!(mints(&mint), 3);
+    state
+        .mcp_sessions
+        .insert("sess-openabdev".into(), pin_multi(&["openabdev"]))
+        .await;
+
+    let payload = json!({
+        "action": "removed",
+        "installation": {"id": 41, "account": {"login": "openabdev"}},
+        "repositories_removed": [{"name": "openab", "full_name": "openabdev/openab"}]
+    });
+    let resp = base_router()
+        .with_state(state.clone())
+        .oneshot(signed_req("installation_repositories", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Intersecting envelope of the NAMED installation re-mints ...
+    let openab2 = multi
+        .get("openabdev")
+        .unwrap()
+        .token_scoped(&["openab".into()])
+        .await
+        .unwrap();
+    assert_ne!(openab.token, openab2.token);
+    // ... its non-intersecting envelope still hits cache ...
+    let kept = multi
+        .get("openabdev")
+        .unwrap()
+        .token_scoped(&["chi".into()])
+        .await
+        .unwrap();
+    assert_eq!(openab_kept.token, kept.token);
+    // ... and the other installation is untouched even though it serves a
+    // repository with the same name (oablab/chi) — scoping is by
+    // installation, not by repository name.
+    let chi2 = multi
+        .get("oablab")
+        .unwrap()
+        .token_scoped(&["chi".into()])
+        .await
+        .unwrap();
+    assert_eq!(chi.token, chi2.token);
+    assert_eq!(mints(&mint), 4, "exactly one re-mint");
+    assert!(state.mcp_sessions.get("sess-openabdev").await.is_some());
+}
+
+/// `github_app_authorization.revoked` with no App backend configured (PAT-only
+/// deployment) is a no-op that must NOT touch PAT-pinned sessions.
+#[tokio::test]
+async fn test_authorization_revoked_without_app_backend_is_a_noop() {
+    let (api, mint) = spawn_mint_api().await;
+    let state = state(base_config(Some(SECRET)), None, None);
+    assert_eq!(mints(&mint), 0);
+    state
+        .mcp_sessions
+        .insert("sess-pat".into(), pin_pat("alice"))
+        .await;
+
+    let payload = json!({"action": "revoked", "sender": {"login": "someone"}});
+    let resp = base_router()
+        .with_state(state.clone())
+        .oneshot(signed_req("github_app_authorization", &payload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["evicted_tokens"], 0);
+    assert_eq!(body["killed_sessions"], 0);
+    assert!(state.mcp_sessions.get("sess-pat").await.is_some());
+    let _ = api;
+}
+
+/// The signature is compared as hex, so letter case is irrelevant, but a
+/// padded header is not a valid signature and must fail closed.
+#[tokio::test]
+async fn test_signature_case_and_padding() {
+    let (api, _) = spawn_mint_api().await;
+    let state = single_state(Some(SECRET), &api);
+    let payload = json!({
+        "action": "suspend",
+        "installation": {"id": 42, "account": {"login": "openabdev"}}
+    });
+    let body = payload.to_string();
+    let lower = sign(SECRET, body.as_bytes());
+    let upper = format!(
+        "sha256={}",
+        lower.trim_start_matches("sha256=").to_uppercase()
+    );
+
+    for (label, sig) in [("uppercase", upper.as_str()), ("lowercase", lower.as_str())] {
+        let resp = base_router()
+            .with_state(state.clone())
+            .oneshot(webhook_req("installation", &payload, Some(sig)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", label);
+    }
+
+    // Whitespace padding must not be trimmed into a valid signature.
+    for bad in [format!("{} ", lower), format!(" {}", lower)] {
+        let resp = base_router()
+            .with_state(state.clone())
+            .oneshot(webhook_req("installation", &payload, Some(&bad)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "padded signature {:?}",
+            bad
+        );
+    }
+}
+
+/// A body beyond the route's hard cap is refused 413 before verification —
+/// an unauthenticated caller cannot force unbounded buffering.
+#[tokio::test]
+async fn test_oversized_body_is_413() {
+    let (api, mint) = spawn_mint_api().await;
+    let state = single_state(Some(SECRET), &api);
+    let payload = vec![b'a'; octobroker::webhook::MAX_BODY_BYTES + 1];
+    let resp = base_router()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhooks/github")
+                .header("x-github-event", "installation")
+                .header("x-hub-signature-256", sign(SECRET, &payload))
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(mints(&mint), 0);
+}
+
 /// No webhook secret configured = listener disabled: the route still wins
 /// over the catch-all but answers fail-closed 404, even for a correctly
 /// signed payload. An EMPTY secret is not a secret at all — it must not
