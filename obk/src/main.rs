@@ -1,3 +1,5 @@
+mod mcp_shim;
+
 use std::env;
 use std::process::{Command, exit};
 
@@ -5,6 +7,13 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let octobroker_url = env::var("OCTOBROKER_URL")
         .unwrap_or_else(|_| "http://octobroker.openab.local:8080".to_string());
+
+    // MCP stdio shim (Phase 3): `obk mcp` pipes JSON-RPC frames to
+    // octobroker /mcp over HTTPS. Auth: OCTOBROKER_KEY, or SigV4 IAM
+    // exchange (ambient ECS/IRSA creds + OCTOBROKER_IAM_SERVER_ID).
+    if args.first().map(|s| s.as_str()) == Some("mcp") {
+        exit(mcp_shim::run(&octobroker_url));
+    }
 
     // Handle version
     if args.first().map(|s| s.as_str()) == Some("version") || args.first().map(|s| s.as_str()) == Some("--version") {

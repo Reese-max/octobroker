@@ -1,7 +1,11 @@
 use moka::future::Cache as MokaCache;
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::HashMap, sync::atomic::{AtomicU64, Ordering}, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use crate::config::CacheConfig;
 
@@ -114,16 +118,17 @@ impl Cache {
     /// same key share a single in-flight future via moka's `entry` API,
     /// so N simultaneous cache misses only trigger one upstream request.
     /// Uses `is_fresh()` to correctly distinguish hits from misses.
-    pub async fn get_or_insert_raw<F, E>(
-        &self,
-        key: &str,
-        init: F,
-    ) -> Result<String, E>
+    pub async fn get_or_insert_raw<F, E>(&self, key: &str, init: F) -> Result<String, E>
     where
         F: std::future::Future<Output = Result<String, E>>,
         E: Clone + std::fmt::Debug + Send + Sync + 'static,
     {
-        match self.raw_store.entry_by_ref(key).or_try_insert_with(init).await {
+        match self
+            .raw_store
+            .entry_by_ref(key)
+            .or_try_insert_with(init)
+            .await
+        {
             Ok(entry) => {
                 if entry.is_fresh() {
                     self.misses.fetch_add(1, Ordering::Relaxed);
@@ -148,10 +153,21 @@ pub struct CacheStats {
 }
 
 pub fn build_key(path: &str, query: &HashMap<String, String>) -> String {
-    let mut parts: Vec<(&str, &str)> = query.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut parts: Vec<(&str, &str)> = query
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     parts.sort();
-    let qs: String = parts.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
-    if qs.is_empty() { path.to_string() } else { format!("{}?{}", path, qs) }
+    let qs: String = parts
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("&");
+    if qs.is_empty() {
+        path.to_string()
+    } else {
+        format!("{}?{}", path, qs)
+    }
 }
 
 /// Build a cache key for raw (non-JSON) responses.
@@ -166,15 +182,30 @@ pub fn build_key(path: &str, query: &HashMap<String, String>) -> String {
 ///   when the pool holds PATs with different repo access — a response fetched
 ///   with a broadly-scoped PAT must never be served to a caller whose own PAT
 ///   would have been denied access.
-pub fn build_raw_key(path: &str, query: &HashMap<String, String>, accept: &str, identity_scope: &str) -> String {
-    let mut parts: Vec<(&str, &str)> = query.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+pub fn build_raw_key(
+    path: &str,
+    query: &HashMap<String, String>,
+    accept: &str,
+    identity_scope: &str,
+) -> String {
+    let mut parts: Vec<(&str, &str)> = query
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     parts.sort();
-    let qs: String = parts.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+    let qs: String = parts
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("&");
     let normalized_accept = accept.trim().to_ascii_lowercase();
     if qs.is_empty() {
         format!("raw:{}:{}:{}", path, normalized_accept, identity_scope)
     } else {
-        format!("raw:{}?{}:{}:{}", path, qs, normalized_accept, identity_scope)
+        format!(
+            "raw:{}?{}:{}:{}",
+            path, qs, normalized_accept, identity_scope
+        )
     }
 }
 
@@ -187,13 +218,33 @@ pub fn build_graphql_key(body: &[u8]) -> String {
 
 pub fn classify_route(path: &str) -> RouteKind {
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() < 4 { return RouteKind::Other; }
+    if parts.len() < 4 {
+        return RouteKind::Other;
+    }
     match parts.get(3).copied() {
-        Some("pulls") => if parts.len() == 5 { RouteKind::PrView } else { RouteKind::PrList },
-        Some("issues") => if parts.len() == 5 { RouteKind::IssueView } else { RouteKind::IssueList },
+        Some("pulls") => {
+            if parts.len() == 5 {
+                RouteKind::PrView
+            } else {
+                RouteKind::PrList
+            }
+        }
+        Some("issues") => {
+            if parts.len() == 5 {
+                RouteKind::IssueView
+            } else {
+                RouteKind::IssueList
+            }
+        }
         Some("commits") => RouteKind::CommitList,
         Some("actions") => match parts.get(4).copied() {
-            Some("runs") => if parts.len() == 6 { RouteKind::RunView } else { RouteKind::RunList },
+            Some("runs") => {
+                if parts.len() == 6 {
+                    RouteKind::RunView
+                } else {
+                    RouteKind::RunList
+                }
+            }
             _ => RouteKind::Other,
         },
         _ if parts.len() == 4 => RouteKind::RepoView,
@@ -211,14 +262,32 @@ mod tests {
 
     #[test]
     fn test_build_raw_key_no_query() {
-        let key = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
-        assert_eq!(key, "raw:/repos/o/r/pulls/1:application/vnd.github.v3.diff:id1");
+        let key = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &empty_query(),
+            "application/vnd.github.v3.diff",
+            "id1",
+        );
+        assert_eq!(
+            key,
+            "raw:/repos/o/r/pulls/1:application/vnd.github.v3.diff:id1"
+        );
     }
 
     #[test]
     fn test_build_raw_key_normalizes_accept_case() {
-        let a = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "Application/Vnd.Github.V3.Diff", "id1");
-        let b = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
+        let a = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &empty_query(),
+            "Application/Vnd.Github.V3.Diff",
+            "id1",
+        );
+        let b = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &empty_query(),
+            "application/vnd.github.v3.diff",
+            "id1",
+        );
         assert_eq!(a, b);
     }
 
@@ -226,8 +295,16 @@ mod tests {
     fn test_build_raw_key_includes_query_params() {
         let mut q = HashMap::new();
         q.insert("page".to_string(), "2".to_string());
-        let key = build_raw_key("/repos/o/r/pulls/1", &q, "application/vnd.github.v3.diff", "id1");
-        assert_eq!(key, "raw:/repos/o/r/pulls/1?page=2:application/vnd.github.v3.diff:id1");
+        let key = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &q,
+            "application/vnd.github.v3.diff",
+            "id1",
+        );
+        assert_eq!(
+            key,
+            "raw:/repos/o/r/pulls/1?page=2:application/vnd.github.v3.diff:id1"
+        );
     }
 
     #[test]
@@ -236,22 +313,55 @@ mod tests {
         q1.insert("page".to_string(), "1".to_string());
         let mut q2 = HashMap::new();
         q2.insert("page".to_string(), "2".to_string());
-        let k1 = build_raw_key("/repos/o/r/pulls/1", &q1, "application/vnd.github.v3.diff", "id1");
-        let k2 = build_raw_key("/repos/o/r/pulls/1", &q2, "application/vnd.github.v3.diff", "id1");
+        let k1 = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &q1,
+            "application/vnd.github.v3.diff",
+            "id1",
+        );
+        let k2 = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &q2,
+            "application/vnd.github.v3.diff",
+            "id1",
+        );
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn test_build_raw_key_differs_by_identity_scope() {
-        let k1 = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
-        let k2 = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id2");
-        assert_ne!(k1, k2, "responses from different identity scopes must not share a cache entry");
+        let k1 = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &empty_query(),
+            "application/vnd.github.v3.diff",
+            "id1",
+        );
+        let k2 = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &empty_query(),
+            "application/vnd.github.v3.diff",
+            "id2",
+        );
+        assert_ne!(
+            k1, k2,
+            "responses from different identity scopes must not share a cache entry"
+        );
     }
 
     #[test]
     fn test_build_raw_key_differs_by_accept() {
-        let k1 = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
-        let k2 = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/json", "id1");
+        let k1 = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &empty_query(),
+            "application/vnd.github.v3.diff",
+            "id1",
+        );
+        let k2 = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &empty_query(),
+            "application/json",
+            "id1",
+        );
         assert_ne!(k1, k2);
     }
 
@@ -259,7 +369,12 @@ mod tests {
     async fn test_cache_raw_get_insert_roundtrip() {
         let cfg = CacheConfig::default();
         let cache = Cache::new(&cfg);
-        let key = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
+        let key = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &empty_query(),
+            "application/vnd.github.v3.diff",
+            "id1",
+        );
         let call_count = std::sync::Arc::new(AtomicU64::new(0));
         let cc1 = call_count.clone();
         let v1 = cache
@@ -295,7 +410,12 @@ mod tests {
         let cfg = CacheConfig::default();
         let cache = std::sync::Arc::new(Cache::new(&cfg));
         let call_count = std::sync::Arc::new(AtomicU64::new(0));
-        let key = build_raw_key("/repos/o/r/pulls/1", &empty_query(), "application/vnd.github.v3.diff", "id1");
+        let key = build_raw_key(
+            "/repos/o/r/pulls/1",
+            &empty_query(),
+            "application/vnd.github.v3.diff",
+            "id1",
+        );
 
         let mut handles = Vec::new();
         for _ in 0..10 {
@@ -319,7 +439,13 @@ mod tests {
         // The one that evaluated is_fresh()=true counts as a miss.
         // The rest see is_fresh()=false and count as hits.
         let stats = cache.stats();
-        assert_eq!(stats.misses, 1, "only one call should be a miss (the one that ran init)");
-        assert_eq!(stats.hits, 9, "the rest should be hits (served from cache after init completed)");
+        assert_eq!(
+            stats.misses, 1,
+            "only one call should be a miss (the one that ran init)"
+        );
+        assert_eq!(
+            stats.hits, 9,
+            "the rest should be hits (served from cache after init completed)"
+        );
     }
 }

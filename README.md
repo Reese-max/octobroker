@@ -345,6 +345,77 @@ Client config gains one line:
 
 Deliver `OCTOBROKER_KEY` to the agent container via ECS task secrets / K8s Secrets — most MCP clients expand `${ENV}` in config.
 
+#### Secretless agent auth — SigV4/IAM (Phase 3)
+
+Agents running on AWS with an IAM role (ECS task role, EKS IRSA, instance profile) can authenticate **with no static secret at all** — the Vault AWS-auth pattern. The agent's ambient credential signs a fixed `sts:GetCallerIdentity` request; octobroker replays it to an allowlisted STS endpoint over TLS, reads the caller ARN, and exchanges the proof for a short-lived `X-Octobroker-Iam-Token`.
+
+```toml
+[mcp]
+enabled = true
+
+[mcp.iam]
+enabled = true
+server_id = "prod-octobroker-01"                 # signed by clients; binds proofs to THIS deployment
+# token_ttl_secs = 900                           # exchanged token lifetime [1,3600]
+# max_proof_age_secs = 60                        # X-Amz-Date freshness — never above 60 (RFC bound)
+# sts_endpoints = ["https://sts.amazonaws.com"]  # replay allowlist (add regional endpoints as needed)
+
+[[mcp.agents]]
+id = "ci-agent"
+iam_arns = ["arn:aws:sts::123456789012:assumed-role/ci-agent-role/*"]  # trailing * = prefix
+tools = ["issue_read", "list_issues"]
+```
+
+How the exchange is constrained (all enforced **before** any STS call):
+
+- Signed `POST` only — presigned-URL (`X-Amz-Signature`) forms are rejected; the URL must equal an `sts_endpoints` entry (`scheme://authority`, path `/`, no query).
+- `SignedHeaders` must cover `host`, `x-amz-date`, and `x-octobroker-server-id`, and may not name anything outside the forwardable allowlist — the freshness stamp and deployment binding are covered by the signature.
+- `x-octobroker-server-id` must equal `server_id`, so a proof minted for a different service/environment cannot be replayed here.
+- The request body must be exactly `Action=GetCallerIdentity&Version=2011-06-15`; the credential scope must be `…/<region>/sts/aws4_request` with the region matching the endpoint host.
+- The reply's `Arn` must match an agent's `iam_arns` (exact or trailing-`*` prefix — temporary credentials return `assumed-role/<role>/<session>` ARNs). Unmapped ARNs get 403.
+
+`X-Octobroker-Iam-Token` then works everywhere `X-Octobroker-Key` does (`/mcp`, `/git-credential`). An agent configured with only `iam_arns` has **no usable static key**.
+
+The **`obk mcp` stdio shim** wraps this for MCP clients that only speak stdio:
+
+```json
+{ "mcpServers": { "github": { "command": "obk", "args": ["mcp"],
+  "env": { "OCTOBROKER_URL": "https://octobroker.internal:8443",
+           "OCTOBROKER_IAM_SERVER_ID": "prod-octobroker-01" } } } }
+```
+
+`obk mcp` reads line-delimited JSON-RPC on stdin, posts each frame to `/mcp` with the exchanged token (auto-refreshed ~60s before expiry; ambient credentials re-resolved so task-role rotation is picked up), and unframes SSE `data:` payloads back onto stdout. `OCTOBROKER_KEY` set → static-key mode instead. `OCTOBROKER_STS_URL` overrides the STS endpoint (default `https://sts.<region>.amazonaws.com` from the ambient AWS region).
+
+#### Quotas, circuit breaking & observability (Phase 3)
+
+```toml
+[mcp]
+agent_requests_per_minute = 240      # global per-agent token bucket; 0 = unlimited
+upstream_breaker_failures = 5        # consecutive upstream failures to open the breaker (0 = off)
+upstream_breaker_cooldown_secs = 30  # fail-fast window; then one half-open probe
+post_timeout_secs = 120              # POST upstream bound; GET streams are never total-bounded
+
+[[mcp.agents]]
+id = "chatty-bot"
+key = "env:OBK_CHATTY"
+requests_per_minute = 30             # per-agent override of the global quota
+```
+
+- **Quota**: a token bucket per agent over *all* `/mcp` methods (unauthenticated network-trust traffic shares one `anonymous` bucket). Exhausted → `429` + `Retry-After` (seconds until a token refills).
+- **Circuit breaker**: transport errors, upstream `429`, and `5xx` count; `4xx` do not (caller problem, not upstream health). Open → `503` + `Retry-After` with no upstream I/O — a wedged upstream no longer pins a handler task per call for the full POST timeout. The same guard covers the multi-app fan-out path.
+- **`Retry-After` propagation**: an upstream `Retry-After` header rides downstream on 429/503 responses, so well-behaved clients honor the real backoff signal.
+- **`GET /metrics`**: Prometheus exposition — `octobroker_mcp_requests_total{agent,kind}`, `octobroker_mcp_denied_total{agent,reason}` (`policy|auth|quota|session|breaker|audit|inflight`), `octobroker_mcp_upstream_requests_total` / `…_failures_total` / `…_stream_errors_total` (mid-body aborts), `octobroker_mcp_upstream_latency_ms` histogram, `octobroker_mcp_circuit_open`, `octobroker_mcp_sessions_pinned`, `octobroker_mcp_iam_auth_total{result}`. The same counters appear under `"mcp"` in `GET /stats`. These endpoints are unauthenticated like `/stats` — restrict them at the network layer (they reveal agent IDs and auth-failure rates).
+
+Suggested alerts: `rate(octobroker_mcp_denied_total{reason="auth"}[5m])` spike (credential stuffing / misconfigured agents), `octobroker_mcp_circuit_open == 1` (upstream wedged), `histogram_quantile(0.95, rate(octobroker_mcp_upstream_latency_ms_bucket[5m]))` regression, nonzero `…_stream_errors_total` (network path or upstream instability).
+
+#### Scaling octobroker (Phase 3 — documented model)
+
+MCP session pins, IAM tokens, quota buckets, and the circuit breaker are **in-process state** — a deliberate Phase-3 choice: a shared pin store would export live credentials to another trust boundary. The supported multi-replica model is **load-balancer session affinity** (sticky by client or consistent-hash on `mcp-session-id` where the LB supports header hashing).
+
+Failure mode, documented and test-pinned: replica loss drops that replica's pins → clients get `404` on the next request → they re-`initialize` and re-pin on the surviving replica. Upstream session `DELETE` is a GitHub no-op anyway — octobroker's pin cache is already the session authority. Note that multi-installation agents hold **one upstream session per routed owner**, so replica loss invalidates N upstream sessions per agent, not 1. If your LB cannot do affinity, run MCP on a dedicated single replica and keep REST/GraphQL stateless.
+
+**Cache-authorization invariant** (`docs/DESIGN.md`): no MCP response cache exists. Any future one must key entries by the full policy envelope (agent id + tool allowlist + repo scope) — a response fetched under a privileged agent must never serve a less-privileged one.
+
 #### Write access (Phase 2b)
 
 ```toml

@@ -76,6 +76,39 @@ enabled = false
 # toolsets = ["issues", "pull_requests", "repos"]
 # Idle TTL for MCP session → identity pinning.
 # session_ttl_secs = 3600
+# POST upstream timeout. GET streams (MCP resumption channel) are never
+# total-bounded.
+# post_timeout_secs = 120
+# GitHub API base used by the App backends — override for GHES
+# (https://<ghes>/api/v3).
+# github_api_base = "https://api.github.com"
+
+# Per-agent request quota (Phase 3). Token bucket applied to EVERY /mcp
+# request (unauthenticated network-trust traffic shares one `anonymous`
+# bucket). Exhausted → 429 + Retry-After.
+# agent_requests_per_minute = 0   # 0 = unlimited; per-agent override below
+
+# Upstream circuit breaker (Phase 3): after N consecutive upstream failures
+# (transport error, 429, or 5xx — never 4xx) calls fail fast with
+# 503 + Retry-After until the cooldown elapses, then one half-open probe.
+# upstream_breaker_failures = 5    # 0 = disabled
+# upstream_breaker_cooldown_secs = 30
+
+# Secretless IAM authentication (Phase 3) — Vault AWS-auth pattern.
+# Agents on AWS (ECS task role / EKS IRSA) sign a fixed
+# sts:GetCallerIdentity POST; octobroker replays it to an allowlisted STS
+# endpoint and exchanges it for a short-lived X-Octobroker-Iam-Token.
+# No GitHub credential AND no octobroker key ever lives on the agent.
+# [mcp.iam]
+# enabled = true
+# server_id = "prod-octobroker-01"   # REQUIRED — signed by clients; binds a
+#                                   # proof to this deployment (replay-safe)
+# token_ttl_secs = 900              # issued token lifetime [1,3600]
+# max_proof_age_secs = 60           # proof freshness — capped at 60 by the RFC
+# sts_endpoints = [                 # replay allowlist — add regional hosts as used
+#   "https://sts.amazonaws.com",
+#   "https://sts.eu-west-1.amazonaws.com",
+# ]
 
 # Durable audit trail for write-classified MCP calls (Phase 2b).
 # REQUIRED before writes can be enabled. Two JSONL records per write call
@@ -143,6 +176,14 @@ enabled = false
 # # arguments; calls with no repo target (e.g. search_code, get_me) are
 # # DENIED. Empty/omitted = no repository restriction.
 # repos = ["openabdev/octobroker", "oablab/*"]
+# # AWS principals that may authenticate as this agent via the SigV4 exchange
+# # ([mcp.iam], POST /mcp/iam-auth). Matched against the STS-reported ARN —
+# # exact, or prefix when the entry ends in `*`. Temporary credentials return
+# # assumed-role ARNs, so role entries normally use the `…/assumed-role/<r>/*`
+# # form. An agent with ONLY iam_arns (no key/keys) has no usable static key.
+# iam_arns = ["arn:aws:sts::123456789012:assumed-role/agent-role/*"]
+# # Per-agent request quota override (requests/minute; 0 = inherit global).
+# requests_per_minute = 0
 # # Per-agent git credential mode: true = clone-only (contents:read),
 # # false = push-capable (contents:write). Overrides the global
 # # [mcp] git_credentials_read_only in either direction; omit to inherit.

@@ -252,5 +252,13 @@ error codes.
 | `404 session not found or expired` | Pin evicted (TTL/restart) or credential expired | Normal: MCP clients re-initialize transparently |
 | `429 agent write concurrency limit reached` | In-flight cap hit | Raise `max_inflight_writes` or let calls drain |
 | `503 audit backend unavailable — write rejected` | Fail-closed audit: record couldn't be persisted | Fix disk/permissions for `[mcp.audit].path` — this is by design |
+| `429 agent request quota exceeded` (+ `Retry-After`) | Per-agent rate bucket empty | Honor `Retry-After`; raise `requests_per_minute` / `agent_requests_per_minute` |
+| `503 upstream circuit open` (+ `Retry-After`) | Upstream MCP endpoint failing (transport/429/5xx × `upstream_breaker_failures`) | Wait out `upstream_breaker_cooldown_secs`; check `/metrics` `octobroker_mcp_upstream_failures_total` |
+| `401 … iam-auth rejected` / `proof was signed for a different server id` | `OCTOBROKER_IAM_SERVER_ID` doesn't match `[mcp.iam] server_id`, or the proof is stale (>60s clock skew) | Match the server id; keep the client clock synced (proofs live ≤60s) |
+| `403 arn is not mapped to any agent` | The IAM principal's ARN isn't in any agent's `iam_arns` | Add the `arn:aws:sts::<acct>:assumed-role/<role>/*` prefix to `iam_arns` |
+| `obk mcp: OCTOBROKER_URL … must be https://` | IAM mode refuses cleartext (the SigV4 proof would be replayable) | Use an https endpoint (or a loopback dev URL) |
+| `obk mcp: OCTOBROKER_IAM_SERVER_ID is required` | IAM mode needs the deployment's server id | Set `OCTOBROKER_IAM_SERVER_ID` to the configured `[mcp.iam] server_id` |
 | Startup panic: `enable_writes requires …` | Write gate validation | Configure the missing section (agents / github_app / audit) |
+| Startup panic: `[mcp.iam] enabled requires …` | Missing `server_id`, empty `sts_endpoints`, or no `iam_arns` | Complete the `[mcp.iam]` block; at least one agent needs `iam_arns` |
 | Tools missing from `tools/list` | Per-agent `X-MCP-Tools` filtering, or the App lacks a permission | Check the agent's `tools` list and the App's permission grants |
+| 404s after an octobroker restart / deploy | Session pins are per-replica | Expected: clients re-`initialize`; keep LB session affinity to avoid mid-session replica switches |

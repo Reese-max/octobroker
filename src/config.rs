@@ -100,6 +100,38 @@ pub struct McpConfig {
     /// Max concurrent write calls per agent (in-flight cap). 0 = unlimited.
     #[serde(default = "default_mcp_max_inflight_writes")]
     pub max_inflight_writes: usize,
+    /// Global per-agent request quota (token bucket, requests/minute).
+    /// Applies to every /mcp request including GET/DELETE. 0 = unlimited;
+    /// an agent's own `requests_per_minute` overrides this. Unauthenticated
+    /// network-trust traffic shares one `anonymous` bucket.
+    #[serde(default)]
+    pub agent_requests_per_minute: u32,
+    /// Upstream circuit breaker: after this many consecutive upstream
+    /// failures (transport error, 429, or 5xx) the breaker opens and calls
+    /// fail fast with 503 + Retry-After until the cooldown elapses and one
+    /// half-open probe is allowed through. 0 disables the breaker.
+    #[serde(default = "default_upstream_breaker_failures")]
+    pub upstream_breaker_failures: u32,
+    /// Breaker cooldown before a half-open probe is allowed through.
+    #[serde(default = "default_upstream_breaker_cooldown")]
+    pub upstream_breaker_cooldown_secs: u64,
+    /// POST (initialize/tools/call) upstream timeout in seconds. GET streams
+    /// are never total-bounded — they are the MCP resumption channel.
+    #[serde(default = "default_post_timeout")]
+    pub post_timeout_secs: u64,
+    /// GitHub API base used by App-backed credential providers. Overridable
+    /// for GitHub Enterprise Server (https://<ghes>/api/v3) and tests.
+    #[serde(default)]
+    pub github_api_base: Option<String>,
+    /// Secretless agent authentication: SigV4 `sts:GetCallerIdentity` proof
+    /// exchange (`POST /mcp/iam-auth`). Vault AWS-auth pattern — the agent's
+    /// ambient IAM credential (ECS task role / EKS IRSA) signs a fixed STS
+    /// call, octobroker replays it to an allowlisted STS endpoint, and maps
+    /// the returned ARN to an agent via `iam_arns`. Issues short-lived
+    /// `X-Octobroker-Iam-Token` credentials; agents never hold a GitHub
+    /// credential OR a static octobroker key.
+    #[serde(default)]
+    pub iam: Option<IamConfig>,
     /// Per-agent authentication + default-deny tool allowlists (Phase 2a).
     /// Empty = Phase 1 network-trust mode (no agent authn on /mcp).
     /// Non-empty = every /mcp request must present a valid X-Octobroker-Key.
@@ -120,6 +152,39 @@ pub struct McpConfig {
     /// pre-flight audit record cannot be persisted is rejected (fail-closed).
     #[serde(default)]
     pub audit: Option<AuditConfig>,
+}
+
+/// SigV4 IAM proof-exchange configuration (`[mcp.iam]`, Phase 3 #18).
+///
+/// The contract follows the Vault AWS-auth pattern: the caller submits the
+/// components of a *signed* `sts:GetCallerIdentity` POST; octobroker replays
+/// it verbatim to an allowlisted STS endpoint over TLS and uses the returned
+/// ARN. octobroker never verifies the signature itself — STS is the
+/// signature oracle.
+#[derive(Clone, Deserialize)]
+pub struct IamConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Required. The value the client must sign into the
+    /// `x-octobroker-server-id` header (covered by `SignedHeaders`). Binds a
+    /// proof to this deployment so a signed GetCallerIdentity minted for
+    /// another service cannot be replayed here.
+    #[serde(default)]
+    pub server_id: String,
+    /// Lifetime of the exchanged `X-Octobroker-Iam-Token` in seconds.
+    /// Bounded to [60, 3600].
+    #[serde(default = "default_iam_token_ttl")]
+    pub token_ttl_secs: u64,
+    /// Maximum accepted age of a signed proof (X-Amz-Date freshness).
+    /// RFC-bound: never configurable above 60s.
+    #[serde(default = "default_iam_proof_age")]
+    pub max_proof_age_secs: u64,
+    /// Allowlisted STS endpoint base URLs the signed request may be replayed
+    /// to, e.g. "https://sts.amazonaws.com" or "https://sts.eu-west-1.amazonaws.com".
+    /// Exact `scheme://authority` match; https required except loopback
+    /// hosts (test/dev, e.g. localstack).
+    #[serde(default = "default_sts_endpoints")]
+    pub sts_endpoints: Vec<String>,
 }
 
 /// Durable audit configuration.
@@ -194,6 +259,20 @@ pub struct McpAgentConfig {
     /// (deny-if-unresolvable). Empty = no repository restriction.
     #[serde(default)]
     pub repos: Vec<String>,
+    /// AWS principal ARNs allowed to authenticate as this agent through the
+    /// SigV4 proof exchange (`[mcp.iam]`, `POST /mcp/iam-auth`). Each entry is
+    /// matched against the ARN returned by `sts:GetCallerIdentity` — exactly,
+    /// or as a prefix when the entry ends in `*`. Temporary credentials return
+    /// `arn:aws:sts::<acct>:assumed-role/<role>/<session>`, so role-based
+    /// entries normally use the `arn:aws:sts::<acct>:assumed-role/<role>/*`
+    /// prefix form. An agent with only `iam_arns` (no `key`/`keys`) can
+    /// authenticate ONLY through the IAM exchange.
+    #[serde(default)]
+    pub iam_arns: Vec<String>,
+    /// Per-agent request quota override (requests/minute, token bucket).
+    /// 0/unset = inherit `[mcp] agent_requests_per_minute`.
+    #[serde(default)]
+    pub requests_per_minute: u32,
     /// Per-agent override of `[mcp] git_credentials_read_only`.
     /// `true` = this agent's /git-credential tokens are minted `contents:
     /// read` (clone/fetch, no push) regardless of the global default;
@@ -217,6 +296,12 @@ impl Default for McpConfig {
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),
             max_inflight_writes: default_mcp_max_inflight_writes(),
+            agent_requests_per_minute: 0,
+            upstream_breaker_failures: default_upstream_breaker_failures(),
+            upstream_breaker_cooldown_secs: default_upstream_breaker_cooldown(),
+            post_timeout_secs: default_post_timeout(),
+            github_api_base: None,
+            iam: None,
             agents: Vec::new(),
             github_app: None,
             github_apps: Vec::new(),
@@ -249,7 +334,9 @@ impl McpConfig {
                 return Err("enable_writes requires [mcp.github_app] or [[mcp.github_apps]] — writes never run on pooled PATs".into());
             }
             if self.audit.is_none() {
-                return Err("enable_writes requires [mcp.audit] — writes are fail-closed audited".into());
+                return Err(
+                    "enable_writes requires [mcp.audit] — writes are fail-closed audited".into(),
+                );
             }
             // Multi-installation mode: repo-less agents ride pooled PATs, and
             // writes never run on pooled PATs — an agent allowlisting a
@@ -257,10 +344,9 @@ impl McpConfig {
             if !self.github_apps.is_empty() {
                 for agent in &self.agents {
                     if agent.repos.is_empty()
-                        && agent
-                            .tools
-                            .iter()
-                            .any(|t| crate::policy::classify_tool(t) == crate::policy::ToolKind::Write)
+                        && agent.tools.iter().any(|t| {
+                            crate::policy::classify_tool(t) == crate::policy::ToolKind::Write
+                        })
                     {
                         return Err(format!(
                             "mcp agent '{}' allowlists write tools but has no `repos` — repo-less agents use pooled PATs and writes never run on pooled PATs",
@@ -281,7 +367,10 @@ impl McpConfig {
                 return Err("enable_git_credentials requires [mcp.github_app] or [[mcp.github_apps]] — git credentials are App installation tokens, never PATs".into());
             }
             if self.audit.is_none() {
-                return Err("enable_git_credentials requires [mcp.audit] — issuance is fail-closed audited".into());
+                return Err(
+                    "enable_git_credentials requires [mcp.audit] — issuance is fail-closed audited"
+                        .into(),
+                );
             }
             if self
                 .github_app
@@ -297,7 +386,8 @@ impl McpConfig {
         }
         // Multi-app validation
         if !self.github_apps.is_empty() {
-            let mut seen_owners: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_owners: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for entry in &self.github_apps {
                 let normalized = entry.owner.trim().to_lowercase();
                 if normalized.is_empty() {
@@ -352,25 +442,173 @@ impl McpConfig {
                 }
             }
         }
+        // SigV4 IAM exchange (Phase 3 #18): hard requirements.
+        if let Some(iam) = &self.iam {
+            if iam.enabled {
+                if !self.enabled {
+                    return Err("[mcp.iam] enabled requires `mcp.enabled = true`".into());
+                }
+                if self.agents.is_empty() {
+                    return Err("[mcp.iam] enabled requires [[mcp.agents]] — the exchange maps AWS principals to agents".into());
+                }
+                if iam.server_id.trim().is_empty() {
+                    return Err("[mcp.iam] enabled requires `server_id` — it binds a proof to this deployment and prevents cross-environment replay".into());
+                }
+                if !self.agents.iter().any(|a| !a.iam_arns.is_empty()) {
+                    return Err("[mcp.iam] enabled but no agent has `iam_arns` — no principal could ever map".into());
+                }
+                if iam.token_ttl_secs == 0 || iam.token_ttl_secs > 3600 {
+                    return Err("[mcp.iam] token_ttl_secs must be within [1, 3600]".into());
+                }
+                if iam.max_proof_age_secs == 0 || iam.max_proof_age_secs > IAM_MAX_PROOF_AGE_SECS {
+                    return Err(format!(
+                        "[mcp.iam] max_proof_age_secs must be within [1, {}] — the RFC caps proof validity at 60s",
+                        IAM_MAX_PROOF_AGE_SECS
+                    ));
+                }
+                if iam.sts_endpoints.is_empty() {
+                    return Err(
+                        "[mcp.iam] enabled requires a non-empty sts_endpoints allowlist".into(),
+                    );
+                }
+                for ep in &iam.sts_endpoints {
+                    if !is_allowed_sts_endpoint(ep) {
+                        return Err(format!(
+                            "[mcp.iam] sts_endpoints entry '{}' is not a valid https://host[/] URL (https required except loopback)",
+                            ep
+                        ));
+                    }
+                }
+            }
+        }
+        // iam_arns entries are matched verbatim against the STS-reported ARN
+        // (trailing `*` = prefix match) — malformed entries would silently
+        // deny every exchange.
+        for agent in &self.agents {
+            for arn in &agent.iam_arns {
+                let well_formed = arn.starts_with("arn:")
+                    && !arn.contains(char::is_whitespace)
+                    && arn.matches('*').count() <= 1
+                    && (!arn.contains('*') || arn.ends_with('*'))
+                    // A wildcard must cut on a component boundary (`/*` or
+                    // `:*`) — bare `…role*` would prefix-match `role-evil`.
+                    && (!arn.ends_with('*')
+                        || arn.ends_with("/*")
+                        || arn.ends_with(":*"));
+                if !well_formed {
+                    return Err(format!(
+                        "mcp agent '{}' iam_arns entry '{}' is malformed — expected `arn:aws:…`, optional trailing `*` for prefix match",
+                        agent.id, arn
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+/// `scheme://authority[/]` — https required, except loopback hosts where http
+/// is permitted for tests/dev (localstack-style). Any path other than "/" is
+/// rejected so the allowlist cannot be smuggled past with a URL prefix.
+fn is_allowed_sts_endpoint(entry: &str) -> bool {
+    let entry = entry.trim().trim_end_matches('/');
+    let Some((scheme, rest)) = entry.split_once("://") else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@']) || rest.contains(char::is_whitespace)
+    {
+        return false;
+    }
+    // authority = host[:port], with bracketed IPv6 handled first
+    // (`[::1]:8080`). Split on the LAST ':' so the port check is numeric.
+    let (host, port) = if let Some(b) = rest.strip_prefix('[') {
+        let Some(end) = b.find(']') else { return false };
+        let host = &b[..end];
+        let tail = &b[end + 1..];
+        match tail.strip_prefix(':') {
+            Some(p) => (host, Some(p)),
+            None if tail.is_empty() => (host, None),
+            None => return false,
+        }
+    } else {
+        match rest.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => (h, Some(p)),
+            Some(_) => return false, // bare IPv6 without brackets
+            None => (rest, None),
+        }
+    };
+    if host.is_empty() {
+        return false;
+    }
+    if let Some(p) = port {
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    match scheme {
+        "https" => true,
+        "http" => matches!(host, "127.0.0.1" | "localhost" | "::1"),
+        _ => false,
     }
 }
 
 fn default_mcp_upstream() -> String {
     "https://api.githubcopilot.com/mcp/readonly".to_string()
 }
-fn default_mcp_session_ttl() -> u64 { 3600 }
-fn default_mcp_max_inflight_writes() -> usize { 4 }
+fn default_mcp_session_ttl() -> u64 {
+    3600
+}
+fn default_mcp_max_inflight_writes() -> usize {
+    4
+}
+fn default_upstream_breaker_failures() -> u32 {
+    5
+}
+fn default_upstream_breaker_cooldown() -> u64 {
+    30
+}
+fn default_post_timeout() -> u64 {
+    120
+}
+fn default_iam_token_ttl() -> u64 {
+    900
+}
+/// RFC bound: a SigV4 proof is valid for at most 60 seconds from X-Amz-Date.
+pub const IAM_MAX_PROOF_AGE_SECS: u64 = 60;
+fn default_iam_proof_age() -> u64 {
+    IAM_MAX_PROOF_AGE_SECS
+}
+fn default_sts_endpoints() -> Vec<String> {
+    vec!["https://sts.amazonaws.com".to_string()]
+}
 
-fn default_port() -> u16 { 8080 }
-fn default_max_entries() -> u64 { 10000 }
-fn default_pr_ttl() -> u64 { 30 }
-fn default_run_ttl() -> u64 { 15 }
-fn default_raw_ttl() -> u64 { 30 }
-fn default_raw_max_bytes() -> u64 { 256 * 1024 * 1024 } // 256 MiB
-fn default_commit_ttl() -> u64 { 120 }
-fn default_repo_ttl() -> u64 { 300 }
-fn default_ttl() -> u64 { 60 }
+fn default_port() -> u16 {
+    8080
+}
+fn default_max_entries() -> u64 {
+    10000
+}
+fn default_pr_ttl() -> u64 {
+    30
+}
+fn default_run_ttl() -> u64 {
+    15
+}
+fn default_raw_ttl() -> u64 {
+    30
+}
+fn default_raw_max_bytes() -> u64 {
+    256 * 1024 * 1024
+} // 256 MiB
+fn default_commit_ttl() -> u64 {
+    120
+}
+fn default_repo_ttl() -> u64 {
+    300
+}
+fn default_ttl() -> u64 {
+    60
+}
 
 // Raw TOML structures (before secret resolution)
 #[derive(Deserialize)]
@@ -399,15 +637,19 @@ impl Config {
             match fs::read_to_string(&path) {
                 Ok(content) => {
                     tracing::info!("loading config from {}", path);
-                    let raw: RawConfig = toml::from_str(&content)
-                        .expect("failed to parse config file");
+                    let raw: RawConfig =
+                        toml::from_str(&content).expect("failed to parse config file");
                     let mut config = Self::from_raw(raw).await;
                     config.apply_env_overrides();
                     return config;
                 }
                 Err(e) => {
                     // Most likely a typo'd OCTOBROKER_CONFIG — don't fail silently
-                    tracing::warn!("cannot read config at {}: {} — falling back to env-only mode", path, e);
+                    tracing::warn!(
+                        "cannot read config at {}: {} — falling back to env-only mode",
+                        path,
+                        e
+                    );
                 }
             }
         }
@@ -426,7 +668,13 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_port());
 
-        let mut config = Config { port, identities, allowed_owners, cache: CacheConfig::default(), mcp: McpConfig::default() };
+        let mut config = Config {
+            port,
+            identities,
+            allowed_owners,
+            cache: CacheConfig::default(),
+            mcp: McpConfig::default(),
+        };
         config.apply_env_overrides();
         config
     }
@@ -472,8 +720,11 @@ impl Config {
             for k in &agent.keys {
                 resolved.push(resolve_secret(k).await);
             }
-            if resolved.is_empty() {
-                panic!("mcp agent '{}' has no key/keys configured", agent.id);
+            if resolved.is_empty() && agent.iam_arns.is_empty() {
+                panic!(
+                    "mcp agent '{}' has no key/keys and no iam_arns configured",
+                    agent.id
+                );
             }
             agent.keys = resolved;
         }
@@ -498,10 +749,16 @@ impl Config {
 
     fn apply_env_overrides(&mut self) {
         if let Ok(v) = std::env::var("OCTOBROKER_PORT") {
-            if let Ok(p) = v.parse() { self.port = p; }
+            if let Ok(p) = v.parse() {
+                self.port = p;
+            }
         }
         if let Ok(v) = std::env::var("OCTOBROKER_ALLOWED_OWNERS") {
-            self.allowed_owners = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            self.allowed_owners = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         if let Ok(v) = std::env::var("OCTOBROKER_MCP_ENABLED") {
             self.mcp.enabled = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes");
@@ -527,8 +784,7 @@ impl Config {
 ///   (anything else) — used as literal value
 async fn resolve_secret(value: &str) -> String {
     if let Some(rest) = value.strip_prefix("env:") {
-        return std::env::var(rest)
-            .unwrap_or_else(|_| panic!("env var {} not set", rest));
+        return std::env::var(rest).unwrap_or_else(|_| panic!("env var {} not set", rest));
     }
     if let Some(rest) = value.strip_prefix("aws:secretsmanager:") {
         return resolve_aws_secret(rest).await;
@@ -541,20 +797,22 @@ async fn resolve_secret(value: &str) -> String {
 
 async fn resolve_aws_secret(spec: &str) -> String {
     // spec = "secret-name:json-key"
-    let (secret_name, json_key) = spec.split_once(':')
+    let (secret_name, json_key) = spec
+        .split_once(':')
         .expect("aws secret ref must be aws:secretsmanager:<name>:<key>");
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = aws_sdk_secretsmanager::Client::new(&config);
-    let resp = client.get_secret_value()
+    let resp = client
+        .get_secret_value()
         .secret_id(secret_name)
         .send()
         .await
         .expect("failed to fetch secret from AWS Secrets Manager");
-    let secret_string = resp.secret_string()
-        .expect("secret has no string value");
-    let parsed: serde_json::Value = serde_json::from_str(secret_string)
-        .expect("secret value is not valid JSON");
-    parsed[json_key].as_str()
+    let secret_string = resp.secret_string().expect("secret has no string value");
+    let parsed: serde_json::Value =
+        serde_json::from_str(secret_string).expect("secret value is not valid JSON");
+    parsed[json_key]
+        .as_str()
         .unwrap_or_else(|| panic!("key '{}' not found in secret '{}'", json_key, secret_name))
         .to_string()
 }
@@ -563,9 +821,11 @@ fn resolve_k8s_secret(spec: &str) -> String {
     // spec = "namespace/secret-name:key"
     // Reads from /var/run/secrets/kubernetes.io/serviceaccount/.. mounted path
     // or the standard projected volume path: /etc/secrets/<secret-name>/<key>
-    let (path_part, key) = spec.split_once(':')
+    let (path_part, key) = spec
+        .split_once(':')
         .expect("k8s secret ref must be k8s:<namespace>/<secret-name>:<key>");
-    let (_, secret_name) = path_part.split_once('/')
+    let (_, secret_name) = path_part
+        .split_once('/')
         .expect("k8s secret ref must include namespace/secret-name");
     let file_path = format!("/etc/secrets/{}/{}", secret_name, key);
     fs::read_to_string(&file_path)
@@ -596,7 +856,11 @@ mod tests {
         std::env::remove_var("OCTOBROKER_CONFIG");
         std::env::set_var("XDG_CONFIG_HOME", &tmp);
 
-        assert_eq!(Config::resolve_config_path(), None, "no file anywhere → env-only");
+        assert_eq!(
+            Config::resolve_config_path(),
+            None,
+            "no file anywhere → env-only"
+        );
 
         // ./config.toml in cwd is found
         fs::write(cwd_dir.join("config.toml"), "port = 1\n").unwrap();
@@ -662,21 +926,40 @@ mod tests {
 
     #[test]
     fn test_mcp_validate_write_gate() {
-        let mut m = McpConfig { enabled: true, enable_writes: true, ..Default::default() };
+        let mut m = McpConfig {
+            enabled: true,
+            enable_writes: true,
+            ..Default::default()
+        };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
         m.agents.push(McpAgentConfig {
-            id: "a".into(), key: None, keys: vec!["k".into()], tools: vec![], repos: vec![],
+            id: "a".into(),
+            key: None,
+            keys: vec!["k".into()],
+            tools: vec![],
+            repos: vec![],
+            iam_arns: Vec::new(),
+            requests_per_minute: 0,
             git_credentials_read_only: None,
         });
         assert!(m.validate().unwrap_err().contains("github_app"));
         m.github_app = Some(GithubAppConfig {
-            app_id: "1".into(), private_key: "pem".into(), installation_id: Some(1), owner: None,
+            app_id: "1".into(),
+            private_key: "pem".into(),
+            installation_id: Some(1),
+            owner: None,
         });
         assert!(m.validate().unwrap_err().contains("audit"));
-        m.audit = Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 });
+        m.audit = Some(AuditConfig {
+            path: "/tmp/a.jsonl".into(),
+            max_result_bytes: 1024,
+        });
         assert!(m.validate().is_ok());
         // reads-only config never requires anything
-        let m = McpConfig { enabled: true, ..Default::default() };
+        let m = McpConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(m.validate().is_ok());
     }
 
@@ -684,9 +967,16 @@ mod tests {
     fn test_mcp_upstream_default_flips_with_writes() {
         let m = McpConfig::default();
         assert!(m.upstream().ends_with("/readonly"));
-        let m = McpConfig { enable_writes: true, ..Default::default() };
+        let m = McpConfig {
+            enable_writes: true,
+            ..Default::default()
+        };
         assert_eq!(m.upstream(), "https://api.githubcopilot.com/mcp/");
-        let m = McpConfig { upstream: Some("http://x/".into()), enable_writes: true, ..Default::default() };
+        let m = McpConfig {
+            upstream: Some("http://x/".into()),
+            enable_writes: true,
+            ..Default::default()
+        };
         assert_eq!(m.upstream(), "http://x/");
     }
 
@@ -707,6 +997,8 @@ mod tests {
                 keys: vec!["k".into()],
                 tools: vec![],
                 repos: repos.iter().map(|s| s.to_string()).collect(),
+                iam_arns: Vec::new(),
+                requests_per_minute: 0,
                 git_credentials_read_only: None,
             }
         }
@@ -714,8 +1006,10 @@ mod tests {
         // mutually exclusive with the singular form
         let m = McpConfig {
             github_app: Some(GithubAppConfig {
-                app_id: "1".into(), private_key: "pem".into(),
-                installation_id: Some(1), owner: None,
+                app_id: "1".into(),
+                private_key: "pem".into(),
+                installation_id: Some(1),
+                owner: None,
             }),
             github_apps: vec![entry("openabdev")],
             agents: vec![multi_agent(&["openabdev/x"])],
@@ -740,7 +1034,10 @@ mod tests {
         assert!(m.validate().unwrap_err().contains("empty owner"));
 
         // agents required in multi mode (routing needs an envelope)
-        let m = McpConfig { github_apps: vec![entry("openabdev")], ..Default::default() };
+        let m = McpConfig {
+            github_apps: vec![entry("openabdev")],
+            ..Default::default()
+        };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
 
         // repo-less agents are allowed (legacy PAT read path)…
@@ -760,7 +1057,10 @@ mod tests {
             enable_git_credentials: false,
             github_apps: vec![entry("openabdev")],
             agents: vec![wa],
-            audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
+            audit: Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            }),
             ..Default::default()
         };
         assert!(m.validate().unwrap_err().contains("pooled PATs"));
@@ -771,7 +1071,10 @@ mod tests {
             agents: vec![multi_agent(&["openabdev/x", "oablab/chi"])],
             ..Default::default()
         };
-        assert!(m.validate().unwrap_err().contains("no [[mcp.github_apps]] entry"));
+        assert!(m
+            .validate()
+            .unwrap_err()
+            .contains("no [[mcp.github_apps]] entry"));
 
         // malformed repo entry rejected
         let m = McpConfig {
@@ -782,7 +1085,13 @@ mod tests {
         assert!(m.validate().unwrap_err().contains("malformed"));
 
         // sloppy entries that would widen scope or fail at runtime: rejected
-        for bad in ["openabdev/", "openabdev/repo/extra", "openabdev / repo", "openabdev/ repo", "/repo"] {
+        for bad in [
+            "openabdev/",
+            "openabdev/repo/extra",
+            "openabdev / repo",
+            "openabdev/ repo",
+            "/repo",
+        ] {
             let m = McpConfig {
                 github_apps: vec![entry("openabdev")],
                 agents: vec![multi_agent(&[bad])],
@@ -810,7 +1119,10 @@ mod tests {
             enable_git_credentials: false,
             github_apps: vec![entry("openabdev"), entry("oablab")],
             agents: vec![multi_agent(&["openabdev/openab", "oablab/chi"])],
-            audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
+            audit: Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            }),
             ..Default::default()
         };
         assert!(m.validate().is_ok());
@@ -825,11 +1137,16 @@ mod tests {
                 keys: vec!["k".into()],
                 tools: vec![],
                 repos: vec!["openabdev/openab".into()],
+                iam_arns: Vec::new(),
+                requests_per_minute: 0,
                 git_credentials_read_only: None,
             }
         }
         fn audit() -> Option<AuditConfig> {
-            Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 })
+            Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            })
         }
         fn single(owner: Option<&str>) -> Option<GithubAppConfig> {
             Some(GithubAppConfig {
@@ -841,7 +1158,10 @@ mod tests {
         }
 
         // agents required
-        let m = McpConfig { enable_git_credentials: true, ..Default::default() };
+        let m = McpConfig {
+            enable_git_credentials: true,
+            ..Default::default()
+        };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
 
         // App backend required — never PATs
@@ -899,6 +1219,143 @@ mod tests {
                 owner: "openabdev".into(),
             }],
             audit: audit(),
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn test_iam_validate_gate() {
+        fn iam_agent() -> McpAgentConfig {
+            McpAgentConfig {
+                id: "a".into(),
+                key: None,
+                keys: vec![],
+                tools: vec![],
+                repos: vec![],
+                iam_arns: vec!["arn:aws:sts::123:assumed-role/r/*".into()],
+                requests_per_minute: 0,
+                git_credentials_read_only: None,
+            }
+        }
+        fn iam() -> Option<IamConfig> {
+            Some(IamConfig {
+                enabled: true,
+                server_id: "srv-1".into(),
+                token_ttl_secs: 900,
+                max_proof_age_secs: 60,
+                sts_endpoints: vec!["https://sts.amazonaws.com".into()],
+            })
+        }
+
+        // happy path
+        let m = McpConfig {
+            enabled: true,
+            iam: iam(),
+            agents: vec![iam_agent()],
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
+
+        // server_id required
+        let mut i = iam().unwrap();
+        i.server_id = " ".into();
+        let m = McpConfig {
+            enabled: true,
+            iam: Some(i),
+            agents: vec![iam_agent()],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("server_id"));
+
+        // at least one agent needs iam_arns
+        let mut a = iam_agent();
+        a.iam_arns = vec![];
+        a.keys = vec!["k".into()];
+        let m = McpConfig {
+            enabled: true,
+            iam: iam(),
+            agents: vec![a],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("iam_arns"));
+
+        // proof age can never exceed the 60s RFC bound
+        let mut i = iam().unwrap();
+        i.max_proof_age_secs = 300;
+        let m = McpConfig {
+            enabled: true,
+            iam: Some(i),
+            agents: vec![iam_agent()],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("max_proof_age_secs"));
+
+        // non-https, non-loopback STS endpoint rejected; loopback allowed
+        let mut i = iam().unwrap();
+        i.sts_endpoints = vec!["http://sts.evil.com".into()];
+        let m = McpConfig {
+            enabled: true,
+            iam: Some(i),
+            agents: vec![iam_agent()],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("sts_endpoints"));
+        let mut i = iam().unwrap();
+        i.sts_endpoints = vec!["http://127.0.0.1:4566".into()];
+        let m = McpConfig {
+            enabled: true,
+            iam: Some(i),
+            agents: vec![iam_agent()],
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
+        for bad in ["ftp://x", "https://", "https://a/b?c", "notaurl"] {
+            let mut i = iam().unwrap();
+            i.sts_endpoints = vec![bad.into()];
+            let m = McpConfig {
+                enabled: true,
+                iam: Some(i),
+                agents: vec![iam_agent()],
+                ..Default::default()
+            };
+            assert!(m.validate().is_err(), "endpoint '{}' must be rejected", bad);
+        }
+
+        // iam without mcp.enabled fails
+        let m = McpConfig {
+            enabled: false,
+            iam: iam(),
+            agents: vec![iam_agent()],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("mcp.enabled"));
+
+        // malformed iam_arns entries are startup errors
+        for bad in [
+            "notanarn",
+            "arn:aws:sts::1:role/a*b",
+            "arn:aws:iam::1:role/*x*",
+        ] {
+            let mut a = iam_agent();
+            a.iam_arns = vec![bad.into()];
+            let m = McpConfig {
+                enabled: true,
+                iam: iam(),
+                agents: vec![a],
+                ..Default::default()
+            };
+            assert!(m.validate().unwrap_err().contains("malformed"), "'{}'", bad);
+        }
+
+        // iam_arns-only agent (no key) is a valid auth path
+        let mut a = iam_agent();
+        a.keys = vec![];
+        a.iam_arns = vec!["arn:aws:iam::123:role/exact".into()];
+        let m = McpConfig {
+            enabled: true,
+            iam: iam(),
+            agents: vec![a],
             ..Default::default()
         };
         assert!(m.validate().is_ok());
