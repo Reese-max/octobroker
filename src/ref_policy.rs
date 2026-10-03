@@ -56,6 +56,12 @@ pub fn branch_protected(branch: &serde_json::Value) -> bool {
 /// (GitHub answers `301 Moved permanently` for a renamed repo, and the HTTP
 /// client follows redirects) would otherwise let the verdict describe a
 /// different ref than the current default branch.
+///
+/// A name mismatch is deliberately indistinguishable from an open branch in
+/// the verdict — both deny, and both are recorded as
+/// `unprotected_default_branch`. A branch that moved between the two reads
+/// is a rare race, and reporting it as "could not verify" would suggest a
+/// transient GitHub problem when the repository may be fine.
 pub fn default_branch_protected(
     repo: Option<&serde_json::Value>,
     branch: Option<&serde_json::Value>,

@@ -12,7 +12,9 @@
 //!
 //! Policy stack (all fail-closed):
 //! key auth → repo-scoped agent → repo allowlist → installation coverage →
-//! audited issuance → single-repo token mint (GitHub enforces the boundary).
+//! audited issuance → single-repo token mint (GitHub enforces the repository
+//! boundary) → ref-level default-branch check for push-capable credentials
+//! (GitHub's branch protection enforces the ref boundary).
 
 use axum::{
     extract::{Query, State},
@@ -1035,8 +1037,8 @@ mod tests {
     async fn test_protection_check_fails_closed_when_github_errors() {
         let path = audit_tmp("refpolicy-ghfail");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
-        let (state, _) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
-        let resp = app(state)
+        let (state, mint_log) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        let resp = app(state.clone())
             .oneshot(req("openabdev/openab-ghfail", Some("key-b0")))
             .await
             .unwrap();
@@ -1056,6 +1058,19 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[1]["success"], false);
         assert_eq!(records[1]["denial"], "unverifiable_default_branch");
+        // Same invariant as the 403 arm: the credential minted before the
+        // check must not stay cached for a later request.
+        assert_eq!(mint_log.lock().unwrap().len(), 1, "issued, then denied");
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-ghfail", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            mint_log.lock().unwrap().len(),
+            2,
+            "denied credential must be evicted from the token cache"
+        );
         std::fs::remove_file(&path).ok();
     }
 

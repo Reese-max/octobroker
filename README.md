@@ -642,9 +642,9 @@ credential cannot rewrite a sibling's work:
   `FNM_PATHNAME`, where `*` does **not** cross `/`: use
   `refs/heads/agent-a/**/*` to allow the whole namespace (one per agent, or
   per trust level — `refs/heads/bot/**/*`, `refs/heads/human/**/*`) and
-  `refs/heads/agent-a/*` for exactly one level. Widening the target to
-  `refs/heads/*` instead would hand the App every branch, which is the
-  opposite of the point.
+  `refs/heads/agent-a/*` for exactly one level. Widening that *allow
+  pattern* to `refs/heads/*` instead would hand the App every branch, which
+  is the opposite of the point.
 - Agents then push branches under their namespace and open a PR into the
   default branch; the default-branch rule handles the rest.
 
@@ -683,7 +683,10 @@ Semantics:
   `GET /repos/{owner}/{repo}/branches/{branch}` (Contents: read) — bounded
   to 10s, with a *protected* verdict reused for 60s so a push-heavy agent
   does not spend two API calls per git operation. Denials are never cached,
-  so hardening a repository takes effect immediately.
+  so hardening a repository takes effect immediately — the converse is the
+  window to be aware of: a repository that already passed can keep passing
+  for up to 60s after protection is removed, or after the default branch is
+  switched to an unprotected one.
 - **Scope — read this before relying on it.** The check proves the default
   branch is *protected*; it does not prove that **direct pushes are
   blocked**. A branch whose only rule is "require status checks" (or
@@ -701,7 +704,11 @@ Semantics:
   the App) and treat this check as the tripwire that notices when it is
   missing. The check also says
   nothing about *which* feature branches the App may push — that is the
-  namespace ruleset's job.
+  namespace ruleset's job. It also governs **`/git-credential` only**: with
+  `enable_writes`, an agent that allowlists `push_files` or
+  `create_or_update_file` gets an MCP token carrying the App's full
+  permission set, and that path is bounded by the MCP tool allowlist and
+  GitHub's protections, not by this flag.
 - Requires `enable_git_credentials` (startup validation rejects the flag
   otherwise). Default `false`, so existing deployments are unchanged.
 
