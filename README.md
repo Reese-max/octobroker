@@ -574,7 +574,8 @@ git push → obk git-credential (OCTOBROKER_KEY from env)
          → installation owner verified against GitHub
          → Contents-only single-repo token (~1h, GitHub-enforced scope)
          → default branch protected? (require_protected_default_branch)
-         → audit result (phase: git_credential_result, mode: read|write)
+         → audit result (phase: git_credential_result, mode: read|write,
+                        denial: <reason>|null)
          → push authenticated as <app>[bot]
 ```
 
@@ -592,8 +593,10 @@ Properties:
   installation ID is refused.
 - **Fail-closed audit** — a request record is persisted *before* any mint or
   cache lookup, and a result record before the token is returned; if either
-  write fails, no credential (503). The token value is never written to the
-  audit log.
+  write fails, no credential (503). The result record carries the effective
+  `mode` plus the `denial` that refused the issuance (`success` is derived
+  from it, so a failed issuance always names its cause). The token value is
+  never written to the audit log.
 - **Deny-by-default** — repo-less agents, off-allowlist repos, and owners
   without an installation are refused before any mint.
 - **Fail-closed helper** — once a request is recognized as `github.com`
@@ -627,16 +630,21 @@ push to:
 In the GitHub UI: *Settings → Rules → Rulesets → New branch ruleset* targeting
 `~DEFAULT_BRANCH`, or *Settings → Branches → Add rule* on the branch itself.
 Either makes `GET /repos/{owner}/{repo}/branches/{default_branch}` report
-`protected: true`.
+`protected: true` — GitHub documents that flag as covering both mechanisms
+("branches protected by branch protections **or rulesets**").
 
 **Recommended: namespace agent branches.** Give each agent its own branch
 namespace and restrict what the App may push directly, so a compromised
 credential cannot rewrite a sibling's work:
 
 - A second ruleset targeting `refs/heads/*` with **Restrict pushes** → *Push
-  only to matching branches*, pattern `refs/heads/agent-a/**` (one per agent,
-  or one namespace per trust level: `refs/heads/bot/**`,
-  `refs/heads/human/**`).
+  only to matching branches*. Ruleset ref patterns are fnmatch with
+  `FNM_PATHNAME`, where `*` does **not** cross `/`: use
+  `refs/heads/agent-a/**/*` to allow the whole namespace (one per agent, or
+  per trust level — `refs/heads/bot/**/*`, `refs/heads/human/**/*`) and
+  `refs/heads/agent-a/*` for exactly one level. Widening the target to
+  `refs/heads/*` instead would hand the App every branch, which is the
+  opposite of the point.
 - Agents then push branches under their namespace and open a PR into the
   default branch; the default-branch rule handles the rest.
 
@@ -660,8 +668,10 @@ Semantics:
 - **Fail-closed.** Unprotected, no default branch, an API error, or an
   unreadable answer all deny and are audited as a failed issuance. Only an
   explicit `protected: true` for the repository's current default branch
-  passes. The token, if already minted, is never returned and is dropped
-  from the cache, so a refused request leaves no live credential behind.
+  passes. The token, if already minted, is never disclosed to the caller and
+  is dropped from the cache, so a refused request leaves octobroker holding
+  no credential for it (the token itself remains valid at GitHub until it
+  expires).
 - **Two denial shapes, on purpose.** An unprotected default branch is a
   `403` (`"denial": "unprotected_default_branch"` in the audit record — fix
   the ruleset); an answer that could not be obtained at all — GitHub
@@ -679,11 +689,12 @@ Semantics:
   blocked**. A branch whose only rule is "require status checks" (or
   "require linear history") is `protected: true` while direct pushes still
   succeed, and so is one that uses *Restrict who can push* to name the App
-  as an allowed pusher. Proving "no direct push" means reading the
-  protection rules themselves
-  (`GET /repos/{owner}/{repo}/rules/branches/{branch}`, **Administration:
-  read**) — a permission this project deliberately does not ask for, and one
-  that rulesets do not expose there at all. So: configure the ruleset as
+  as an allowed pusher. Proving "no direct push" means reading the active
+  rules for the branch (`GET /repos/{owner}/{repo}/rules/branches/{branch}`,
+  which reports rules from repository *and* organization rulesets), and that
+  needs **Administration: read** — a permission this project deliberately
+  does not ask an App for, since git credentials need Contents and nothing
+  else. So: configure the ruleset as
   above (*Require a pull request*, no bypass for the App) and treat this
   check as the tripwire that notices when it is missing. The check also says
   nothing about *which* feature branches the App may push — that is the

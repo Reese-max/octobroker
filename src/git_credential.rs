@@ -220,8 +220,8 @@ pub async fn git_credential(
     // push-capable credential. Read-only (contents:read) credentials are
     // exempt: they cannot push, so there is no ref to police. Runs after
     // the mint because the reads are authenticated by the repo-scoped token
-    // itself; a denial never returns it and drops it from the token cache,
-    // so a refused request leaves no live push-capable credential behind.
+    // itself; a denial never discloses it and drops it from the token cache,
+    // so octobroker holds no credential for a refused request.
     if state.config.mcp.require_protected_default_branch && !read_only {
         let denial = match provider
             .default_branch_protected(owner, name, &token.token)
@@ -283,6 +283,9 @@ pub async fn git_credential(
             "audit result unavailable — rejecting git-credential response: {}",
             e
         );
+        // Same invariant as a policy denial: a credential that will not be
+        // handed out is not kept around.
+        provider.evict_git_tokens(name);
         return rpc_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "audit backend unavailable — credential rejected",
@@ -338,7 +341,18 @@ mod tests {
             State(log): State<MintLog>,
             Path(id): Path<u64>,
             axum::Json(body): axum::Json<serde_json::Value>,
-        ) -> axum::Json<serde_json::Value> {
+        ) -> axum::response::Response {
+            // `<repo>-mintfail` cannot be minted (GitHub answers 422/5xx for
+            // an unknown repository) so the failure path is reachable.
+            if body["repositories"][0]
+                .as_str()
+                .is_some_and(|r| r.starts_with("mintfail"))
+            {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::UNPROCESSABLE_ENTITY)
+                    .body(axum::body::Body::from("{\"message\":\"not found\"}"))
+                    .unwrap();
+            }
             log.lock().unwrap().push((id, body));
             let exp = time::OffsetDateTime::from_unix_timestamp(
                 (std::time::SystemTime::now()
@@ -350,10 +364,17 @@ mod tests {
             .unwrap()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-            axum::Json(serde_json::json!({
-                "token": if id == 41 { "ghs_git_openabdev" } else { "ghs_git_oablab" },
-                "expires_at": exp
-            }))
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::CREATED)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "token": if id == 41 { "ghs_git_openabdev" } else { "ghs_git_oablab" },
+                        "expires_at": exp
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
         }
         async fn installation(Path(id): Path<u64>) -> axum::Json<serde_json::Value> {
             axum::Json(serde_json::json!({
@@ -369,8 +390,9 @@ mod tests {
         //   <repo>-ghfail      → the branch read fails (500)
         //   <repo>-metafail    → the repository read fails (500)
         //   <repo>-nodefault   → the repository reports no default branch
-        //   <repo>-flip        → protected on the first branch read, then the
-        //                       repository becomes unreachable
+        //   <repo>-flip        → protected on the first branch read; every
+        //                       later branch read for it fails
+        //   <repo>-mintfail    → the mint endpoint answers 500
         //   <repo>-slash       → default branch is "release/v1" (a branch
         //                       name containing a slash)
         //   anything else       → default branch "main", protected:true
@@ -568,6 +590,7 @@ mod tests {
                                     "openabdev/openab-metafail",
                                     "openabdev/openab-nodefault",
                                     "openabdev/openab-flip",
+                                    "openabdev/mintfail",
                                     "openabdev/openab-slash",
                                     "oablab/chi",
                                     "mislabeled/repo",
@@ -577,8 +600,18 @@ mod tests {
                             agent("other", "key-other", &["otherorg/thing"]),
                             // Per-agent overrides: pinned read-only / pinned
                             // push-capable regardless of the global flag.
-                            agent_override("pinned-ro", "key-ro", &["openabdev/openab"], true),
-                            agent_override("pinned-rw", "key-rw", &["openabdev/openab"], false),
+                            agent_override(
+                                "pinned-ro",
+                                "key-ro",
+                                &["openabdev/openab", "openabdev/openab-unprotected"],
+                                true,
+                            ),
+                            agent_override(
+                                "pinned-rw",
+                                "key-rw",
+                                &["openabdev/openab", "openabdev/openab-unprotected"],
+                                false,
+                            ),
                         ],
                         github_app: None,
                         github_apps: entries,
@@ -1035,6 +1068,68 @@ mod tests {
             assert_eq!(record["success"], false);
             assert_eq!(record["denial"], "unverifiable_default_branch");
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_mint_failure_is_audited_as_a_failure() {
+        let path = audit_tmp("refpolicy-mintfail");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let (state, mint_log) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/mintfail", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // `success` is derived from `denial`, so a failed issuance can never
+        // be recorded without the reason it failed.
+        let records = audit_records(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["phase"], "git_credential_result");
+        assert_eq!(records[1]["success"], false);
+        assert_eq!(records[1]["denial"], "mint_failed");
+        assert!(records[1]["expires_at"].is_null());
+        assert!(mint_log.lock().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_pinned_write_agent_is_still_checked_for_protection() {
+        let path = audit_tmp("refpolicy-pinned-rw");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        // Read-only fleet default, but this agent pins itself push-capable.
+        // The policy check must follow the EFFECTIVE mode: skipping it here
+        // would hand a `contents: write` credential for an unprotected
+        // repository — exactly the bypass the per-agent override creates.
+        let (state, mint_log) = test_state_with_ref_policy(true, true, true, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-unprotected", Some("key-rw")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(mint_log.lock().unwrap().len(), 1, "issued, then denied");
+        let last = audit_records(&path).pop().unwrap();
+        assert_eq!(last["denial"], "unprotected_default_branch");
+        assert_eq!(last["mode"], "write");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_pinned_read_only_agent_is_exempt_from_the_check() {
+        let path = audit_tmp("refpolicy-pinned-ro");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        // Mirror image: the fleet is push-capable, this agent pins itself
+        // read-only, so there is no ref to police.
+        let (state, mint_log) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-unprotected", Some("key-ro")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            mint_log.lock().unwrap()[0].1["permissions"],
+            serde_json::json!({"contents": "read"})
+        );
         std::fs::remove_file(&path).ok();
     }
 

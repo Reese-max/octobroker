@@ -34,18 +34,20 @@ const VERIFY_TTL: Duration = Duration::from_secs(3600);
 /// singleflight waiter queue — or a credential request — indefinitely.
 const MINT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Ceiling for the ref-policy protection reads (#49). Kept below the client
-/// helper's own budget (`obk` abandons a credential request after 15s) so a
-/// slow GitHub answer becomes a clean fail-closed denial here instead of a
-/// client-side timeout.
+/// Ceiling for the ref-policy protection reads (#49). It bounds THIS phase:
+/// a slow GitHub answer becomes a clean fail-closed denial here instead of
+/// piling up behind the connection ceiling, and it is deliberately shorter
+/// than the client helper's own budget.
 const PROTECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a *positive* protection verdict may be reused (#49). GitHub
 /// applies branch protection / rulesets out of band, so a short window keeps
 /// a push-heavy agent from spending two API calls per git operation while
-/// bounding how long a just-removed protection could still pass. Only
-/// positives are cached: a denial or an unreadable answer is always
-/// re-checked, so fixing a repository takes effect immediately.
+/// bounding how long a stale pass-through can last: protection removed — or
+/// the default branch switched to an unprotected one — can still pass for at
+/// most this long (the verdict is keyed per repository, not per branch).
+/// Only positives are cached: a denial or an unreadable answer is always
+/// re-checked, so hardening a repository takes effect immediately.
 const PROTECT_TTL: Duration = Duration::from_secs(60);
 
 /// Cap on cached protection verdicts. A wildcard-allowlisted agent can name
@@ -86,6 +88,9 @@ pub struct AppTokenProvider {
     /// Ref-policy protection verdicts (`owner/repo` → expiry), positives
     /// only, bounded by PROTECT_CACHE_MAX (#49).
     protected_branches: Mutex<HashMap<String, u64>>,
+    /// Ceiling for the protection reads (PROTECT_TIMEOUT). A field so tests
+    /// can shrink it and prove the bound actually fires.
+    protect_timeout: Duration,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +139,7 @@ impl AppTokenProvider {
             mint_locks: Mutex::new(HashMap::new()),
             verified_owner: Mutex::new(None),
             protected_branches: Mutex::new(HashMap::new()),
+            protect_timeout: PROTECT_TIMEOUT,
         })
     }
 
@@ -395,15 +401,15 @@ impl AppTokenProvider {
             return Ok(crate::ref_policy::Protection::Protected);
         }
         let repo_url = repo_url(&self.api_base, owner, repository)?;
-        let branch = tokio::time::timeout(PROTECT_TIMEOUT, async {
+        let verdict = tokio::time::timeout(self.protect_timeout, async {
             let repo = self.get_json(&repo_url, token).await?;
-            let branch = crate::ref_policy::default_branch(&repo).ok_or_else(|| {
+            let branch_name = crate::ref_policy::default_branch(&repo).ok_or_else(|| {
                 format!(
                     "repository {}/{} reports no default branch",
                     owner, repository
                 )
             })?;
-            let branch_url = branch_url(&self.api_base, owner, repository, branch)?;
+            let branch_url = branch_url(&self.api_base, owner, repository, branch_name)?;
             let branch_value = self.get_json(&branch_url, token).await?;
             Ok::<crate::ref_policy::Protection, String>(
                 crate::ref_policy::default_branch_protected(Some(&repo), Some(&branch_value)),
@@ -415,13 +421,13 @@ impl AppTokenProvider {
                 "protection check for {}/{} exceeded {}s",
                 owner,
                 repository,
-                PROTECT_TIMEOUT.as_secs()
+                self.protect_timeout.as_secs()
             )
         })??;
-        if branch == crate::ref_policy::Protection::Protected {
+        if verdict == crate::ref_policy::Protection::Protected {
             self.remember_protected(owner, repository);
         }
-        Ok(branch)
+        Ok(verdict)
     }
 
     /// Drop every cached git credential for `repository` (both permission
@@ -556,16 +562,20 @@ fn parse_rfc3339_unix(s: &str) -> Option<u64> {
 }
 
 /// `<api_base>/repos/<owner>/<repo>` with owner and repository carried as
-/// path segments. Repository names may contain `.` — including a bare `..`,
-/// which a raw interpolation would let the URL parser collapse into a
-/// different route.
+/// path segments, so neither can introduce a query, a fragment, or an extra
+/// path element. A dot-only name is refused HERE rather than relied upon
+/// upstream: pushing one does not encode it, and `..` would resolve to the
+/// owner's own endpoint.
 fn repo_url(api_base: &str, owner: &str, repository: &str) -> Result<String, String> {
+    if matches!(repository, "." | "..") {
+        return Err(format!("invalid repository name '{}'", repository));
+    }
     let mut url = reqwest::Url::parse(&format!("{}/repos", api_base))
         .map_err(|e| format!("invalid repository URL: {}", e))?;
     let mut segments = url
         .path_segments_mut()
         .map_err(|_| "api_base is not a hierarchical URL".to_string())?;
-    segments.pop_if_empty().push(owner).push(repository);
+    segments.push(owner).push(repository);
     drop(segments);
     Ok(url.to_string())
 }
@@ -586,7 +596,7 @@ fn branch_url(
         let mut segments = url
             .path_segments_mut()
             .map_err(|_| "repository path is not a valid URL base".to_string())?;
-        segments.pop_if_empty().push("branches").push(branch);
+        segments.push("branches").push(branch);
     }
     Ok(url.to_string())
 }
@@ -862,14 +872,16 @@ pub(crate) mod tests {
             "https://api.github.com/repos/openabdev/openab"
         );
         // A name carrying URL-significant characters can only ever be a path
-        // segment: it must not introduce a query or a fragment. (A dot-only
-        // name is additionally refused by the /git-credential charset check
-        // before any URL is built.)
-        for name in ["..", "a?b=c", "a#b", "openab/../escape"] {
+        // segment: it must not introduce a query or a fragment.
+        for name in ["a?b=c", "a#b", "openab/../escape"] {
             let url = repo_url("https://api.github.com", "acme", name).unwrap();
             assert!(!url.contains('?'), "{} rewrote the query: {}", name, url);
             assert!(!url.contains('#'), "{} added a fragment: {}", name, url);
         }
+        // Dot-only names are refused locally, not merely encoded: `..`
+        // would otherwise resolve to the owner's own endpoint.
+        assert!(repo_url("https://api.github.com", "acme", "..").is_err());
+        assert!(repo_url("https://api.github.com", "acme", ".").is_err());
         assert!(repo_url("not-a-url", "o", "r").is_err());
     }
 
@@ -903,6 +915,90 @@ pub(crate) mod tests {
     #[test]
     fn test_branch_url_rejects_a_non_http_base() {
         assert!(branch_url("not-a-url", "o", "r", "main").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_protection_read_is_bounded() {
+        use axum::{extract::Path, routing::get, Router};
+
+        // Repository metadata answers immediately; the branch read hangs.
+        let app = Router::new()
+            .route(
+                "/repos/{owner}/{repo}",
+                get(|| async { axum::Json(serde_json::json!({"default_branch": "main"})) }),
+            )
+            .route(
+                "/repos/{owner}/{repo}/branches/{*branch}",
+                get(|Path((_o, _r, _b)): Path<(String, String, String)>| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    axum::Json(serde_json::json!({"name": "main", "protected": true}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(1),
+            None,
+            format!("http://{}", addr),
+        )
+        .unwrap();
+        // Shrink the production ceiling so the bound is observable in a test.
+        p.protect_timeout = std::time::Duration::from_millis(50);
+        let err = p
+            .default_branch_protected("openabdev", "openab", "ghs_token")
+            .await
+            .unwrap_err();
+        assert!(err.contains("exceeded"), "unexpected error: {}", err);
+        // A timed-out check proves nothing and must not be cached as a pass.
+        assert!(p.protected_verdict("openabdev", "openab").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_protection_check_rejects_non_2xx_answers() {
+        use axum::{extract::Path, http::StatusCode, routing::get, Router};
+
+        // GitHub rate limiting and permission errors arrive as non-2xx with a
+        // perfectly parsable JSON body: without the status check such a body
+        // would read as "no protection" instead of "no answer".
+        let app = Router::new()
+            .route(
+                "/repos/{owner}/{repo}",
+                get(|| async { axum::Json(serde_json::json!({"default_branch": "main"})) }),
+            )
+            .route(
+                "/repos/{owner}/{repo}/branches/{*branch}",
+                get(|Path((_o, _r, _b)): Path<(String, String, String)>| async {
+                    axum::response::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            "{\"message\":\"API rate limit exceeded\"}",
+                        ))
+                        .unwrap()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(1),
+            None,
+            format!("http://{}", addr),
+        )
+        .unwrap();
+        let err = p
+            .default_branch_protected("openabdev", "openab", "ghs_token")
+            .await
+            .unwrap_err();
+        assert!(err.contains("403"), "unexpected error: {}", err);
+        assert!(p.protected_verdict("openabdev", "openab").is_none());
     }
 
     #[test]
