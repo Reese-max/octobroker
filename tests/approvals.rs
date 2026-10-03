@@ -79,7 +79,7 @@ fn pending_record_is_durable_and_deduped() {
     assert_eq!(lines[0]["tool"], "merge_pull_request");
     assert_eq!(lines[0]["repo"], "o/r");
     assert_eq!(lines[0]["status"], "pending");
-    assert!(lines[0]["expires_at"].as_u64().unwrap() > 0);
+    assert!(lines[0]["expires_at_ms"].as_u64().unwrap() > 0);
     assert!(!lines[0].to_string().contains("\"pull_number\":7"));
 
     // Listed as pending.
@@ -298,4 +298,273 @@ fn open_fails_loudly_on_bad_path() {
         .err()
         .unwrap();
     assert!(!err.is_empty());
+}
+
+#[test]
+fn gate_dedup_is_scoped_to_agent_and_tool() {
+    // One agent's approval must never be handed to a different agent, even
+    // for a byte-identical call: the dedup key is (agent, tool, args hash).
+    let (path, store) = open("dedup-scope", 900);
+    let args = serde_json::json!({"owner": "o", "repo": "r", "pull_number": 7});
+    let h = hash("merge_pull_request", args.clone());
+
+    let id_a = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    let id_b = pending_id(
+        store
+            .gate("bot-b", "merge_pull_request", &h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    assert_ne!(id_a, id_b, "a second agent must get its own request");
+
+    // Same agent, different tool → different request.
+    let id_other_tool = pending_id(
+        store
+            .gate("bot-a", "push_files", &h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    assert_ne!(id_a, id_other_tool, "the tool is part of the dedup key");
+
+    // bot-b cannot consume bot-a's approval, even after it is approved.
+    store.decide(&id_a, true).unwrap();
+    assert!(matches!(
+        store.consume(&id_a, "bot-b", "merge_pull_request", &h),
+        Err(ConsumeError::NotApproved) | Err(ConsumeError::NotFound)
+    ));
+    // bot-a still can.
+    assert!(store
+        .consume(&id_a, "bot-a", "merge_pull_request", &h)
+        .is_ok());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn consumed_approval_stays_consumed_across_restart() {
+    // Single-use must survive a restart: a consumed record replays as
+    // consumed, so the same call needs a fresh approval instead of
+    // re-arming on the durable log.
+    let (path, store) = open("consume-restart", 900);
+    let h = hash("merge_pull_request", serde_json::json!({"owner": "o"}));
+    let id = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    store.decide(&id, true).unwrap();
+    assert!(store
+        .consume(&id, "bot-a", "merge_pull_request", &h)
+        .is_ok());
+    drop(store);
+
+    let store = ApprovalStore::open(&path, 900).unwrap();
+    assert_eq!(
+        store.get(&id).map(|a| a.status),
+        Some(ApprovalStatus::Consumed),
+        "a consumed approval must not replay as approved"
+    );
+    // The retry must go back through the human gate with a NEW id.
+    let fresh = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    assert_ne!(fresh, id);
+    assert!(store
+        .consume(&id, "bot-a", "merge_pull_request", &h)
+        .is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn replay_refuses_a_corrupt_log_rather_than_weakening_state() {
+    // A torn tail (crash between write_all and the next append) merges two
+    // records into one unparseable line. Skipping it silently would drop a
+    // `denied` decision and resurrect the call as approvable.
+    let (path, store) = open("corrupt", 900);
+    let h = hash("merge_pull_request", serde_json::json!({"owner": "o"}));
+    let id = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    store.decide(&id, false).unwrap();
+    drop(store);
+
+    // Keep the request record, tear the decision record mid-write.
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let torn = lines.pop().unwrap();
+    let truncated: String = torn.chars().take(torn.len() / 2).collect();
+    lines.push(truncated);
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let err = ApprovalStore::open(&path, 900).err().expect(
+        "a corrupt approval log must fail loudly at startup instead of replaying weaker state",
+    );
+    assert!(err.contains("cannot replay approval log"), "{}", err);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn replay_tolerates_blank_lines() {
+    // Blank separators are not corruption and must not brick startup.
+    let (path, store) = open("blank", 900);
+    let h = hash("merge_pull_request", serde_json::json!({"owner": "o"}));
+    let id = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    store.decide(&id, true).unwrap();
+    drop(store);
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("\n{}\n\n", raw)).unwrap();
+    let store = ApprovalStore::open(&path, 900).unwrap();
+    match store
+        .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+        .unwrap()
+    {
+        GateDecision::Approved { id: got } => assert_eq!(got, id),
+        GateDecision::Pending { id, .. } => panic!("approval lost across blank lines: {}", id),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn open_fails_loudly_on_an_unreadable_log() {
+    // An audit file the process can append to but not read means the
+    // forensic trail and the live state have diverged — refuse to start
+    // rather than silently reconstruct empty approval state.
+    use std::os::unix::fs::PermissionsExt;
+    let (path, _store) = open("unreadable", 900);
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&path, perms).unwrap();
+    // root ignores mode bits; then the fixture cannot express the case.
+    if std::fs::read_to_string(&path).is_ok() {
+        std::fs::remove_file(&path).ok();
+        return;
+    }
+    assert!(ApprovalStore::open(&path, 900).is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn terminal_records_are_pruned_so_the_working_set_stays_bounded() {
+    // An agent that keeps retrying (and an operator that keeps denying)
+    // must not grow the in-memory working set without bound. The JSONL
+    // stays the full history; only live work is retained.
+    let (path, store) = open("prune", 900);
+
+    for round in 0..25u64 {
+        let h = hash(
+            "merge_pull_request",
+            serde_json::json!({"owner": "o", "n": round}),
+        );
+        let id = pending_id(
+            store
+                .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+                .unwrap(),
+        );
+        store.decide(&id, false).unwrap();
+    }
+    // 25 requests were denied, each superseded by the next gate call: only
+    // the most recent terminal record is still held.
+    assert_eq!(store.list(None).len(), 1);
+
+    // The next call prunes it and opens a fresh one.
+    let fresh_h = hash("merge_pull_request", serde_json::json!({"owner": "fresh"}));
+    store
+        .gate("bot-a", "merge_pull_request", &fresh_h, &[], Some("o/r"))
+        .unwrap();
+    assert_eq!(store.list(None).len(), 1);
+    assert!(
+        store.list(Some("denied")).is_empty(),
+        "a superseded denial must not accumulate"
+    );
+
+    // An approved-but-unconsumed record IS live and must survive pruning.
+    let live_h = hash("merge_pull_request", serde_json::json!({"owner": "live"}));
+    let live_id = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &live_h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    store.decide(&live_id, true).unwrap();
+    store
+        .gate("bot-a", "push_files", &fresh_h, &[], Some("o/r"))
+        .unwrap();
+    assert_eq!(
+        store.get(&live_id).map(|a| a.status),
+        Some(ApprovalStatus::Approved)
+    );
+
+    // Pruning is a memory concern only — the durable trail keeps every
+    // request and decision that was ever written.
+    let lines = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        lines
+            .lines()
+            .filter(|l| l.contains("approval_request"))
+            .count(),
+        28
+    );
+    assert_eq!(
+        lines
+            .lines()
+            .filter(|l| l.contains("approval_decision"))
+            .count(),
+        26
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn approval_timestamps_are_unix_milliseconds() {
+    // One unit across the record: expires_at_ms - created_ts_ms is the real
+    // window. Mixing seconds and milliseconds silently corrupts operator
+    // arithmetic on the endpoint that unblocks a high-risk write.
+    let (path, store) = open("units", 900);
+    let h = hash("merge_pull_request", serde_json::json!({"owner": "o"}));
+    let id = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    store.decide(&id, true).unwrap();
+    store
+        .consume(&id, "bot-a", "merge_pull_request", &h)
+        .unwrap();
+
+    let a = store.get(&id).unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // Sanity: a plausible millisecond clock, not a second clock.
+    assert!(a.created_ts_ms > 1_000_000_000_000, "{}", a.created_ts_ms);
+    assert!(a.created_ts_ms <= now_ms + 5_000);
+    assert_eq!(a.expires_at_ms - a.created_ts_ms, 900 * 1000);
+    assert!(a.decided_ts_ms.unwrap() >= a.created_ts_ms);
+    assert!(a.consumed_ts_ms.unwrap() >= a.decided_ts_ms.unwrap());
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(
+        lines[0].get("expires_at_ms").is_some(),
+        "the durable record names its unit"
+    );
+    assert!(lines[0].get("expires_at").is_none());
+    std::fs::remove_file(&path).ok();
 }

@@ -7,7 +7,7 @@
 //! high-risk write is a different trust decision than holding an agent's
 //! bounded allowlist.
 //!
-//!   GET  /approvals[?status=pending|approved|denied|consumed|expired]
+//!   GET  /approvals[?status=pending|approved|denied|consumed|expired|all]
 //!   GET  /approvals/{id}
 //!   POST /approvals/{id}/approve
 //!   POST /approvals/{id}/deny
@@ -15,6 +15,7 @@
 //! Requests:
 //!   GET /approvals                                    → pending records
 //!   GET /approvals?status=all                         → every record
+//!   GET /approvals?status=pendings                     → 400 (typo guard)
 //!   POST /approvals/apv_…/approve  (operator key)     → 200 + record
 //!
 //! Decisions are single-shot (409 on re-decision/expired/unknown-consume
@@ -73,10 +74,13 @@ fn store(state: &AppState) -> Result<&crate::approvals::ApprovalStore, Box<Respo
     })
 }
 
+/// Every timestamp is unix milliseconds so `expires_at_ms - created_ts_ms`
+/// is the real window; mixing units here would silently corrupt operator
+/// arithmetic on the one endpoint that unblocks a high-risk write.
 fn approval_json(a: &Approval) -> Value {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     serde_json::json!({
         "id": a.id,
@@ -86,12 +90,17 @@ fn approval_json(a: &Approval) -> Value {
         "arg_keys": a.arg_keys,
         "args_hash": a.args_hash,
         "status": a.effective_status(now),
-        "created_ts": a.created_ts,
-        "expires_at": a.expires_at,
-        "decided_ts": a.decided_ts,
-        "consumed_ts": a.consumed_ts,
+        "created_ts_ms": a.created_ts_ms,
+        "expires_at_ms": a.expires_at_ms,
+        "decided_ts_ms": a.decided_ts_ms,
+        "consumed_ts_ms": a.consumed_ts_ms,
     })
 }
+
+/// Statuses `?status=` accepts. `all` disables the filter.
+const STATUS_FILTERS: [&str; 7] = [
+    "all", "pending", "approved", "denied", "consumed", "expired", "",
+];
 
 pub async fn list_approvals(
     State(state): State<Arc<AppState>>,
@@ -110,6 +119,15 @@ pub async fn list_approvals(
         .get("status")
         .map(|s| s.as_str())
         .unwrap_or("pending");
+    // A typo must not read as "nothing pending" on the endpoint operators
+    // poll while a high-risk write waits — that is indistinguishable from
+    // an empty queue.
+    if !STATUS_FILTERS.contains(&status) {
+        return rpc_error(
+            StatusCode::BAD_REQUEST,
+            "unknown status filter — expected one of: all, pending, approved, denied, consumed, expired",
+        );
+    }
     let records = store.list(if status == "all" { None } else { Some(status) });
     let body = serde_json::json!({
         "approvals": records.iter().map(approval_json).collect::<Vec<_>>()
@@ -333,6 +351,74 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "key {:?}", key);
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_unknown_status_filter_is_rejected() {
+        // A typo must not read as an empty queue on the endpoint operators
+        // poll while a high-risk write waits — that is indistinguishable
+        // from "nothing needs you".
+        let path = approvals_tmp("bad-status");
+        let state = test_state(&path, "op-key", true);
+        make_pending(&state, "deadbeef");
+        for bad in ["pendings", "Pending", "approve", "granted"] {
+            let resp = app(state.clone())
+                .oneshot(req(
+                    "GET",
+                    &format!("/approvals?status={}", bad),
+                    Some("op-key"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "status={:?} must be rejected, not silently empty",
+                bad
+            );
+        }
+        // The documented filters all work.
+        for good in [
+            "all", "pending", "approved", "denied", "consumed", "expired",
+        ] {
+            let resp = app(state.clone())
+                .oneshot(req(
+                    "GET",
+                    &format!("/approvals?status={}", good),
+                    Some("op-key"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "status={}", good);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_record_exposes_millisecond_timestamps() {
+        // Every timestamp in one record uses the same unit, so
+        // expires_at_ms - created_ts_ms is the real approval window.
+        let path = approvals_tmp("units-api");
+        let state = test_state(&path, "op-key", true);
+        let id = make_pending(&state, "deadbeef");
+        let resp = app(state.clone())
+            .oneshot(req("GET", &format!("/approvals/{}", id), Some("op-key")))
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        let created = v["created_ts_ms"].as_u64().expect("created_ts_ms");
+        let expires = v["expires_at_ms"].as_u64().expect("expires_at_ms");
+        assert!(created > 1_000_000_000_000, "milliseconds, not seconds");
+        assert_eq!(expires - created, 900 * 1000);
+        for legacy in ["created_ts", "expires_at", "decided_ts", "consumed_ts"] {
+            assert!(
+                v.get(legacy).is_none(),
+                "ambiguous field {} removed",
+                legacy
+            );
+        }
+        assert!(v["decided_ts_ms"].is_null());
         std::fs::remove_file(&path).ok();
     }
 

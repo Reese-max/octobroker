@@ -136,7 +136,10 @@ pub struct ApprovalsConfig {
     /// write is a different trust decision than holding an agent's
     /// bounded allowlist.
     pub operator_key: String,
-    /// TTL (seconds) for pending and approved records alike.
+    /// TTL (seconds) for pending and approved records alike. Bounded to
+    /// (0, MAX_APPROVAL_TTL_SECS]: a zero TTL makes every record expire the
+    /// instant it is written, so an operator could never decide one and
+    /// every agent call would mint a fresh undecidable request.
     #[serde(default = "default_approval_ttl_secs")]
     pub ttl_secs: u64,
 }
@@ -144,6 +147,11 @@ pub struct ApprovalsConfig {
 fn default_approval_ttl_secs() -> u64 {
     900
 }
+
+/// Upper bound on `[mcp.approvals] ttl_secs` — an approval is a
+/// point-of-no-return grant for a high-blast-radius write, so it must not
+/// be configurable into "effectively never expires".
+pub const MAX_APPROVAL_TTL_SECS: u64 = 86_400;
 
 /// Durable audit configuration.
 #[derive(Clone, Deserialize)]
@@ -340,6 +348,12 @@ impl McpConfig {
         if let Some(ap) = &self.approvals {
             if ap.operator_key.trim().is_empty() {
                 return Err("[mcp.approvals] operator_key must not be empty".into());
+            }
+            if ap.ttl_secs == 0 || ap.ttl_secs > MAX_APPROVAL_TTL_SECS {
+                return Err(format!(
+                    "[mcp.approvals] ttl_secs must be between 1 and {} — an approval that expires instantly can never be decided, and one that never expires is not a human gate",
+                    MAX_APPROVAL_TTL_SECS
+                ));
             }
             if self.audit.is_none() {
                 return Err(
@@ -1097,5 +1111,184 @@ mod tests {
             ..Default::default()
         };
         assert!(m.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod approval_tier_tests {
+    use super::*;
+
+    fn agent(id: &str, key: &str, tools: &[&str], tools_approval: &[&str]) -> McpAgentConfig {
+        McpAgentConfig {
+            id: id.into(),
+            key: None,
+            keys: vec![key.into()],
+            tools: tools.iter().map(|s| s.to_string()).collect(),
+            tools_approval: tools_approval.iter().map(|s| s.to_string()).collect(),
+            repos: vec![],
+            git_credentials_read_only: None,
+        }
+    }
+
+    fn audit() -> Option<AuditConfig> {
+        Some(AuditConfig {
+            path: "/tmp/a.jsonl".into(),
+            max_result_bytes: 1024,
+        })
+    }
+
+    fn app() -> Option<GithubAppConfig> {
+        Some(GithubAppConfig {
+            app_id: "1".into(),
+            private_key: "pem".into(),
+            installation_id: Some(1),
+            owner: Some("openabdev".into()),
+        })
+    }
+
+    fn approvals(key: &str, ttl: u64) -> Option<ApprovalsConfig> {
+        Some(ApprovalsConfig {
+            operator_key: key.into(),
+            ttl_secs: ttl,
+        })
+    }
+
+    /// The smallest valid approval-tier deployment: one agent with one
+    /// approval-tier tool, App backend, audit sink, operator key.
+    fn valid() -> McpConfig {
+        McpConfig {
+            enable_writes: true,
+            agents: vec![agent(
+                "bot",
+                "agent-key",
+                &["issue_read"],
+                &["merge_pull_request"],
+            )],
+            github_app: app(),
+            audit: audit(),
+            approvals: approvals("operator-key", 900),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn approval_tier_toml_roundtrips() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+[[identities]]
+id = "alice"
+token = "t"
+
+[mcp]
+enabled = true
+enable_writes = true
+
+[mcp.audit]
+path = "/tmp/a.jsonl"
+
+[mcp.approvals]
+operator_key = "env:OCTOBROKER_OPERATOR_KEY"
+ttl_secs = 120
+
+[[mcp.agents]]
+id = "bot"
+key = "env:OCTOBROKER_KEY_BOT"
+tools = ["issue_read"]
+tools_approval = ["merge_pull_request"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(raw.mcp.agents[0].tools_approval, vec!["merge_pull_request"]);
+        assert_eq!(raw.mcp.approvals.as_ref().unwrap().ttl_secs, 120);
+        // Defaults apply when the key is omitted entirely.
+        let raw: RawConfig = toml::from_str(
+            r#"
+[[identities]]
+id = "alice"
+token = "t"
+
+[[mcp.agents]]
+id = "bot"
+key = "k"
+"#,
+        )
+        .unwrap();
+        assert!(raw.mcp.agents[0].tools_approval.is_empty());
+        assert!(raw.mcp.approvals.is_none());
+    }
+
+    #[test]
+    fn valid_approval_tier_passes() {
+        valid()
+            .validate()
+            .expect("baseline approval config must be valid");
+    }
+
+    #[test]
+    fn tool_cannot_be_in_two_policy_tiers() {
+        let mut m = valid();
+        m.agents[0].tools = vec!["issue_read".into(), "merge_pull_request".into()];
+        let err = m.validate().unwrap_err();
+        assert!(err.contains("both tools and tools_approval"), "{}", err);
+    }
+
+    #[test]
+    fn approval_tier_requires_operator_endpoint_and_write_stack() {
+        // No [mcp.approvals] → nobody could ever approve a pending record.
+        let mut m = valid();
+        m.approvals = None;
+        assert!(m.validate().unwrap_err().contains("[mcp.approvals]"));
+
+        // An approved call executes as a write, so writes must be enabled.
+        let mut m = valid();
+        m.enable_writes = false;
+        assert!(
+            m.validate().unwrap_err().contains("enable_writes"),
+            "{}",
+            m.validate().unwrap_err()
+        );
+    }
+
+    #[test]
+    fn operator_endpoint_requires_audit_and_a_bounded_ttl() {
+        let mut m = valid();
+        m.audit = None;
+        assert!(m.validate().unwrap_err().contains("[mcp.audit]"));
+
+        // A zero TTL can never be decided; an unbounded TTL is not a human gate.
+        for bad in [0, MAX_APPROVAL_TTL_SECS + 1] {
+            let mut m = valid();
+            m.approvals = approvals("operator-key", bad);
+            assert!(
+                m.validate().unwrap_err().contains("ttl_secs"),
+                "ttl={}",
+                bad
+            );
+        }
+        // The boundary values are accepted.
+        for good in [1, MAX_APPROVAL_TTL_SECS] {
+            let mut m = valid();
+            m.approvals = approvals("operator-key", good);
+            assert!(m.validate().is_ok(), "ttl={}", good);
+        }
+    }
+
+    #[test]
+    fn operator_key_must_be_separate_from_every_agent_key() {
+        // The core of the auth-separation guarantee: an agent must never
+        // hold the credential that approves its own call.
+        let mut m = valid();
+        m.approvals = approvals("agent-key", 900);
+        let err = m.validate().unwrap_err();
+        assert!(err.contains("duplicates agent 'bot' key"), "{}", err);
+
+        // Rotated keys count too, not just the primary one.
+        let mut m = valid();
+        m.agents[0].keys = vec!["k1".into(), "operator-key".into()];
+        assert!(m.validate().unwrap_err().contains("duplicates agent"));
+
+        let mut m = valid();
+        m.approvals = approvals("   ", 900);
+        assert!(m.validate().unwrap_err().contains("must not be empty"));
     }
 }

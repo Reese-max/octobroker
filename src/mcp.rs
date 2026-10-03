@@ -205,13 +205,34 @@ pub async fn mcp_proxy(
                         }
                     }
                 }
-                // 4. Human-approval tier (#51): allowed in principle, but
-                //    each individual call requires a prior operator
-                //    decision. Placed AFTER every deny rule so denied
-                //    calls never create approval records (deny wins), and
-                //    BEFORE credential resolution so a pending call never
-                //    mints a token. A pending request does not consume the
-                //    in-flight write cap (acquired below, post-gate).
+            }
+
+            // Local octobroker-owned tools are writes even when the upstream policy block
+            // is bypassed (for example, in no-agent/network-trust mode). Keep the
+            // local mutation path fail-closed and before credential resolution.
+            // This is a deny rule, so it runs BEFORE the approval gate below —
+            // a call this rejects must never leave an approval record behind.
+            if let Some(local) = frame.tool.as_deref().filter(|t| is_local_tool(t)) {
+                if agent.is_none() || !state.config.mcp.enable_writes {
+                    tracing::warn!(
+                        "MCP tools/call {} DENIED (local write tools require an authenticated write-enabled agent)",
+                        local
+                    );
+                    return tool_call_denied(
+                        frame.rpc_id.as_ref(),
+                        "local write tools require an authenticated write-enabled agent",
+                    );
+                }
+            }
+
+            // 4. Human-approval tier (#51): allowed in principle, but
+            //    each individual call requires a prior operator
+            //    decision. Placed AFTER every deny rule so denied
+            //    calls never create approval records (deny wins), and
+            //    BEFORE credential resolution so a pending call never
+            //    mints a token. A pending request does not consume the
+            //    in-flight write cap (acquired below, post-gate).
+            if let (Some(tool_name), Some(agent)) = (frame.tool.as_deref(), agent) {
                 if agent.tools_approval.iter().any(|t| t == tool_name) {
                     let Some(store) = state.approvals.as_ref() else {
                         // Startup validation guarantees the store exists
@@ -222,8 +243,8 @@ pub async fn mcp_proxy(
                             agent.id,
                             session_suffix(session_id.as_deref())
                         );
-                        return rpc_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
+                        return tool_call_unavailable(
+                            frame.rpc_id.as_ref(),
                             "approval backend unavailable",
                         );
                     };
@@ -249,7 +270,7 @@ pub async fn mcp_proxy(
                             approved_consume =
                                 Some((id, agent.id.clone(), tool_name.to_string(), args_hash));
                         }
-                        Ok(crate::approvals::GateDecision::Pending { id, expires_at }) => {
+                        Ok(crate::approvals::GateDecision::Pending { id, expires_at_ms }) => {
                             tracing::warn!(
                                 "MCP tools/call {} PENDING approval {} [agent={}]{}",
                                 tool_name,
@@ -260,7 +281,7 @@ pub async fn mcp_proxy(
                             return tool_call_pending_approval(
                                 frame.rpc_id.as_ref(),
                                 &id,
-                                expires_at,
+                                expires_at_ms,
                             );
                         }
                         Err(e) => {
@@ -271,34 +292,14 @@ pub async fn mcp_proxy(
                                 "approval store unavailable — rejecting call (fail-closed): {}",
                                 e
                             );
-                            return rpc_error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "approval backend unavailable — write rejected",
+                            return tool_call_unavailable(
+                                frame.rpc_id.as_ref(),
+                                "approval backend unavailable — retry later",
                             );
                         }
                     }
                 }
             }
-        }
-    }
-
-    // Local octobroker-owned tools are writes even when the upstream policy block
-    // is bypassed (for example, in no-agent/network-trust mode). Keep the
-    // local mutation path fail-closed and before credential resolution.
-    if let Some(local) = frame
-        .as_ref()
-        .and_then(|f| f.tool.as_deref())
-        .filter(|t| is_local_tool(t))
-    {
-        if agent.is_none() || !state.config.mcp.enable_writes {
-            tracing::warn!(
-                "MCP tools/call {} DENIED (local write tools require an authenticated write-enabled agent)",
-                local
-            );
-            return tool_call_denied(
-                frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
-                "local write tools require an authenticated write-enabled agent",
-            );
         }
     }
 
@@ -449,8 +450,8 @@ pub async fn mcp_proxy(
     // call (fail-closed).
     if let Some((approval_id, c_agent, c_tool, c_hash)) = &approved_consume {
         let Some(store) = state.approvals.as_ref() else {
-            return rpc_error(
-                StatusCode::SERVICE_UNAVAILABLE,
+            return tool_call_unavailable(
+                frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
                 "approval backend unavailable",
             );
         };
@@ -461,9 +462,9 @@ pub async fn mcp_proxy(
                     "approval consume record not durable — rejecting call (fail-closed): {}",
                     e
                 );
-                return rpc_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "approval backend unavailable — write rejected",
+                return tool_call_unavailable(
+                    frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+                    "approval backend unavailable — retry later",
                 );
             }
             Err(e) => {
@@ -977,6 +978,22 @@ fn tool_call_denied(rpc_id: Option<&serde_json::Value>, message: &str) -> Respon
     )
 }
 
+/// Fail-closed rejection on a `tools/call` caused by unavailable broker
+/// infrastructure (audit sink, approval store) rather than by policy.
+/// Same correlation reasoning as `tool_call_denied`: a protocol-level
+/// `rpc_error` carries `id: null`, which strict JSON-RPC clients cannot
+/// correlate — the agent hangs on a call that will never be answered
+/// (#58). Echoing the id as a tool error keeps the call answerable and
+/// tells the model the retry is safe; the call still never executes.
+fn tool_call_unavailable(rpc_id: Option<&serde_json::Value>, message: &str) -> Response {
+    tool_response(
+        rpc_id,
+        true,
+        StatusCode::OK,
+        format!("octobroker could not authorize this call: {}", message),
+    )
+}
+
 /// Approval-tier gate (#51): the call is policy-allowed but has no
 /// operator decision yet. Returned as a *successful* JSON-RPC response
 /// carrying a tool-level error — like `tool_call_denied`, so the request
@@ -986,7 +1003,7 @@ fn tool_call_denied(rpc_id: Option<&serde_json::Value>, message: &str) -> Respon
 fn tool_call_pending_approval(
     rpc_id: Option<&serde_json::Value>,
     approval_id: &str,
-    expires_at: u64,
+    expires_at_ms: u64,
 ) -> Response {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -994,13 +1011,13 @@ fn tool_call_pending_approval(
         "result": {
             "isError": true,
             "content": [{"type": "text", "text": format!(
-                "octobroker: this call requires human approval and is pending (approval_id={}, expires_at={}). An operator must approve it via the /approvals management API; then retry the identical call.",
-                approval_id, expires_at
+                "octobroker: this call requires human approval and is pending (approval_id={}, expires_at_ms={}). An operator must approve it via the /approvals management API; then retry the identical call.",
+                approval_id, expires_at_ms
             )}],
             "approval": {
                 "id": approval_id,
                 "status": "pending",
-                "expires_at": expires_at,
+                "expires_at_ms": expires_at_ms,
             }
         }
     });
@@ -4353,6 +4370,18 @@ data: "id":1,"result":{"tools":[]}}
     ) -> Arc<AppState> {
         let sink = crate::audit::AuditSink::open(sink_path).unwrap();
         let store = crate::approvals::ApprovalStore::open(sink_path, 900).unwrap();
+        test_state_approvals_with(upstream, sink, Some(store), agents, max_inflight)
+    }
+
+    /// Same, with the approval store injected so a test can exercise the
+    /// branches where it is absent or cannot persist.
+    fn test_state_approvals_with(
+        upstream: &str,
+        sink: crate::audit::AuditSink,
+        store: Option<crate::approvals::ApprovalStore>,
+        agents: Vec<config::McpAgentConfig>,
+        max_inflight: usize,
+    ) -> Arc<AppState> {
         let cache_config = config::CacheConfig::default();
         let identities = vec![config::IdentityConfig {
             id: "alice".into(),
@@ -4395,7 +4424,7 @@ data: "id":1,"result":{"tools":[]}}
             multi_app_tokens: None,
             audit: Some(sink),
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            approvals: Some(store),
+            approvals: store,
         })
     }
 
@@ -4723,6 +4752,249 @@ data: "id":1,"result":{"tools":[]}}
             reqs[0].tools_hdr.as_deref(),
             Some("issue_read,merge_pull_request")
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Fail-closed on a tools/call must still be a correlated tool error.
+    /// A protocol-level `rpc_error` answers with `id: null`, which strict
+    /// JSON-RPC clients cannot correlate — the agent hangs forever on a
+    /// call that was already refused (#58).
+    async fn assert_correlated_tool_error(resp: Response, expected_id: i64, needle: &str) {
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["id"],
+            serde_json::json!(expected_id),
+            "fail-closed tools/call responses must echo the request id"
+        );
+        assert_eq!(v["result"]["isError"], serde_json::json!(true));
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(needle), "expected {:?} in {:?}", needle, text);
+    }
+
+    #[tokio::test]
+    async fn test_missing_approval_store_fails_closed_with_correlated_error() {
+        // Startup validation normally guarantees the store exists, but if
+        // it is ever absent the call must be refused — never allowed, and
+        // never answered with an uncorrelatable id.
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-no-store");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_approvals_with(
+            &url,
+            sink,
+            None,
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &["issue_read"],
+                &["merge_pull_request"],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MERGE_CALL, &[("x-octobroker-key", "key-w")]))
+            .await
+            .unwrap();
+        assert_correlated_tool_error(resp, 1, "approval backend unavailable").await;
+        assert!(captured.lock().unwrap().is_empty());
+        assert!(
+            read_audit(&path).is_empty(),
+            "an unavailable store must not record a pending request"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_unpersistable_approval_request_fails_closed() {
+        // The durable pending record is the only thing an operator could
+        // later act on. If it cannot be fsync'd, the call must not proceed
+        // — and the agent must learn why, with its id echoed back.
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-gate-fail");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_approvals_with(
+            &url,
+            sink,
+            Some(crate::approvals::ApprovalStore::failing_for_tests()),
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &["issue_read"],
+                &["merge_pull_request"],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MERGE_CALL, &[("x-octobroker-key", "key-w")]))
+            .await
+            .unwrap();
+        assert_correlated_tool_error(resp, 1, "could not authorize").await;
+        assert!(captured.lock().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_unpersistable_approval_consume_fails_closed_and_blocks_dispatch() {
+        // The consume record is the audit trail for an executed
+        // point-of-no-return write. If it cannot be fsync'd, the call must
+        // NOT reach the upstream — the approval stays armed and the agent
+        // gets a retryable, correlated error.
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-consume-fail");
+        let args = serde_json::json!({"owner":"openabdev","repo":"octobroker","pull_number":15});
+        let hash = crate::approvals::args_hash("merge_pull_request", Some(&args));
+        let exp_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            + 600_000;
+        let mut records = std::collections::HashMap::new();
+        records.insert(
+            "apv_test0000000001".to_string(),
+            crate::approvals::Approval {
+                id: "apv_test0000000001".to_string(),
+                agent: "bot-w".into(),
+                tool: "merge_pull_request".into(),
+                args_hash: hash.clone(),
+                repo: Some("openabdev/octobroker".into()),
+                arg_keys: vec!["owner".into(), "repo".into(), "pull_number".into()],
+                status: crate::approvals::ApprovalStatus::Approved,
+                created_ts_ms: 1,
+                expires_at_ms: exp_ms,
+                decided_ts_ms: Some(1),
+                consumed_ts_ms: None,
+            },
+        );
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_approvals_with(
+            &url,
+            sink,
+            Some(crate::approvals::ApprovalStore::failing_with_for_tests(
+                records,
+            )),
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &["issue_read"],
+                &["merge_pull_request"],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MERGE_CALL, &[("x-octobroker-key", "key-w")]))
+            .await
+            .unwrap();
+        assert_correlated_tool_error(resp, 1, "could not authorize").await;
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "an un-auditable consume must never reach the upstream"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_pending_approval_mints_no_credential() {
+        // The gate must sit before credential resolution, not merely before
+        // dispatch: an App-mode pending call must not mint an installation
+        // token at all. Asserting "no upstream request" cannot tell those
+        // apart — a mint is a separate HTTP call the mock records.
+        let minted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gh_app = {
+            let minted = minted.clone();
+            axum::Router::new().route(
+                "/app/installations/41/access_tokens",
+                axum::routing::post(move || {
+                    let minted = minted.clone();
+                    async move {
+                        minted.lock().unwrap().push(());
+                        let exp = time::OffsetDateTime::from_unix_timestamp((now() + 3600) as i64)
+                            .unwrap()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap();
+                        axum::Json(serde_json::json!({"token": "ghs_mock", "expires_at": exp}))
+                    }
+                }),
+            )
+        };
+        let gh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gh_addr = gh_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(gh_listener, gh_app).await.unwrap() });
+        let gh_url = format!("http://{}", gh_addr);
+
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("apv-no-mint");
+        let cache_config = config::CacheConfig::default();
+        let provider = crate::app_token::AppTokenProvider::new(
+            "12345".into(),
+            crate::app_token::tests::TEST_RSA_PEM,
+            Some(41),
+            None,
+            gh_url,
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            pool: pool::PatPool::new(&[]), // App backend only: a mint is required
+            cache: cache::Cache::new(&cache_config),
+            config: config::Config {
+                port: 8080,
+                identities: vec![],
+                allowed_owners: vec!["openabdev".to_string()],
+                cache: cache_config,
+                mcp: config::McpConfig {
+                    enabled: true,
+                    enable_writes: true,
+                    enable_git_credentials: false,
+                    git_credentials_read_only: false,
+                    upstream: Some(url.clone()),
+                    toolsets: vec![],
+                    session_ttl_secs: 3600,
+                    max_inflight_writes: 4,
+                    agents: vec![agent_with_approval(
+                        "bot-w",
+                        "key-w",
+                        &["issue_read"],
+                        &["merge_pull_request"],
+                        &["openabdev/octobroker"],
+                    )],
+                    github_app: None,
+                    github_apps: Vec::new(),
+                    audit: Some(config::AuditConfig {
+                        path: "unused".into(),
+                        max_result_bytes: 1024 * 1024,
+                    }),
+                    approvals: Some(config::ApprovalsConfig {
+                        operator_key: "op-key".into(),
+                        ttl_secs: 900,
+                    }),
+                },
+            },
+            token_users: moka::future::Cache::builder().max_capacity(10).build(),
+            http: reqwest::Client::new(),
+            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+            app_tokens: Some(provider),
+            multi_app_tokens: None,
+            audit: Some(crate::audit::AuditSink::open(&path).unwrap()),
+            write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            approvals: Some(crate::approvals::ApprovalStore::open(&path, 900).unwrap()),
+        });
+
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MERGE_CALL, &[("x-octobroker-key", "key-w")]))
+            .await
+            .unwrap();
+        assert_pending_approval(resp, 1).await;
+        assert!(
+            minted.lock().unwrap().is_empty(),
+            "a pending approval must not mint an installation token"
+        );
+        assert!(captured.lock().unwrap().is_empty());
         std::fs::remove_file(&path).ok();
     }
 

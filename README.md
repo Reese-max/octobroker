@@ -430,7 +430,8 @@ ttl_secs = 900                              # bounds pending AND approved record
 Approval-tier tools require the same write stack as `enable_writes` (App
 credentials + audit): an approved call executes as a normal audited
 write. `tools` and `tools_approval` must not list the same tool name —
-startup fails on the overlap.
+startup fails on the overlap. `ttl_secs` must be between 1 and 86400: a
+zero TTL can never be decided, and an unbounded one is not a human gate.
 
 **Call flow.** A `tools/call` on an approval-tier tool runs every deny
 rule first (tool allowlist, write gate, repository allowlist — denied
@@ -444,8 +445,8 @@ error that correlates the request id:
 {"result": {
   "isError": true,
   "content": [{"type": "text", "text":
-    "octobroker: this call requires human approval and is pending (approval_id=apv_…, expires_at=…). An operator must approve it via the /approvals management API; then retry the identical call."}],
-  "approval": {"id": "apv_…", "status": "pending", "expires_at": …}}}
+    "octobroker: this call requires human approval and is pending (approval_id=apv_…, expires_at_ms=…). An operator must approve it via the /approvals management API; then retry the identical call."}],
+  "approval": {"id": "apv_…", "status": "pending", "expires_at_ms": …}}}
 ```
 
 Retrying the identical call returns the SAME approval id (deduped — one
@@ -455,9 +456,10 @@ in-flight write slot is consumed.
 
 **Operator decision.** `/approvals` answers a local 404 when
 `[mcp.approvals]` is not configured; otherwise every request needs
-`X-Octobroker-Operator-Key` (startup rejects an operator key that
-duplicates any agent key — approving a high-risk write is a different
-trust decision than holding an agent's bounded allowlist):
+`X-Octobroker-Operator-Key`. When the MCP proxy is enabled, startup
+validation rejects an operator key that duplicates any agent key —
+approving a high-risk write is a different trust decision than holding
+an agent's bounded allowlist:
 
 ```
 GET  /approvals[?status=pending|approved|denied|consumed|expired|all]
@@ -469,7 +471,18 @@ POST /approvals/{id}/deny
 Decisions are single-shot (`409` on re-decision or expiry) and durable:
 `approval_decision` records are fsync'd before state changes, and the
 store replays the JSONL at startup so pending/approved state survives
-restarts.
+restarts. An unrecognised `status` filter is a `400` rather than an
+empty list — a typo must not read as "nothing is waiting". Record
+timestamps (`created_ts_ms`, `expires_at_ms`, `decided_ts_ms`,
+`consumed_ts_ms`) are all unix milliseconds, matching the audit `ts`
+field, so `expires_at_ms - created_ts_ms` is the real window.
+
+Replay is fail-loud, not fail-silent: if the audit log exists but cannot
+be read, or contains a non-blank line that does not parse as JSON (a
+torn tail from a crash mid-write), startup refuses rather than
+reconstructing weaker state — silently skipping such a line could drop a
+`denied` decision or a `consume` and re-arm a blocked or already-used
+approval. Blank lines are tolerated.
 
 **Execution.** After approval, a re-invocation with IDENTICAL arguments
 consumes the approval: the hash pins (agent, tool, canonical args), so
@@ -478,7 +491,9 @@ last durable step — after the in-flight cap and the audit preflight — so
 a `429`/`503` never burns an approval. Single-use: the next identical
 call needs a fresh approval. And deny rules win end-to-end: every retry
 re-runs the full policy check, so an approval never overrides the tool or
-repository allowlists.
+repository allowlists. Superseded decisions (denied, consumed, or lapsed)
+are dropped from the in-memory working set so a retrying agent cannot
+grow it without bound; the JSONL keeps the full forensic history.
 
 #### Multi-installation routing (one key, many orgs)
 

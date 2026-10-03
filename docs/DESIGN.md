@@ -38,11 +38,17 @@ engine**, sitting between agents and two GitHub surfaces:
 ```
 agent → [authn: X-Octobroker-Key] → [session binding] → [tool allowlist]
       → [write classification] → [repo allowlist (deny-if-unresolvable)]
-      → [in-flight cap] → [fail-closed audit] → forward with scoped token
+      → [local-tool gate] → [approval tier: pending | approved]
+      → [in-flight cap] → [fail-closed audit] → [consume approval]
+      → forward with scoped token
       → [buffer+parse write outcomes] → audit result
 ```
 
-Every layer is independent; a request must clear all of them.
+Every layer is independent; a request must clear all of them. The
+approval tier sits after every deny rule so a denied call never leaves an
+approval record, and before credential resolution so a pending call mints
+no token. Consume happens after the cap and the audit preflight, so an
+infrastructure rejection (429/503) never burns an approval.
 
 ## Credential model
 
@@ -88,6 +94,7 @@ Per-agent, default-deny, enforced at the proxy and mirrored upstream:
 id    = "my-bot"
 keys  = ["env:KEY_CURRENT", "env:KEY_NEXT"]   # rotation: both valid
 tools = ["issue_read", "create_issue"]        # exact names, default-deny
+tools_approval = ["merge_pull_request"]      # allowed, but per-call human gate
 repos = ["my-org/repo-a", "my-org/*"]         # exact or owner wildcard
 ```
 
@@ -102,6 +109,11 @@ repos = ["my-org/repo-a", "my-org/*"]         # exact or owner wildcard
 - Write classification is rule-based and conservative: only
   `get_*`/`list_*`/`search_*`/`*_read` names are reads; **everything else,
   including unknown names, is a write**.
+- `tools_approval` is a third tier, not a weaker allowlist: the tool is
+  permitted in principle, but each call is held pending until an operator
+  approves it through `/approvals` under a credential that is validated
+  to be distinct from every agent key. The two lists must not name the
+  same tool, so the tier is never ambiguous.
 
 ## Write gate
 
@@ -151,3 +163,6 @@ caller.
 | Scoped installation tokens per policy envelope | #17 review | GitHub enforces the repo boundary, not just our parser |
 | Writes: App + audit + agents required in code | #17 review | Hard rules, not documented hopes |
 | `octobroker_*` review tools as a narrow MCP exception | #44 / PR #45 | Fill upstream capability gaps without arbitrary GraphQL; preserve default-deny, repo binding, App credentials, and audit |
+| Per-agent approval tier in the shared audit JSONL, not a second store | #51 / PR #66 | One forensic trail; fail-closed by reusing the audit sink's fsync contract |
+| Approval state reconstructed from the log by fail-loud replay | #51 review | A torn line can swallow a `denied`; silent skipping would re-arm a blocked call |
+| Consume placed after the cap + audit preflight | #51 review | An infrastructure 429/503 must not burn a point-of-no-return approval |

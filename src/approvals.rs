@@ -13,6 +13,9 @@
 //!   `approval_decision`, `approval_consume`) is appended + fsync'd BEFORE
 //!   the in-memory state changes, and startup rebuilds state by replaying
 //!   the JSONL — a restart never silently drops a pending or approved call.
+//!   A replay that cannot be trusted (an unparseable or unreadable record)
+//!   fails loudly at startup instead of reconstructing weaker state: a
+//!   lost `denied` or `consume` record must never resurrect as `pending`.
 //! - Fail-closed: if a record cannot be persisted the operation reports an
 //!   error and the caller must not proceed (same contract as the write
 //!   audit preflight).
@@ -79,31 +82,31 @@ pub struct Approval {
     /// Argument key NAMES only — values are never stored.
     pub arg_keys: Vec<String>,
     pub status: ApprovalStatus,
-    /// Creation time, unix milliseconds (matches audit `ts`).
-    pub created_ts: u64,
-    /// Absolute expiry, unix seconds (matches GitHub token expiries).
-    pub expires_at: u64,
-    pub decided_ts: Option<u64>,
-    pub consumed_ts: Option<u64>,
+    /// Creation time, unix milliseconds (matches the audit `ts` field).
+    pub created_ts_ms: u64,
+    /// Absolute expiry, unix milliseconds.
+    pub expires_at_ms: u64,
+    pub decided_ts_ms: Option<u64>,
+    pub consumed_ts_ms: Option<u64>,
 }
 
 impl Approval {
     /// Status with lazy expiry applied: a pending or approved record past
-    /// `expires_at` reports "expired" without needing a sweeper task.
-    pub fn effective_status(&self, now: u64) -> &'static str {
+    /// `expires_at_ms` reports "expired" without needing a sweeper task.
+    pub fn effective_status(&self, now_ms: u64) -> &'static str {
         match self.status {
-            ApprovalStatus::Pending | ApprovalStatus::Approved if self.expires_at <= now => {
+            ApprovalStatus::Pending | ApprovalStatus::Approved if self.expires_at_ms <= now_ms => {
                 "expired"
             }
             other => other.as_str(),
         }
     }
 
-    fn is_live(&self, now: u64) -> bool {
+    fn is_live(&self, now_ms: u64) -> bool {
         matches!(
             self.status,
             ApprovalStatus::Pending | ApprovalStatus::Approved
-        ) && self.expires_at > now
+        ) && self.expires_at_ms > now_ms
     }
 }
 
@@ -112,7 +115,7 @@ impl Approval {
 pub enum GateDecision {
     /// The call must not execute yet; the agent gets this id (either an
     /// existing live request — deduped — or a freshly recorded one).
-    Pending { id: String, expires_at: u64 },
+    Pending { id: String, expires_at_ms: u64 },
     /// An operator approved this exact (agent, tool, args hash); the call
     /// may proceed and must `consume` this id at the point of no return.
     Approved { id: String },
@@ -176,70 +179,110 @@ impl ApprovalStore {
     /// Opens (creates) the JSONL file, first replaying any existing
     /// `approval_*` records so in-flight approvals survive restarts.
     /// `ttl_secs` bounds pending AND approved records identically.
+    ///
+    /// Replay is fail-loud, not fail-silent: a log that exists but cannot be
+    /// read, or a non-blank line that does not parse as JSON, aborts `open`
+    /// instead of yielding weaker state. A torn tail (a crash between
+    /// `write_all` and the next append) merges two records into one
+    /// unparseable line — silently skipping it could drop a `denied` or a
+    /// `consume`, resurrecting a blocked call or re-arming a used approval.
     pub fn open(path: &str, ttl_secs: u64) -> Result<Self, String> {
         let mut records: HashMap<String, Approval> = HashMap::new();
-        if let Ok(existing) = File::open(path) {
-            for line in BufReader::new(existing).lines() {
-                let Ok(line) = line else { break };
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-                    continue; // foreign records (write audits) are not ours
-                };
-                match v.get("phase").and_then(|p| p.as_str()) {
-                    Some("approval_request") => {
-                        let Some(id) = v.get("id").and_then(|i| i.as_str()) else {
-                            continue;
-                        };
-                        records.insert(
-                            id.to_string(),
-                            Approval {
-                                id: id.to_string(),
-                                agent: v["agent"].as_str().unwrap_or_default().to_string(),
-                                tool: v["tool"].as_str().unwrap_or_default().to_string(),
-                                args_hash: v["args_hash"].as_str().unwrap_or_default().to_string(),
-                                repo: v.get("repo").and_then(|r| r.as_str()).map(str::to_string),
-                                arg_keys: v["arg_keys"]
-                                    .as_array()
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|k| k.as_str().map(str::to_string))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default(),
-                                status: ApprovalStatus::Pending,
-                                created_ts: v["ts"].as_u64().unwrap_or_default(),
-                                expires_at: v["expires_at"].as_u64().unwrap_or_default(),
-                                decided_ts: None,
-                                consumed_ts: None,
-                            },
+        match File::open(path) {
+            Ok(existing) => {
+                for (index, line) in BufReader::new(existing).lines().enumerate() {
+                    let line =
+                        line.map_err(|e| format!("cannot replay approval log {}: {}", path, e))?;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let v = serde_json::from_str::<serde_json::Value>(&line).map_err(|e| {
+                        tracing::error!(
+                            "approval log {} line {} is corrupt: {}",
+                            path,
+                            index + 1,
+                            e
                         );
-                    }
-                    Some("approval_decision") => {
-                        let Some(id) = v.get("id").and_then(|i| i.as_str()) else {
-                            continue;
-                        };
-                        if let Some(a) = records.get_mut(id) {
-                            if a.status == ApprovalStatus::Pending {
-                                a.status = match v["decision"].as_str() {
-                                    Some("approved") => ApprovalStatus::Approved,
-                                    _ => ApprovalStatus::Denied,
-                                };
-                                a.decided_ts = v["ts"].as_u64();
+                        format!(
+                            "cannot replay approval log {}: corrupt line {} ({}) — refusing to \
+                             reconstruct approval state that may have lost a decision",
+                            path,
+                            index + 1,
+                            e
+                        )
+                    })?;
+                    match v.get("phase").and_then(|p| p.as_str()) {
+                        Some("approval_request") => {
+                            let Some(id) = v.get("id").and_then(|i| i.as_str()) else {
+                                continue;
+                            };
+                            records.insert(
+                                id.to_string(),
+                                Approval {
+                                    id: id.to_string(),
+                                    agent: v["agent"].as_str().unwrap_or_default().to_string(),
+                                    tool: v["tool"].as_str().unwrap_or_default().to_string(),
+                                    args_hash: v["args_hash"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    repo: v
+                                        .get("repo")
+                                        .and_then(|r| r.as_str())
+                                        .map(str::to_string),
+                                    arg_keys: v["arg_keys"]
+                                        .as_array()
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|k| k.as_str().map(str::to_string))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
+                                    status: ApprovalStatus::Pending,
+                                    created_ts_ms: v["ts"].as_u64().unwrap_or_default(),
+                                    expires_at_ms: v["expires_at_ms"].as_u64().unwrap_or_default(),
+                                    decided_ts_ms: None,
+                                    consumed_ts_ms: None,
+                                },
+                            );
+                        }
+                        Some("approval_decision") => {
+                            let Some(id) = v.get("id").and_then(|i| i.as_str()) else {
+                                continue;
+                            };
+                            if let Some(a) = records.get_mut(id) {
+                                if a.status == ApprovalStatus::Pending {
+                                    a.status = match v["decision"].as_str() {
+                                        Some("approved") => ApprovalStatus::Approved,
+                                        _ => ApprovalStatus::Denied,
+                                    };
+                                    a.decided_ts_ms = v["ts"].as_u64();
+                                }
                             }
                         }
-                    }
-                    Some("approval_consume") => {
-                        let Some(id) = v.get("id").and_then(|i| i.as_str()) else {
-                            continue;
-                        };
-                        if let Some(a) = records.get_mut(id) {
-                            if a.status == ApprovalStatus::Approved {
-                                a.status = ApprovalStatus::Consumed;
-                                a.consumed_ts = v["ts"].as_u64();
+                        Some("approval_consume") => {
+                            let Some(id) = v.get("id").and_then(|i| i.as_str()) else {
+                                continue;
+                            };
+                            if let Some(a) = records.get_mut(id) {
+                                if a.status == ApprovalStatus::Approved {
+                                    a.status = ApprovalStatus::Consumed;
+                                    a.consumed_ts_ms = v["ts"].as_u64();
+                                }
                             }
                         }
+                        // Records written by the write-audit sink
+                        // (`request`, `result`, `git_credential_*`) share
+                        // this file and are not ours.
+                        _ => continue,
                     }
-                    _ => continue,
                 }
+            }
+            // No log yet = no approvals yet. Anything else (permissions,
+            // wrong type) is a broken forensic trail, not an empty one.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!("cannot replay approval log {}: {}", path, e));
             }
         }
         let file = OpenOptions::new()
@@ -258,10 +301,38 @@ impl ApprovalStore {
         })
     }
 
+    /// A store whose appends always fail (read-only fd) — for fail-closed
+    /// tests, mirroring `AuditSink::failing_for_tests`.
+    #[cfg(test)]
+    pub fn failing_for_tests() -> Self {
+        Self::failing_with_for_tests(HashMap::new())
+    }
+
+    /// Same, pre-seeded with records so a test can reach the branches that
+    /// only run once an approval already exists (e.g. consume).
+    #[cfg(test)]
+    pub fn failing_with_for_tests(records: HashMap<String, Approval>) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                file: File::open("/dev/null").unwrap(),
+                records,
+                counter: 0,
+            }),
+            path: "/dev/null (read-only)".to_string(),
+            ttl_secs: 900,
+        }
+    }
+
     /// Proxy-side gate. Returns the live request for this exact call
     /// (deduped), an approved record, or records a new durable pending
     /// request. A persistence failure is an Err — the call must be
     /// rejected (fail-closed, no unaudited approval requests).
+    ///
+    /// The dedup key is (agent, tool, args hash): dropping any component
+    /// would let one agent's approval authorize another agent's call, or one
+    /// tool's approval authorize a different operation. Terminal and lapsed
+    /// records are pruned here so a retrying agent cannot grow the working
+    /// set without bound — the JSONL remains the full forensic history.
     pub fn gate(
         &self,
         agent: &str,
@@ -270,8 +341,9 @@ impl ApprovalStore {
         arg_keys: &[String],
         repo: Option<&str>,
     ) -> Result<GateDecision, String> {
-        let now = unix_now_secs();
+        let now = unix_now_ms();
         let mut inner = self.inner.lock().unwrap();
+        inner.records.retain(|_, a| a.is_live(now));
         if let Some(a) = inner.records.values().find(|a| {
             a.agent == agent && a.tool == tool && a.args_hash == args_hash && a.is_live(now)
         }) {
@@ -279,12 +351,12 @@ impl ApprovalStore {
                 ApprovalStatus::Approved => GateDecision::Approved { id: a.id.clone() },
                 _ => GateDecision::Pending {
                     id: a.id.clone(),
-                    expires_at: a.expires_at,
+                    expires_at_ms: a.expires_at_ms,
                 },
             });
         }
 
-        let expires_at = now + self.ttl_secs;
+        let expires_at_ms = now.saturating_add(self.ttl_secs.saturating_mul(1000));
         let approval = Approval {
             id: self.next_id(&mut inner),
             agent: agent.to_string(),
@@ -293,15 +365,15 @@ impl ApprovalStore {
             repo: repo.map(str::to_string),
             arg_keys: arg_keys.to_vec(),
             status: ApprovalStatus::Pending,
-            created_ts: unix_now_ms(),
-            expires_at,
-            decided_ts: None,
-            consumed_ts: None,
+            created_ts_ms: now,
+            expires_at_ms,
+            decided_ts_ms: None,
+            consumed_ts_ms: None,
         };
         self.append(
             &mut inner,
             serde_json::json!({
-                "ts": approval.created_ts,
+                "ts": approval.created_ts_ms,
                 "phase": "approval_request",
                 "id": approval.id,
                 "agent": approval.agent,
@@ -310,18 +382,18 @@ impl ApprovalStore {
                 "arg_keys": approval.arg_keys,
                 "args_hash": approval.args_hash,
                 "status": "pending",
-                "expires_at": approval.expires_at,
+                "expires_at_ms": approval.expires_at_ms,
             }),
         )?;
         let id = approval.id.clone();
         inner.records.insert(id.clone(), approval);
-        Ok(GateDecision::Pending { id, expires_at })
+        Ok(GateDecision::Pending { id, expires_at_ms })
     }
 
     /// Operator decision via the management API. Single-shot: only a live
     /// pending record may transition.
     pub fn decide(&self, id: &str, approved: bool) -> Result<Approval, DecideError> {
-        let now = unix_now_secs();
+        let now = unix_now_ms();
         let mut inner = self.inner.lock().unwrap();
         {
             let a = inner.records.get(id).ok_or(DecideError::NotFound)?;
@@ -346,7 +418,7 @@ impl ApprovalStore {
         } else {
             ApprovalStatus::Denied
         };
-        a.decided_ts = Some(ts);
+        a.decided_ts_ms = Some(ts);
         Ok(a.clone())
     }
 
@@ -360,7 +432,7 @@ impl ApprovalStore {
         tool: &str,
         args_hash: &str,
     ) -> Result<Approval, ConsumeError> {
-        let now = unix_now_secs();
+        let now = unix_now_ms();
         let mut inner = self.inner.lock().unwrap();
         {
             let a = inner.records.get(id).ok_or(ConsumeError::NotFound)?;
@@ -386,14 +458,14 @@ impl ApprovalStore {
         .map_err(ConsumeError::Persist)?;
         let a = inner.records.get_mut(id).unwrap();
         a.status = ApprovalStatus::Consumed;
-        a.consumed_ts = Some(ts);
+        a.consumed_ts_ms = Some(ts);
         Ok(a.clone())
     }
 
     /// All known approvals, or only those whose EFFECTIVE status (lazy
     /// expiry applied) equals `status`.
     pub fn list(&self, status: Option<&str>) -> Vec<Approval> {
-        let now = unix_now_secs();
+        let now = unix_now_ms();
         let inner = self.inner.lock().unwrap();
         let mut out: Vec<Approval> = inner
             .records
@@ -401,7 +473,7 @@ impl ApprovalStore {
             .filter(|a| status.map(|s| a.effective_status(now) == s).unwrap_or(true))
             .cloned()
             .collect();
-        out.sort_by_key(|a| a.created_ts);
+        out.sort_by_key(|a| a.created_ts_ms);
         out
     }
 
@@ -441,12 +513,5 @@ fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
         .unwrap_or(0)
 }

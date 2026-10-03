@@ -93,7 +93,7 @@ enabled = false
 # operator one durable forensic trail. operator_key authenticates the
 # /approvals endpoints via X-Octobroker-Operator-Key and must NOT equal
 # any agent key (startup fails if it does). ttl_secs bounds pending and
-# approved records alike.
+# approved records alike and must be 1..86400 (0 could never be decided).
 # [mcp.approvals]
 # operator_key = "env:OCTOBROKER_OPERATOR_KEY"
 # ttl_secs = 900

@@ -597,9 +597,13 @@ mod tests {
     #[tokio::test]
     async fn test_approvals_route_wins_over_catchall() {
         // /approvals and /approvals/{id}[/{approve,deny}] must reach the
-        // management handlers — not the /{*path} GitHub catch-all. With no
-        // [mcp.approvals] config the handlers answer their own local 404,
-        // not the proxy's 403 for non-repo paths.
+        // management handlers — not the /{*path} GitHub catch-all.
+        //
+        // The status code alone cannot prove this: `is_allowed_path("/approvals")`
+        // returns true (fewer than three segments), so a shadowed GET would be
+        // forwarded to api.github.com/approvals with a pooled PAT and come back
+        // 404 for a completely different reason. Assert the handler's OWN
+        // message instead, which only the local handler can produce.
         let state = test_state(vec!["openabdev"]);
         for (method, uri) in [
             ("GET", "/approvals"),
@@ -619,6 +623,17 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{} {}", method, uri);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("approvals are not enabled"),
+                "{} {} was answered by {} — the catch-all proxied it upstream",
+                method,
+                uri,
+                text
+            );
         }
     }
 
