@@ -158,9 +158,10 @@ impl std::fmt::Display for ConsumeError {
     }
 }
 
-/// Default in-memory working-set bound; overridable per deployment with
-/// `[mcp.approvals] max_records`. Only reached by a flood of distinct
-/// requests — see `gate` for the eviction policy.
+/// Conservative fallback used only when a caller does not set a bound. In
+/// production `main` always calls `with_max_records` with the operator's
+/// `[mcp.approvals] max_records` (default 1_048_576); this keeps an embedded
+/// caller that forgets from growing without limit.
 const MAX_RECORDS: usize = 1024;
 
 struct Inner {
@@ -364,20 +365,9 @@ impl ApprovalStore {
     ) -> Result<GateDecision, String> {
         let now = unix_now_ms();
         let mut inner = self.inner.lock().unwrap();
-        if inner.records.len() >= self.max_records {
-            let mut oldest: Vec<(u64, String)> = inner
-                .records
-                .values()
-                .map(|a| (a.created_ts_ms, a.id.clone()))
-                .collect();
-            oldest.sort();
-            for (_, id) in oldest {
-                if inner.records.len() < self.max_records {
-                    break;
-                }
-                inner.records.remove(&id);
-            }
-        }
+        // Dedup BEFORE eviction: a retry of a live request must find its own
+        // record even when the working set is exactly at its bound, or the
+        // approval id would churn on every poll.
         if let Some(a) = inner.records.values().find(|a| {
             a.agent == agent && a.tool == tool && a.args_hash == args_hash && a.is_live(now)
         }) {
@@ -388,6 +378,26 @@ impl ApprovalStore {
                     expires_at_ms: a.expires_at_ms,
                 },
             });
+        }
+
+        // Only a genuinely new request needs room. Evict terminal (denied /
+        // consumed / lapsed) records first and then the oldest, so a flood
+        // never pushes a live pending request out of the operator's queue
+        // while keeping an ancient denial. This still fails closed: an
+        // evicted APPROVED record makes the call re-request, never execute.
+        if inner.records.len() >= self.max_records {
+            let mut victims: Vec<(bool, u64, String)> = inner
+                .records
+                .values()
+                .map(|a| (a.is_live(now), a.created_ts_ms, a.id.clone()))
+                .collect();
+            victims.sort();
+            for (_, _, id) in victims {
+                if inner.records.len() < self.max_records {
+                    break;
+                }
+                inner.records.remove(&id);
+            }
         }
 
         let expires_at_ms = now.saturating_add(self.ttl_secs.saturating_mul(1000));

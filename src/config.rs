@@ -159,7 +159,7 @@ fn default_approval_max_records() -> usize {
     MAX_APPROVAL_RECORDS
 }
 
-/// Default/upper bound for `[mcp.approvals] max_records`.
+/// Default for `[mcp.approvals] max_records` (the in-memory working-set bound).
 pub const MAX_APPROVAL_RECORDS: usize = 1_048_576;
 
 /// Upper bound on `[mcp.approvals] ttl_secs` — an approval is a

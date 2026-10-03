@@ -18,9 +18,9 @@
 //!   GET /approvals?status=pendings                     → 400 (typo guard)
 //!   POST /approvals/apv_…/approve  (operator key)     → 200 + record
 //!
-//! Decisions are single-shot (409 on re-decision/expired/unknown-consume
-//! states) and durable — a decision that cannot be fsync'd to the audit
-//! JSONL fails 503 without changing state.
+//! Decisions are single-shot (404 for an unknown id, 409 once a known id is
+//! already decided or expired) and durable — a decision that cannot be
+//! fsync'd to the audit JSONL fails 503 without changing state.
 
 use axum::{
     extract::{Path, Query, State},

@@ -454,14 +454,15 @@ error that correlates the request id:
 ```
 
 Retrying the identical call returns the SAME approval id (deduped — one
-record per unique request) — the agent can wait, escalate, or poll. While
+record per unique request, while that record is inside `max_records`) —
+the agent can wait, escalate, or poll. While
 pending, nothing executes, no upstream credential is minted, and no
 in-flight write slot is consumed.
 
 **Operator decision.** `/approvals` answers a local 404 when
 `[mcp.approvals]` is not configured; otherwise every request needs
-`X-Octobroker-Operator-Key`. When the MCP proxy is enabled, startup
-validation rejects an operator key that duplicates any agent key —
+`X-Octobroker-Operator-Key`. Whenever `[mcp.approvals]` is configured,
+startup validation rejects an operator key that duplicates any agent key —
 approving a high-risk write is a different trust decision than holding
 an agent's bounded allowlist:
 
@@ -497,7 +498,9 @@ call needs a fresh approval. And deny rules win end-to-end: every retry
 re-runs the full policy check, so an approval never overrides the tool or
 repository allowlists. Inside `max_records` every record stays
 answerable: a denial keeps returning `409` on re-decision and stays
-visible to `?status=denied`.
+visible to `?status=denied`. Past the bound, terminal records are dropped
+first and then the oldest, so a flood never pushes a live pending request
+out of the operator's queue.
 
 #### Multi-installation routing (one key, many orgs)
 

@@ -588,6 +588,77 @@ fn the_working_set_is_bounded_under_a_request_flood() {
 }
 
 #[test]
+fn dedup_wins_over_eviction_even_at_the_smallest_bound() {
+    // Eviction runs AFTER the dedup lookup. If it ran first, a bound of 1
+    // would evict the very record the retry is looking for: the approval id
+    // would churn on every poll and the operator's approve would 404.
+    let (path, store) = open("dedup-vs-evict", 900);
+    let store = store.with_max_records(1);
+    let h = hash("merge_pull_request", serde_json::json!({"owner": "o"}));
+    let id = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+            .unwrap(),
+    );
+    for _ in 0..5 {
+        assert_eq!(
+            pending_id(
+                store
+                    .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+                    .unwrap()
+            ),
+            id,
+            "the same request must keep its approval id"
+        );
+    }
+    // It is still decidable.
+    assert_eq!(
+        store.decide(&id, true).unwrap().status,
+        ApprovalStatus::Approved
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn eviction_drops_terminal_records_before_live_ones() {
+    // Past the bound, a denial is worth less to an operator than a live
+    // pending request — even when the denial is the newer of the two.
+    let (path, store) = open("terminal-first", 900);
+    let store = store.with_max_records(2);
+    let live_h = hash("merge_pull_request", serde_json::json!({"owner": "live"}));
+    let live_id = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &live_h, &[], None)
+            .unwrap(),
+    );
+    let denied_h = hash("merge_pull_request", serde_json::json!({"owner": "denied"}));
+    let denied_id = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &denied_h, &[], None)
+            .unwrap(),
+    );
+    store.decide(&denied_id, false).unwrap();
+    assert_eq!(store.list(None).len(), 2);
+
+    // A third, distinct request forces one eviction.
+    let third_h = hash("merge_pull_request", serde_json::json!({"owner": "third"}));
+    store
+        .gate("bot-a", "merge_pull_request", &third_h, &[], None)
+        .unwrap();
+    assert_eq!(store.list(None).len(), 2);
+    assert!(
+        store.get(&denied_id).is_none(),
+        "the terminal denial should be the one evicted"
+    );
+    assert_eq!(
+        store.get(&live_id).map(|a| a.status),
+        Some(ApprovalStatus::Pending),
+        "a live pending request must outlive a denial"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn approval_timestamps_are_unix_milliseconds() {
     // One unit across the record: expires_at_ms - created_ts_ms is the real
     // window. Mixing seconds and milliseconds silently corrupts operator
