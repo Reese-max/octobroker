@@ -83,6 +83,15 @@ const MINIMIZE_CLASSIFIERS: &[&str] = &[
 const SUBMIT_REVIEW_EVENTS: &[&str] = &["APPROVE", "REQUEST_CHANGES", "COMMENT"];
 /// States accepted by GitHub's REST commit status API.
 const COMMIT_STATUS_STATES: &[&str] = &["error", "failure", "pending", "success"];
+/// Free-text ceilings, in characters. GitHub truncates or rejects longer
+/// values; rejecting locally keeps a write-classified, audited call from
+/// spending a round trip to learn that, and bounds what a caller can push
+/// through an audited broker-owned tool. `context` is GitHub's own 100-char
+/// limit for a commit status check name.
+const COMMIT_STATUS_CONTEXT_MAX: usize = 100;
+const COMMIT_STATUS_DESCRIPTION_MAX: usize = 140;
+const COMMIT_STATUS_TARGET_URL_MAX: usize = 1024;
+const REVIEW_BODY_MAX: usize = 65_536;
 
 fn is_local_tool(name: &str) -> bool {
     LOCAL_TOOLS.contains(&name)
@@ -327,6 +336,10 @@ pub async fn mcp_proxy(
     });
     // Per-agent in-flight cap on write calls (held until the buffered
     // response is fully assembled; the guard decrements on drop).
+    let local_tool_name = frame
+        .as_ref()
+        .and_then(|f| f.tool.as_deref())
+        .filter(|t| is_local_tool(t));
     let _inflight: Option<InFlightGuard> = match (&write_call, agent_id) {
         (Some(_), Some(aid)) => {
             let cap = state.config.mcp.max_inflight_writes;
@@ -338,10 +351,17 @@ pub async fn mcp_proxy(
                         aid,
                         cap
                     );
-                    return rpc_error(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "agent write concurrency limit reached",
-                    );
+                    let message = "agent write concurrency limit reached";
+                    // Broker-owned tools never produce an upstream call, so
+                    // they always answer with a correlated tool error rather
+                    // than an id-less JSON-RPC error.
+                    return match local_tool_name {
+                        Some(_) => tool_call_denied(
+                            frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+                            message,
+                        ),
+                        None => rpc_error(StatusCode::TOO_MANY_REQUESTS, message),
+                    };
                 }
             }
         }
@@ -366,22 +386,20 @@ pub async fn mcp_proxy(
                 "audit unavailable — rejecting write call (fail-closed): {}",
                 e
             );
-            return rpc_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "audit backend unavailable — write rejected",
-            );
+            let message = "audit backend unavailable — write rejected";
+            return match local_tool_name {
+                Some(_) => {
+                    tool_call_denied(frame.as_ref().and_then(|f| f.rpc_id.as_ref()), message)
+                }
+                None => rpc_error(StatusCode::SERVICE_UNAVAILABLE, message),
+            };
         }
     }
 
     // octobroker-owned review tools are handled locally. All policy and audit
     // checks above still apply; the upstream GitHub MCP server is not asked
     // to interpret a tool it does not expose.
-    if let Some(local_tool) = frame
-        .as_ref()
-        .and_then(|f| f.tool.as_deref())
-        .filter(|t| is_local_tool(t))
-        .map(str::to_string)
-    {
+    if let Some(local_tool) = local_tool_name.map(str::to_string) {
         let local = dispatch_local_tool(
             &state,
             &cred,
@@ -941,13 +959,19 @@ fn tool_response(
 /// verification, or a GitHub rejection — rides the wire as HTTP 200 with
 /// `result.isError`, same contract as `tool_call_denied`: strict JSON-RPC
 /// clients treat non-2xx as transport errors and would never surface the
-/// message to the model. The underlying status is preserved in `http_status`
-/// for the audit record only.
+/// message to the model.
+///
+/// `http_status` is NOT the wire status: it is the reason class recorded in
+/// the durable audit trail, so a reader can tell a rejected caller from a
+/// successful transport. Argument-validation failures, which never leave
+/// octobroker, are recorded as `BAD_REQUEST`; verification failures keep the
+/// GitHub status (`FORBIDDEN`/`CONFLICT`) and transport failures
+/// `BAD_GATEWAY`.
 ///
 /// Pre-flight rejections that happen BEFORE dispatch (tool allowlist, write
 /// gate, repository allowlist, in-flight cap, audit outage) are proxy-level
-/// decisions, not handler outcomes, and keep their own JSON-RPC error
-/// responses; that pre-existing behavior is unchanged by this layer.
+/// decisions, not handler outcomes; they keep their own JSON-RPC error
+/// response, with the descriptive status in the status line.
 fn local_tool_error(
     rpc_id: Option<&serde_json::Value>,
     http_status: StatusCode,
@@ -1061,7 +1085,7 @@ fn required_repo_node_args<'a>(
         {
             return Err(Box::new(local_tool_error(
                 rpc_id,
-                StatusCode::OK,
+                StatusCode::BAD_REQUEST,
                 format!("missing or invalid argument: {}", key),
             )));
         }
@@ -1232,7 +1256,7 @@ async fn handle_minimize_comment(
     let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "arguments must be an object",
         );
     };
@@ -1245,7 +1269,7 @@ async fn handle_minimize_comment(
     if !MINIMIZE_CLASSIFIERS.contains(&classifier) {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "classifier is not supported",
         );
     }
@@ -1321,7 +1345,7 @@ async fn handle_restore_comment(
     let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "arguments must be an object",
         );
     };
@@ -1402,7 +1426,7 @@ async fn handle_review_delete_pending(
     let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "arguments must be an object",
         );
     };
@@ -1483,7 +1507,7 @@ async fn handle_review_submit(
     let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "arguments must be an object",
         );
     };
@@ -1496,7 +1520,7 @@ async fn handle_review_submit(
     if !SUBMIT_REVIEW_EVENTS.contains(&event) {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "event must be one of: APPROVE, REQUEST_CHANGES, COMMENT",
         );
     }
@@ -1507,12 +1531,19 @@ async fn handle_review_submit(
             None => {
                 return local_tool_error(
                     frame.rpc_id.as_ref(),
-                    StatusCode::OK,
+                    StatusCode::BAD_REQUEST,
                     "body must be a string",
                 );
             }
         },
     };
+    if body_text.map(|text| text.chars().count() > REVIEW_BODY_MAX) == Some(true) {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::BAD_REQUEST,
+            format!("body must be at most {} characters", REVIEW_BODY_MAX),
+        );
+    }
 
     let expected_repo = format!("{}/{}", owner, repo);
     if let Some(response) = verify_pending_review(
@@ -1611,7 +1642,7 @@ async fn handle_commit_status_set(
     let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "arguments must be an object",
         );
     };
@@ -1623,7 +1654,7 @@ async fn handle_commit_status_set(
         {
             return local_tool_error(
                 frame.rpc_id.as_ref(),
-                StatusCode::OK,
+                StatusCode::BAD_REQUEST,
                 format!("missing or invalid argument: {}", key),
             );
         }
@@ -1640,29 +1671,39 @@ async fn handle_commit_status_set(
     if !valid_repo_segment(owner) || !valid_repo_segment(repo) {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "owner or repo contains unsupported characters",
         );
     }
     if !valid_commit_sha(sha) {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "sha must be a full 40-hex (or 64-hex) commit SHA",
         );
     }
     if !COMMIT_STATUS_STATES.contains(&status_state) {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "state must be one of: error, failure, pending, success",
         );
     }
     if context.trim().is_empty() {
         return local_tool_error(
             frame.rpc_id.as_ref(),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             "context must not be empty",
+        );
+    }
+    if context.chars().count() > COMMIT_STATUS_CONTEXT_MAX {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::BAD_REQUEST,
+            format!(
+                "context must be at most {} characters",
+                COMMIT_STATUS_CONTEXT_MAX
+            ),
         );
     }
 
@@ -1671,15 +1712,18 @@ async fn handle_commit_status_set(
         let Some(description) = value.as_str() else {
             return local_tool_error(
                 frame.rpc_id.as_ref(),
-                StatusCode::OK,
+                StatusCode::BAD_REQUEST,
                 "description must be a string",
             );
         };
-        if description.chars().count() > 140 {
+        if description.chars().count() > COMMIT_STATUS_DESCRIPTION_MAX {
             return local_tool_error(
                 frame.rpc_id.as_ref(),
-                StatusCode::OK,
-                "description must be at most 140 characters",
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "description must be at most {} characters",
+                    COMMIT_STATUS_DESCRIPTION_MAX
+                ),
             );
         }
         payload["description"] = serde_json::json!(description);
@@ -1688,15 +1732,25 @@ async fn handle_commit_status_set(
         let Some(target_url) = value.as_str() else {
             return local_tool_error(
                 frame.rpc_id.as_ref(),
-                StatusCode::OK,
+                StatusCode::BAD_REQUEST,
                 "target_url must be a string",
             );
         };
         if !(target_url.starts_with("https://") || target_url.starts_with("http://")) {
             return local_tool_error(
                 frame.rpc_id.as_ref(),
-                StatusCode::OK,
+                StatusCode::BAD_REQUEST,
                 "target_url must be an http(s) URL",
+            );
+        }
+        if target_url.chars().count() > COMMIT_STATUS_TARGET_URL_MAX {
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "target_url must be at most {} characters",
+                    COMMIT_STATUS_TARGET_URL_MAX
+                ),
             );
         }
         payload["target_url"] = serde_json::json!(target_url);
@@ -4051,10 +4105,12 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(out.tool_error, Some(true));
         assert!(mutations.lock().unwrap().is_empty());
 
-        // Unknown classifier is rejected before any network call.
+        // Unknown classifier is rejected before any network call: 400 proves
+        // the enum check ran, a 502 would mean the verify query was attempted.
         let frame = minimize_frame("openabdev", "octobroker", "WRONG");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, "http://127.0.0.1:1/").await;
         assert_eq!(out.tool_error, Some(true));
+        assert_eq!(out.http_status, 400, "classifier must be checked up front");
     }
 
     #[tokio::test]
@@ -4155,6 +4211,7 @@ data: "id":1,"result":{"tools":[]}}
         };
         let out = handle_restore_comment(&state, &app_cred(), &frame, "http://127.0.0.1:1/").await;
         assert_eq!(out.tool_error, Some(true));
+        assert_eq!(out.http_status, 400, "node_id must be required up front");
     }
 
     // ---- octobroker-owned tools: pending review delete/submit (mock GraphQL) ----
@@ -4434,7 +4491,15 @@ data: "id":1,"result":{"tools":[]}}
         );
         // Unroutable URL: a network call would surface as BAD_GATEWAY, not an arg error.
         let out = handle_review_submit(&state, &app_cred(), &frame, "http://127.0.0.1:1/").await;
-        assert_eq!(out.http_status, 200, "arg errors are tool errors");
+        assert_eq!(
+            out.http_status, 400,
+            "an invalid event is an argument error"
+        );
+        assert_eq!(
+            out.response.status(),
+            StatusCode::OK,
+            "tool error on the wire"
+        );
         assert_eq!(out.tool_error, Some(true));
     }
 
@@ -4673,6 +4738,22 @@ data: "id":1,"result":{"tools":[]}}
     }
 
     #[tokio::test]
+    async fn test_submit_review_rejects_oversized_body_before_network() {
+        // Free-text ceilings are enforced locally: an over-long review body
+        // must not cost a GitHub round trip on an audited write call.
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = pending_review_frame(
+            SUBMIT_REVIEW_TOOL,
+            "openabdev",
+            "openab",
+            serde_json::json!({"event": "COMMENT", "body": "b".repeat(REVIEW_BODY_MAX + 1)}),
+        );
+        let out = handle_review_submit(&state, &app_cred(), &frame, "http://127.0.0.1:1/").await;
+        assert_eq!(out.tool_error, Some(true));
+        assert_eq!(out.http_status, 400, "body must be bounded up front");
+    }
+
+    #[tokio::test]
     async fn test_review_ops_reject_blank_repo_arguments() {
         // Trimming must not turn a blank argument into a valid one.
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
@@ -4690,6 +4771,8 @@ data: "id":1,"result":{"tools":[]}}
             )
             .await;
             assert_eq!(out.tool_error, Some(true), "repo={:?}", blank);
+            // 400, not 502: the call was rejected before any GitHub request.
+            assert_eq!(out.http_status, 400, "repo={:?}", blank);
         }
     }
 
@@ -4794,6 +4877,12 @@ data: "id":1,"result":{"tools":[]}}
             ("repo", serde_json::json!("..")),
             ("owner", serde_json::json!(".")),
             ("context", serde_json::json!("   ")), // blank context
+            // free-text ceilings (GitHub's own limits, enforced locally)
+            ("context", serde_json::json!("c".repeat(101))),
+            (
+                "target_url",
+                serde_json::json!(format!("https://x/{}", "u".repeat(1100))),
+            ),
             ("target_url", serde_json::json!("javascript:alert(1)")),
             ("description", serde_json::json!("x".repeat(141))),
         ];
@@ -4805,8 +4894,14 @@ data: "id":1,"result":{"tools":[]}}
                 handle_commit_status_set(&state, &app_cred(), &frame, "http://127.0.0.1:1").await;
             assert_eq!(out.tool_error, Some(true), "case: {}", key);
             assert_eq!(
-                out.http_status, 200,
-                "arg errors are tool errors, case: {}",
+                out.http_status, 400,
+                "argument errors never leave octobroker, case: {}",
+                key
+            );
+            assert_eq!(
+                out.response.status(),
+                StatusCode::OK,
+                "arg errors are tool errors on the wire, case: {}",
                 key
             );
         }
@@ -5428,6 +5523,8 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(records[1]["phase"], "result");
         assert_eq!(records[1]["tool"], SUBMIT_REVIEW_TOOL);
         assert_eq!(records[1]["tool_error"], true);
+        // 400 in the trail: the argument error never reached GitHub.
+        assert_eq!(records[1]["http_status"], 400);
         std::fs::remove_file(&path).ok();
     }
 
@@ -5455,7 +5552,130 @@ data: "id":1,"result":{"tools":[]}}
             ))
             .await
             .unwrap();
+        // Broker-owned writes answer with a correlated tool error (an id-less
+        // JSON-RPC error is invisible to strict MCP clients); upstream tools
+        // keep the 503 protocol error.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], 8);
+        assert_eq!(v["result"]["isError"], true);
+        assert!(
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("audit backend unavailable"),
+            "got {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_write_rejected_when_audit_unavailable() {
+        // The fail-closed audit gate is unchanged for proxied upstream writes.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_writes_enabled(
+            &url,
+            crate::audit::AuditSink::failing_for_tests(),
+            vec![agent_with_repos(
+                "bot-w",
+                "key-w",
+                &["create_issue"],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"octobroker","title":"t"}}}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_local_review_tool_rejected_at_inflight_cap_with_correlated_error() {
+        // The per-agent write cap applies to broker-owned writes too, and the
+        // rejection stays correlated to the request id.
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("local-tool-cap");
+        std::fs::remove_file(&path).ok();
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_writes_enabled(
+            &url,
+            sink,
+            vec![agent_with_repos(
+                "bot-w",
+                "key-w",
+                &[SUBMIT_REVIEW_TOOL],
+                &["openabdev/octobroker"],
+            )],
+            1,
+        );
+        let _held = InFlightGuard::try_acquire(&state.write_inflight, "bot-w", 1).unwrap();
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"octobroker_review_submit","arguments":{"owner":"openabdev","repo":"octobroker","node_id":"PRR_x","event":"APPROVE"}}}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], 11, "cap rejection must stay correlated");
+        assert_eq!(v["result"]["isError"], true);
+        assert!(
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("concurrency limit"),
+            "got {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(captured.lock().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_local_review_tool_denied_outside_repo_allowlist() {
+        // octobroker performs the GitHub mutation itself, so the agent's
+        // repository allowlist is the containment boundary: a broker-owned
+        // write for a repository the agent does not hold is refused before
+        // any handler runs, exactly like a proxied write.
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("local-tool-repo");
+        std::fs::remove_file(&path).ok();
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_writes_enabled(
+            &url,
+            sink,
+            vec![agent_with_repos(
+                "bot-w",
+                "key-w",
+                &[RESTORE_COMMENT_TOOL],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"octobroker_review_restore_comment","arguments":{"owner":"evil","repo":"other","node_id":"IC_x"}}}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_tool_denied(resp, 12, "repository not permitted").await;
+        // Denials happen before the audit pre-flight: nothing was written.
+        assert!(read_audit(&path).is_empty());
         assert!(captured.lock().unwrap().is_empty());
     }
 
