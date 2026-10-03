@@ -639,8 +639,12 @@ targeting `~DEFAULT_BRANCH`; or the classic equivalent, *Settings → Branches �
 Add classic branch protection rule* with a branch name pattern matching the
 default branch.
 Either makes `GET /repos/{owner}/{repo}/branches/{default_branch}` report
-`protected: true` — GitHub documents that flag as covering both mechanisms
-("branches protected by branch protections **or rulesets**").
+`protected: true`, which is the flag the check below reads. Rulesets are
+covered by that same notion: GitHub's `protected` *filter* on
+`GET /repos/{owner}/{repo}/branches` is documented as returning "branches
+protected by branch protections **or rulesets**" (the per-branch response
+carries no prose of its own, so this is the documented statement the
+inference rests on).
 
 **Recommended: keep the App out of the namespaces humans use.** Nothing in
 the token stops the App pushing to any *unprotected* ref, so protect the
@@ -654,12 +658,14 @@ teams as bypass holders and **not** the App:
   any other pattern they work under — with **Restrict updates**. Classic
   branch protection's *Restrict who can push to matching branches* is the
   same control.
-- Give each depth its own pattern: ruleset ref patterns are fnmatch with
-  `FNM_PATHNAME`, where `*` matches one path segment and never crosses `/`
-  (a bare `**` is therefore just `*`). So `refs/heads/release/*` covers
-  `release/v1` while `refs/heads/release/**/*` covers two or more levels
-  (`release/2024/rc1`) — GitHub's own "any number of slashes" example is
-  `qa/**/*`. A ruleset accepts several include patterns, so list both.
+- Do not guess the depth semantics: ruleset ref patterns are fnmatch with
+  `FNM_PATHNAME`, where `*` never crosses `/` (so
+  `refs/heads/release/*` is unambiguously the one-level form), and GitHub
+  documents `qa/**/*` as how to "include any number of slashes after `qa`"
+  (it matches `qa/foo/bar/foobar/hello-world`). List **both**
+  `refs/heads/release/*` and `refs/heads/release/**/*` — a ruleset accepts
+  several include patterns, and listing both keeps the boundary intact
+  whatever depth the `**` form covers.
 - Agents then push only under their own namespaces
   (`refs/heads/agent-a/…`, which nothing restricts), and open a PR into the
   default branch, where the require-PR rule above applies.

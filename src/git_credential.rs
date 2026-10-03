@@ -235,8 +235,7 @@ pub async fn git_credential(
             // Two denials, deliberately distinct: a repository that needs
             // hardening (403 — add the ruleset) versus an answer we could not
             // obtain at all (503 — GitHub unreachable, rate limited, timed
-            // out; retry). The cause is echoed because it names the failing
-            // read, never the credential.
+            // out; retry).
             Ok(crate::ref_policy::Protection::Unprotected) => Some((
                 StatusCode::FORBIDDEN,
                 "unprotected_default_branch",
@@ -244,9 +243,11 @@ pub async fn git_credential(
                     .to_string(),
                 None,
             )),
-            // The cause (a GitHub status, an unreachable API base) goes to
-            // the broker log, not to the caller: the response must not echo
-            // internal endpoints back to the agent.
+            // The cause goes to the broker log, not to the caller: it names
+            // the failing read (a GitHub status, an unreachable API base)
+            // and the response must not echo internal endpoints back to the
+            // agent. It never carries the credential — that lives only in
+            // the Authorization header.
             Err(e) => Some((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unverifiable_default_branch",
