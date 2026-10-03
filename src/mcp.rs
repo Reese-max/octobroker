@@ -270,23 +270,38 @@ pub async fn mcp_proxy(
         }
     }
 
+    // A broker-owned tool never produces an upstream call, so every rejection
+    // on the way to the local handler answers with a correlated tool error.
+    let local_tool_name = frame
+        .as_ref()
+        .and_then(|f| f.tool.as_deref())
+        .filter(|t| is_local_tool(t));
     let route_owner = resolved_repo.as_ref().map(|(o, _)| o.as_str());
     let cred = match pick_credential(&state, session_id.as_deref(), agent, route_owner).await {
         Ok(c) => c,
-        Err(StatusCode::NOT_FOUND) => {
-            tracing::warn!(
-                "MCP request rejected: unknown or expired session{}",
-                session_suffix(session_id.as_deref())
-            );
-            return rpc_error(StatusCode::NOT_FOUND, "session not found or expired");
+        Err(code) => {
+            let message = match code {
+                StatusCode::NOT_FOUND => {
+                    tracing::warn!(
+                        "MCP request rejected: unknown or expired session{}",
+                        session_suffix(session_id.as_deref())
+                    );
+                    "session not found or expired"
+                }
+                StatusCode::FORBIDDEN => "session not owned by this agent",
+                StatusCode::BAD_GATEWAY => "upstream credential unavailable",
+                _ => "no upstream identity available",
+            };
+            // Same rule as the write cap and the audit gate: a broker-owned
+            // call answers with a correlated tool error, because an id-less
+            // JSON-RPC error is invisible to strict MCP clients.
+            return match local_tool_name {
+                Some(_) => {
+                    tool_call_denied(frame.as_ref().and_then(|f| f.rpc_id.as_ref()), message)
+                }
+                None => rpc_error(code, message),
+            };
         }
-        Err(StatusCode::FORBIDDEN) => {
-            return rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent");
-        }
-        Err(StatusCode::BAD_GATEWAY) => {
-            return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential unavailable");
-        }
-        Err(code) => return rpc_error(code, "no upstream identity available"),
     };
     let cred_label = cred.label();
 
@@ -334,12 +349,6 @@ pub async fn mcp_proxy(
             })
             .map(str::to_string)
     });
-    // Per-agent in-flight cap on write calls (held until the buffered
-    // response is fully assembled; the guard decrements on drop).
-    let local_tool_name = frame
-        .as_ref()
-        .and_then(|f| f.tool.as_deref())
-        .filter(|t| is_local_tool(t));
     let _inflight: Option<InFlightGuard> = match (&write_call, agent_id) {
         (Some(_), Some(aid)) => {
             let cap = state.config.mcp.max_inflight_writes;
@@ -963,10 +972,10 @@ fn tool_response(
 ///
 /// `http_status` is NOT the wire status: it is the reason class recorded in
 /// the durable audit trail, so a reader can tell a rejected caller from a
-/// successful transport. Argument-validation failures, which never leave
-/// octobroker, are recorded as `BAD_REQUEST`; verification failures keep the
-/// GitHub status (`FORBIDDEN`/`CONFLICT`) and transport failures
-/// `BAD_GATEWAY`.
+/// successful transport — `BAD_REQUEST` for arguments rejected before any
+/// GitHub request, `FORBIDDEN` for a node that failed the authorship or
+/// repository check, `CONFLICT` for a review that is no longer pending,
+/// `BAD_GATEWAY` for a GitHub transport failure or an unexpected payload.
 ///
 /// Pre-flight rejections that happen BEFORE dispatch (tool allowlist, write
 /// gate, repository allowlist, in-flight cap, audit outage) are proxy-level
@@ -1135,8 +1144,17 @@ async fn verify_comment_ownership(
         .pointer("/data/node/issue/repository/nameWithOwner")
         .or_else(|| verify_body.pointer("/data/node/pullRequest/repository/nameWithOwner"))
         .and_then(|value| value.as_str());
-    if !verify_status.is_success()
-        || verify_body.get("errors").is_some()
+    if !verify_status.is_success() {
+        return Some(local_tool_error(
+            rpc_id,
+            StatusCode::BAD_GATEWAY,
+            "GitHub comment ownership check failed",
+        ));
+    }
+    // A GraphQL `errors[]`, a missing viewer/author, or a foreign author is a
+    // refusal, not a transport failure: record it as FORBIDDEN so an audit
+    // reader filtering on status sees the denial.
+    if verify_body.get("errors").is_some()
         || viewer.is_none()
         || author.is_none()
         || viewer.map(normalize_actor) != author.map(normalize_actor)
@@ -1144,7 +1162,7 @@ async fn verify_comment_ownership(
         tracing::warn!("comment ownership check failed for {}", expected_repo);
         return Some(local_tool_error(
             rpc_id,
-            verify_status,
+            StatusCode::FORBIDDEN,
             "comment is not authored by the current GitHub identity",
         ));
     }
@@ -1207,8 +1225,14 @@ async fn verify_pending_review(
     let actual_repo = verify_body
         .pointer("/data/node/repository/nameWithOwner")
         .and_then(|value| value.as_str());
-    if !verify_status.is_success()
-        || verify_body.get("errors").is_some()
+    if !verify_status.is_success() {
+        return Some(local_tool_error(
+            rpc_id,
+            StatusCode::BAD_GATEWAY,
+            "GitHub review ownership check failed",
+        ));
+    }
+    if verify_body.get("errors").is_some()
         || viewer.is_none()
         || author.is_none()
         || viewer.map(normalize_actor) != author.map(normalize_actor)
@@ -1216,7 +1240,7 @@ async fn verify_pending_review(
         tracing::warn!("review ownership check failed for {}", expected_repo);
         return Some(local_tool_error(
             rpc_id,
-            verify_status,
+            StatusCode::FORBIDDEN,
             "review is not authored by the current GitHub identity",
         ));
     }
@@ -4070,6 +4094,9 @@ data: "id":1,"result":{"tools":[]}}
         let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
         assert_eq!(out.tool_error, Some(true));
+        // A foreign author is a refusal, not a transport failure: the audit
+        // trail must not record GitHub's 200 for a denied mutation.
+        assert_eq!(out.http_status, StatusCode::FORBIDDEN.as_u16());
         assert!(
             mutations.lock().unwrap().is_empty(),
             "no mutation for foreign authors"
@@ -4380,6 +4407,7 @@ data: "id":1,"result":{"tools":[]}}
         );
         let out = handle_review_delete_pending(&state, &app_cred(), &frame, &gql).await;
         assert_eq!(out.tool_error, Some(true));
+        assert_eq!(out.http_status, StatusCode::FORBIDDEN.as_u16());
         assert!(
             mutations.lock().unwrap().is_empty(),
             "no mutation for foreign authors"
@@ -5642,6 +5670,58 @@ data: "id":1,"result":{"tools":[]}}
             String::from_utf8_lossy(&body)
         );
         assert!(captured.lock().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_local_review_tool_with_expired_session_is_correlated() {
+        // A stale or never-initialized session is the routine case in a long
+        // review session. For a broker-owned tool it must still answer with a
+        // correlated tool error: an id-less JSON-RPC error is invisible to
+        // strict MCP clients, which leave the agent hanging on the call.
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("local-tool-session");
+        std::fs::remove_file(&path).ok();
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_writes_enabled(
+            &url,
+            sink,
+            vec![agent_with_repos(
+                "bot-w",
+                "key-w",
+                &[SUBMIT_REVIEW_TOOL],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"octobroker_review_submit","arguments":{"owner":"openabdev","repo":"octobroker","node_id":"PRR_x","event":"APPROVE"}}}"#,
+                &[
+                    ("x-octobroker-key", "key-w"),
+                    ("mcp-session-id", "never-initialized"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], 13, "session rejection must stay correlated");
+        assert_eq!(v["result"]["isError"], true);
+        assert!(
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session"),
+            "got {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(captured.lock().unwrap().is_empty());
+        // Rejected before the audit pre-flight: no credential was resolved.
+        assert!(read_audit(&path).is_empty());
         std::fs::remove_file(&path).ok();
     }
 
