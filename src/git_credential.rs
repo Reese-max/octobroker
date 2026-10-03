@@ -263,7 +263,7 @@ pub async fn git_credential(
                 reason,
                 detail
             );
-            provider.evict_git_tokens(name);
+            provider.evict_git_token(name, read_only);
             if let Err(audit_err) = sink.record_git_credential_result(
                 &agent.id,
                 &cred_label,
@@ -293,7 +293,7 @@ pub async fn git_credential(
         );
         // Same invariant as a policy denial: a credential that will not be
         // handed out is not kept around.
-        provider.evict_git_tokens(name);
+        provider.evict_git_token(name, read_only);
         return rpc_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "audit backend unavailable — credential rejected",

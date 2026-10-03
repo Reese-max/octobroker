@@ -430,17 +430,25 @@ impl AppTokenProvider {
         Ok(verdict)
     }
 
-    /// Drop every cached git credential for `repository` (both permission
-    /// envelopes). Called whenever a request that already minted one will
-    /// not be completed — a ref-policy denial, or a result audit record that
-    /// could not be persisted — so no request that fails after the mint ever
-    /// leaves a live credential behind for a later caller.
-    pub fn evict_git_tokens(&self, repository: &str) {
-        let mut cached = self.cached.lock().unwrap();
-        for purpose in ["git:contents=read", "git:contents=write"] {
-            // Mirrors the single-repository cache key built by token_for.
-            cached.remove(&format!("{}:{}", purpose, repository));
-        }
+    /// Drop the cached git credential for `repository` in the envelope that
+    /// was actually minted (`read_only` selects it, exactly as `token_git`
+    /// does). Called whenever a request that already minted one will not be
+    /// completed — a ref-policy denial, or a result audit record that could
+    /// not be persisted — so no request that fails after the mint ever
+    /// leaves a live credential behind for a later caller. The other
+    /// envelope is untouched: a denial of a push credential must not force
+    /// read-only agents on the same repository to re-mint.
+    pub fn evict_git_token(&self, repository: &str, read_only: bool) {
+        let purpose = if read_only {
+            "git:contents=read"
+        } else {
+            "git:contents=write"
+        };
+        // Mirrors the single-repository cache key built by token_for.
+        self.cached
+            .lock()
+            .unwrap()
+            .remove(&format!("{}:{}", purpose, repository));
     }
 
     /// Whether a cached, unexpired positive verdict exists for this
@@ -1061,7 +1069,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_evict_git_tokens_drops_only_that_repository() {
+    fn test_evict_git_token_drops_only_that_envelope_and_repository() {
         let p = AppTokenProvider::new("123".into(), TEST_RSA_PEM, Some(1), None, "http://x".into())
             .unwrap();
         let exp = unix_now() + 3600;
@@ -1081,14 +1089,23 @@ pub(crate) mod tests {
             );
         }
         drop(cached);
-        p.evict_git_tokens("openab");
+        p.evict_git_token("openab", false);
         let cached = p.cached.lock().unwrap();
-        // Both git envelopes for THIS repository go; a repository whose name
-        // merely ends with it, and the MCP namespace, stay.
+        // Only the envelope that was minted goes: the read namespace for the
+        // same repository, a repository whose name merely ends with it, and
+        // the MCP namespace all stay.
         assert!(!cached.contains_key("git:contents=write:openab"));
-        assert!(!cached.contains_key("git:contents=read:openab"));
+        assert!(cached.contains_key("git:contents=read:openab"));
         assert!(cached.contains_key("git:contents=write:openab-ab"));
         assert!(cached.contains_key("mcp:openab"));
+        drop(cached);
+        // …and the read envelope can be evicted on its own.
+        p.evict_git_token("openab", true);
+        assert!(!p
+            .cached
+            .lock()
+            .unwrap()
+            .contains_key("git:contents=read:openab"));
     }
 
     #[tokio::test]

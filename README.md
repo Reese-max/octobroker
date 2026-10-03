@@ -633,20 +633,26 @@ Either makes `GET /repos/{owner}/{repo}/branches/{default_branch}` report
 `protected: true` — GitHub documents that flag as covering both mechanisms
 ("branches protected by branch protections **or rulesets**").
 
-**Recommended: namespace agent branches.** Give each agent its own branch
-namespace and restrict what the App may push directly, so a compromised
-credential cannot rewrite a sibling's work:
+**Recommended: keep the App out of the namespaces humans use.** Nothing in
+the token stops the App pushing to any *unprotected* ref, so protect the
+branches people work on and let agents push only where protection allows.
+The rule that does this is **Restrict updates** ("only users with bypass
+permissions can push to branches whose name matches the pattern you
+specify") — enable it on the **human** namespaces, listing the humans and
+teams as bypass holders and **not** the App:
 
-- A second ruleset targeting `refs/heads/*` with **Restrict pushes** → *Push
-  only to matching branches*. Ruleset ref patterns are fnmatch with
-  `FNM_PATHNAME`, where `*` does **not** cross `/`: use
-  `refs/heads/agent-a/**/*` to allow the whole namespace (one per agent, or
-  per trust level — `refs/heads/bot/**/*`, `refs/heads/human/**/*`) and
-  `refs/heads/agent-a/*` for exactly one level. Widening that *allow
-  pattern* to `refs/heads/*` instead would hand the App every branch, which
-  is the opposite of the point.
-- Agents then push branches under their namespace and open a PR into the
-  default branch; the default-branch rule handles the rest.
+- A ruleset targeting `refs/heads/release/**` (and any other namespace
+  humans use) with **Restrict updates**. Classic branch protection's
+  *Restrict who can push to matching branches* is the same control.
+- Give each depth its own pattern: ruleset ref patterns are fnmatch with
+  `FNM_PATHNAME`, where `*` matches one path segment and never crosses `/`,
+  so `refs/heads/release/*` covers `release/v1` while
+  `refs/heads/release/**/*` covers two or more levels (`release/2024/rc1`).
+  GitHub's own "any number of slashes" example is `qa/**/*`. A ruleset
+  accepts several include patterns, so list both.
+- Agents then push only under their own namespaces
+  (`refs/heads/agent-a/…`, which nothing restricts), and open a PR into the
+  default branch, where the require-PR rule above applies.
 
 **Optional: let octobroker verify it.** A ruleset that is accidentally
 deleted or an unmigrated repository should not silently downgrade the
