@@ -208,6 +208,45 @@ pub async fn git_credential(
         }
     };
 
+    // Ref-level push policy (#49): a repository-scoped token can push to
+    // ANY ref in the repo, including the default branch, and octobroker
+    // does not proxy git to narrow that — GitHub's own branch protection /
+    // ruleset is the ref-level boundary. When the operator requires it,
+    // prove the default branch is protected before handing out a
+    // push-capable credential. Read-only (contents:read) credentials are
+    // exempt: they cannot push, so there is no ref to police. Runs after
+    // the mint because the reads are authenticated by the repo-scoped token
+    // itself; a denial never returns it.
+    if state.config.mcp.require_protected_default_branch && !read_only {
+        let denial = match provider
+            .default_branch_protected(owner, name, &token.token)
+            .await
+        {
+            Ok(crate::ref_policy::Protection::Protected) => None,
+            Ok(crate::ref_policy::Protection::Unprotected) => Some(
+                "the repository's default branch is not protected — see the ref-level push policy in the README".to_string(),
+            ),
+            Err(e) => Some(format!(
+                "the repository's default branch protection could not be verified: {}",
+                e
+            )),
+        };
+        if let Some(reason) = denial {
+            tracing::warn!("git-credential DENIED ({}) [agent={}]", reason, agent.id);
+            if let Err(audit_err) = sink.record_git_credential_result(
+                &agent.id,
+                &cred_label,
+                &repo_label,
+                mode,
+                false,
+                None,
+            ) {
+                tracing::error!("git-credential failure result audit failed: {}", audit_err);
+            }
+            return rpc_error(StatusCode::FORBIDDEN, &reason);
+        }
+    }
+
     // Result record: if this cannot be persisted, do not return the token.
     if let Err(e) = sink.record_git_credential_result(
         &agent.id,
@@ -259,6 +298,16 @@ mod tests {
 
     type MintLog = Arc<std::sync::Mutex<Vec<(u64, serde_json::Value)>>>;
 
+    /// Default branch the mock GitHub reports for `repo` (see
+    /// `spawn_mock_github`'s ref-policy surface).
+    fn default_branch_of(repo: &str) -> &'static str {
+        if repo.ends_with("-slash") {
+            "release/v1"
+        } else {
+            "main"
+        }
+    }
+
     async fn spawn_mock_github() -> (String, MintLog) {
         use axum::extract::Path;
 
@@ -290,6 +339,51 @@ mod tests {
             }))
         }
 
+        // Ref-level push policy surface (#49): the two reads the broker makes
+        // before handing out a PUSH-CAPABLE credential. Answers are derived
+        // from the repository name so one stateless mock serves every case:
+        //   <repo>-unprotected → default branch reports protected:false
+        //   <repo>-ghfail      → the branch read fails (500)
+        //   <repo>-slash       → default branch is "release/v1" (a branch
+        //                       name containing a slash)
+        //   anything else       → default branch "main", protected:true
+        async fn repo_meta(
+            Path((_owner, repo)): Path<(String, String)>,
+        ) -> axum::Json<serde_json::Value> {
+            axum::Json(serde_json::json!({
+                "default_branch": default_branch_of(&repo),
+            }))
+        }
+        async fn repo_branch(
+            Path((_owner, repo, branch)): Path<(String, String, String)>,
+        ) -> axum::response::Response {
+            let json = |value: serde_json::Value| {
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(value.to_string()))
+                    .unwrap()
+            };
+            if repo.ends_with("-ghfail") {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(axum::body::Body::from("boom"))
+                    .unwrap();
+            }
+            // Only the repo's real default branch exists: asking for any
+            // other name 404s, exactly as GitHub would.
+            if branch != default_branch_of(&repo) {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::from("{\"message\":\"Branch not found\"}"))
+                    .unwrap();
+            }
+            json(serde_json::json!({
+                "name": branch,
+                "protected": !repo.ends_with("-unprotected"),
+            }))
+        }
+
         let log: MintLog = Arc::new(std::sync::Mutex::new(Vec::new()));
         let app = axum::Router::new()
             .route(
@@ -297,6 +391,11 @@ mod tests {
                 axum::routing::post(mint),
             )
             .route("/app/installations/{id}", axum::routing::get(installation))
+            .route("/repos/{owner}/{repo}", axum::routing::get(repo_meta))
+            .route(
+                "/repos/{owner}/{repo}/branches/{*branch}",
+                axum::routing::get(repo_branch),
+            )
             .with_state(log.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -331,6 +430,17 @@ mod tests {
     async fn test_state(
         enabled: bool,
         read_only: bool,
+        sink: Option<crate::audit::AuditSink>,
+    ) -> (Arc<AppState>, MintLog) {
+        test_state_with_ref_policy(enabled, read_only, false, sink).await
+    }
+
+    /// Same state, with the #49 ref-level push policy gate
+    /// (`require_protected_default_branch`) set explicitly.
+    async fn test_state_with_ref_policy(
+        enabled: bool,
+        read_only: bool,
+        require_protected_default_branch: bool,
         sink: Option<crate::audit::AuditSink>,
     ) -> (Arc<AppState>, MintLog) {
         let (gh, mint_log) = spawn_mock_github().await;
@@ -372,6 +482,7 @@ mod tests {
                         enable_writes: false,
                         enable_git_credentials: enabled,
                         git_credentials_read_only: read_only,
+                        require_protected_default_branch,
                         upstream: None,
                         toolsets: vec![],
                         session_ttl_secs: 3600,
@@ -380,7 +491,15 @@ mod tests {
                             agent(
                                 "b0",
                                 "key-b0",
-                                &["openabdev/openab", "oablab/chi", "mislabeled/repo"],
+                                &[
+                                    "openabdev/openab",
+                                    // ref-policy fixtures (see spawn_mock_github)
+                                    "openabdev/openab-unprotected",
+                                    "openabdev/openab-ghfail",
+                                    "openabdev/openab-slash",
+                                    "oablab/chi",
+                                    "mislabeled/repo",
+                                ],
                             ),
                             agent("norepo", "key-norepo", &[]),
                             agent("other", "key-other", &["otherorg/thing"]),
@@ -712,5 +831,140 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         // a failed audit preflight must never reach the mint endpoint
         assert!(mint_log.lock().unwrap().is_empty());
+    }
+
+    // ---- #49 ref-level push policy ----
+
+    /// Audit trail of one /git-credential request as parsed JSONL records.
+    fn audit_records(path: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_protected_default_branch_still_issues_push_credential() {
+        let path = audit_tmp("refpolicy-ok");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let (state, mint_log) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/openab", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["password"], "ghs_git_openabdev");
+        assert_eq!(mint_log.lock().unwrap().len(), 1);
+        let records = audit_records(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["success"], true);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_unprotected_default_branch_denies_push_credential() {
+        let path = audit_tmp("refpolicy-unprotected");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let (state, _mint_log) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-unprotected", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // The credential must never leave the broker, in any form.
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("ghs_git_openabdev"),
+            "token leaked: {}",
+            text
+        );
+        assert!(text.contains("not protected"), "got: {}", text);
+        // Audited as a failed issuance (preflight + result, no expiry).
+        let records = audit_records(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["phase"], "git_credential_request");
+        assert_eq!(records[1]["phase"], "git_credential_result");
+        assert_eq!(records[1]["success"], false);
+        assert_eq!(records[1]["mode"], "write");
+        assert!(records[1]["expires_at"].is_null());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_protection_check_is_opt_in() {
+        let path = audit_tmp("refpolicy-off");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        // Flag off: the repository is unprotected and the credential is
+        // issued anyway — existing deployments are unaffected by default.
+        let (state, mint_log) = test_state_with_ref_policy(true, false, false, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-unprotected", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(mint_log.lock().unwrap().len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_only_credential_skips_protection_check() {
+        let path = audit_tmp("refpolicy-readonly");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        // Flag on, but the issued credential is contents:read — it cannot
+        // push at all, so there is no ref to police and no reason to deny.
+        let (state, mint_log) = test_state_with_ref_policy(true, true, true, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-unprotected", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let minted = mint_log.lock().unwrap();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(
+            minted[0].1["permissions"],
+            serde_json::json!({"contents": "read"})
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_protection_check_fails_closed_on_github_error() {
+        let path = audit_tmp("refpolicy-ghfail");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let (state, _) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-ghfail", Some("key-b0")))
+            .await
+            .unwrap();
+        // An unreadable answer is never a pass: 5xx from GitHub denies.
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let records = audit_records(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["success"], false);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_default_branch_with_slash_is_checked() {
+        let path = audit_tmp("refpolicy-slash");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let (state, _) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        // Default branch is "release/v1": the branch that gets checked is
+        // the one GitHub reports, not a hardcoded "main" — asking for any
+        // other name 404s in the mock, exactly as GitHub would.
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-slash", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        std::fs::remove_file(&path).ok();
     }
 }

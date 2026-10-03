@@ -66,6 +66,20 @@ enabled = false
 # per agent: a `git_credentials_read_only` key on an [[mcp.agents]] entry
 # wins over this global default, in either direction (see below).
 # git_credentials_read_only = false
+# Ref-level push policy: refuse PUSH-CAPABLE git credentials for a
+# repository whose default branch is not protected. The credential's
+# repository scope stops at the repo boundary — inside it, an App token can
+# push to main — so GitHub branch protection / rulesets are the ref-level
+# boundary (octobroker does not proxy git to police refs). With this set,
+# octobroker reads GET /repos/{owner}/{repo} and
+# GET /repos/{owner}/{repo}/branches/{default_branch} before returning a
+# push-capable token, and denies (403, audited as a failed issuance) unless
+# GitHub reports protected:true. Fail-closed: an API error or an
+# unreadable answer denies too. Read-only credentials are exempt — they
+# cannot push. No extra App permission needed (Metadata + Contents: read).
+# See README "Ref-level push policy" for the ruleset setup. Requires
+# enable_git_credentials. Default false.
+# require_protected_default_branch = false
 # Max concurrent write calls per agent (0 = unlimited).
 # max_inflight_writes = 4
 # Upstream MCP endpoint. Default: hosted read-only variant, or the full

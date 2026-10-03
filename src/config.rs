@@ -86,6 +86,18 @@ pub struct McpConfig {
     /// target repositories. Default false (push-capable, unchanged behavior).
     #[serde(default)]
     pub git_credentials_read_only: bool,
+    /// Ref-level push policy (#49): before issuing a PUSH-CAPABLE
+    /// git credential, verify with GitHub that the target repository's
+    /// default branch is protected (branch protection or a ruleset), and
+    /// refuse the credential if it is not — or if that cannot be verified.
+    /// A repository-scoped token can otherwise rewrite `main` directly;
+    /// GitHub's protection is the ref-level boundary, since octobroker
+    /// deliberately does not proxy the git protocol. Read-only
+    /// (`contents: read`) credentials are exempt: they cannot push at all.
+    /// Requires `enable_git_credentials` (validated at startup). Default
+    /// false (opt-in) — hardening guidance lives in the README.
+    #[serde(default)]
+    pub require_protected_default_branch: bool,
     /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant,
     /// or the full write-capable surface when enable_writes is set.
     #[serde(default)]
@@ -213,6 +225,7 @@ impl Default for McpConfig {
             enable_writes: false,
             enable_git_credentials: false,
             git_credentials_read_only: false,
+            require_protected_default_branch: false,
             upstream: None,
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),
@@ -294,6 +307,12 @@ impl McpConfig {
             {
                 return Err("enable_git_credentials with [mcp.github_app] requires `owner` — explicit installation IDs are verified against this owner before issuance".into());
             }
+        }
+        // The ref-level push policy only guards credential issuance: a config
+        // that requires it without enabling the endpoint would look hardened
+        // while protecting nothing.
+        if self.require_protected_default_branch && !self.enable_git_credentials {
+            return Err("require_protected_default_branch requires enable_git_credentials — the protected-default-branch check runs at credential issuance".into());
         }
         // Mutual exclusion: singular and plural forms cannot coexist
         if self.github_app.is_some() && !self.github_apps.is_empty() {
@@ -999,6 +1018,54 @@ mod tests {
                 owner: "openabdev".into(),
             }],
             audit: audit(),
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_validate_protected_default_branch_gate() {
+        fn agent() -> McpAgentConfig {
+            McpAgentConfig {
+                id: "b0".into(),
+                key: None,
+                keys: vec!["k".into()],
+                tools: vec![],
+                repos: vec!["openabdev/openab".into()],
+                git_credentials_read_only: None,
+            }
+        }
+        // Off by default: ref-level enforcement stays opt-in.
+        assert!(!McpConfig::default().require_protected_default_branch);
+        // The flag is meaningless without the endpoint it guards — a config
+        // that sets it but never issues credentials must not look hardened.
+        let m = McpConfig {
+            require_protected_default_branch: true,
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("enable_git_credentials"));
+        // It adds no relief to the existing hard gate.
+        let m = McpConfig {
+            enable_git_credentials: true,
+            require_protected_default_branch: true,
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
+        // Fully configured: valid.
+        let m = McpConfig {
+            enable_git_credentials: true,
+            require_protected_default_branch: true,
+            agents: vec![agent()],
+            github_app: Some(GithubAppConfig {
+                app_id: "1".into(),
+                private_key: "pem".into(),
+                installation_id: Some(1),
+                owner: Some("openabdev".into()),
+            }),
+            audit: Some(AuditConfig {
+                path: "/tmp/a.jsonl".into(),
+                max_result_bytes: 1024,
+            }),
             ..Default::default()
         };
         assert!(m.validate().is_ok());

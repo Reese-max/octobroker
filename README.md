@@ -545,6 +545,14 @@ tokens are cached under separate namespaces, so agents with different modes
 never share credentials even for the same repository. Note the App itself
 must hold **Contents: Read & write** whenever any agent is push-capable.
 
+**Ref-level push policy (no direct-to-main).** A repository-scoped token
+still reaches *every ref* in that repository: GitHub enforces the repo
+boundary, but inside it the token can push to `main` as freely as to a
+feature branch. Enforce the ref boundary in GitHub — see
+[Ref-level push policy](#ref-level-push-policy) for the branch-protection
+setup, and `require_protected_default_branch` to make octobroker refuse
+credentials for a repository whose default branch is open.
+
 Agent side, `obk` doubles as a standard git credential helper. Register it
 as the **only** helper for `github.com` — `--replace-all` with an empty
 first entry clears any inherited helpers (osxkeychain, GCM, `gh auth
@@ -565,6 +573,7 @@ git push → obk git-credential (OCTOBROKER_KEY from env)
          → durable audit preflight (phase: git_credential_request)
          → installation owner verified against GitHub
          → Contents-only single-repo token (~1h, GitHub-enforced scope)
+         → default branch protected? (require_protected_default_branch)
          → audit result (phase: git_credential_result, mode: read|write)
          → push authenticated as <app>[bot]
 ```
@@ -595,6 +604,72 @@ Properties:
   serve them. `gist.github.com` is not supported.
 - **Nothing to store** — `store`/`erase` are no-ops; tokens expire on their
   own. `cache-control: no-store` on the response.
+
+#### Ref-level push policy
+
+GitHub enforces octobroker's boundaries; that principle extends to refs. The
+App token is scoped to one repository, so *where* in that repository it may
+push has to be expressed as **GitHub branch protection or a ruleset** —
+octobroker deliberately does not proxy the git smart-HTTP protocol to police
+refs itself (a pack-inspecting broker is a much bigger architectural bite,
+and it would put policy in octobroker's process instead of GitHub's).
+
+**Required: protect the default branch.** For every repository an agent may
+push to:
+
+- **Require a pull request** to update the default branch — no direct push,
+  not even from an App. This is the rule that turns a leaked credential from
+  "can rewrite `main`" into "can open a PR".
+- **Block force pushes and deletions** on it.
+- Do **not** put the App in the ruleset's bypass list. A bypass actor undoes
+  the boundary for everyone else's sake.
+
+In the GitHub UI: *Settings → Rules → Rulesets → New branch ruleset* targeting
+`~DEFAULT_BRANCH`, or *Settings → Branches → Add rule* on the branch itself.
+Either makes `GET /repos/{owner}/{repo}/branches/{default_branch}` report
+`protected: true`.
+
+**Recommended: namespace agent branches.** Give each agent its own branch
+namespace and restrict what the App may push directly, so a compromised
+credential cannot rewrite a sibling's work:
+
+- A second ruleset targeting `refs/heads/*` with **Restrict pushes** → *Push
+  only to matching branches*, pattern `refs/heads/agent-a/**` (one per agent,
+  or one namespace per trust level: `refs/heads/bot/**`,
+  `refs/heads/human/**`).
+- Agents then push branches under their namespace and open a PR into the
+  default branch; the default-branch rule handles the rest.
+
+**Optional: let octobroker verify it.** A ruleset that is accidentally
+deleted or an unmigrated repository should not silently downgrade the
+boundary, so octobroker can refuse to issue a **push-capable** credential
+for a repository whose default branch is not protected:
+
+```toml
+[mcp]
+enable_git_credentials = true
+require_protected_default_branch = true   # deny push credentials when the
+                                          # default branch is verifiably open
+```
+
+Semantics:
+
+- **Push-capable credentials only.** A `git_credentials_read_only` credential
+  (`contents: read`) cannot push at all, so it is never withheld — a
+  read-only fleet keeps working on unprotected repositories.
+- **Fail-closed.** Unprotected, no default branch, an API error, or an
+  unreadable answer all deny (403) and are audited as a failed issuance. Only
+  an explicit `protected: true` passes. The token, if already minted, is
+  never returned.
+- **No extra App permissions.** The check is two reads the credential's own
+  token already authorizes — `GET /repos/{owner}/{repo}` (Metadata) and
+  `GET /repos/{owner}/{repo}/branches/{branch}` (Contents: read).
+- **Scope.** It proves the default branch is protected; it does not police
+  which feature branches the App may push, nor force-push classification.
+  Those remain ruleset responsibilities — see *namespace agent branches*
+  above.
+- Requires `enable_git_credentials` (startup validation rejects the flag
+  otherwise). Default `false`, so existing deployments are unchanged.
 
 Deployment notes:
 

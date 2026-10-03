@@ -343,6 +343,69 @@ impl AppTokenProvider {
         Ok(())
     }
 
+    /// Verify that `repository`'s default branch is protected, using the
+    /// already-minted, repository-scoped installation token (#49).
+    ///
+    /// GitHub is the ref-level enforcement layer — octobroker never parses
+    /// the git protocol — so a repository whose default branch is wide open
+    /// would otherwise hand a push-capable agent a credential that can
+    /// rewrite `main` directly. Two cheap reads answer the question with
+    /// permissions a git credential already has: `GET /repos/{o}/{r}` is
+    /// Metadata (implicit), `GET /repos/{o}/{r}/branches/{b}` is
+    /// Contents: read. No extra App permission is required.
+    ///
+    /// `Ok(Protected)` only when GitHub reports `protected: true` for the
+    /// default branch (that flag covers classic branch protection *and*
+    /// rulesets). `Ok(Unprotected)` when GitHub reports no protection;
+    /// `Err` when the check could not be completed at all (transport
+    /// failure, non-2xx, unparsable body, no default branch name). Callers
+    /// must deny on `Err` too — it is never a pass.
+    pub async fn default_branch_protected(
+        &self,
+        owner: &str,
+        repository: &str,
+        token: &str,
+    ) -> Result<crate::ref_policy::Protection, String> {
+        let repo_url = format!("{}/repos/{}/{}", self.api_base, owner, repository);
+        let repo = self.get_json(&repo_url, token).await?;
+        let branch = crate::ref_policy::default_branch(&repo).ok_or_else(|| {
+            format!(
+                "repository {}/{} reports no default branch",
+                owner, repository
+            )
+        })?;
+        let branch_url = branch_url(&self.api_base, owner, repository, branch)?;
+        let branch_value = self.get_json(&branch_url, token).await?;
+        Ok(crate::ref_policy::default_branch_protected(
+            Some(&repo),
+            Some(&branch_value),
+        ))
+    }
+
+    /// Installation-token-authenticated GET returning parsed JSON, or an
+    /// `Err` the caller must fail closed on.
+    async fn get_json(&self, url: &str, token: &str) -> Result<serde_json::Value, String> {
+        let resp = self
+            .http
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/vnd.github+json")
+            .header(
+                "User-Agent",
+                concat!("octobroker/", env!("CARGO_PKG_VERSION")),
+            )
+            .send()
+            .await
+            .map_err(|e| format!("{}: request failed: {}", url, e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("{}: GitHub returned {}", url, status));
+        }
+        resp.json()
+            .await
+            .map_err(|e| format!("{}: response parse failed: {}", url, e))
+    }
+
     async fn resolve_installation(&self, jwt: &str) -> Result<u64, String> {
         if let Some(id) = *self.installation_id.lock().unwrap() {
             return Ok(id);
@@ -411,6 +474,28 @@ fn parse_rfc3339_unix(s: &str) -> Option<u64> {
     let parsed =
         time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
     u64::try_from(parsed.unix_timestamp()).ok()
+}
+
+/// `<api_base>/repos/<owner>/<repo>/branches/<branch>` with the branch name
+/// carried as a single path segment. Branch names may contain `/`
+/// (`release/v1`); interpolating one raw would address a different route
+/// (and a name containing `..` or a query would rewrite the request), so it
+/// is percent-encoded.
+fn branch_url(
+    api_base: &str,
+    owner: &str,
+    repository: &str,
+    branch: &str,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(&format!(
+        "{}/repos/{}/{}/branches",
+        api_base, owner, repository
+    ))
+    .map_err(|e| format!("invalid branch URL: {}", e))?;
+    url.path_segments_mut()
+        .map_err(|_| "repository path is not a valid URL base".to_string())?
+        .push(branch);
+    Ok(url.to_string())
 }
 
 /// Multi-app mode: one `AppTokenProvider` per repository owner, enabling
@@ -669,6 +754,38 @@ pub(crate) mod tests {
             seen[2]["permissions"],
             serde_json::json!({"contents": "read"})
         );
+    }
+
+    #[test]
+    fn test_branch_url_carries_the_branch_as_one_segment() {
+        // A branch name containing a slash must stay ONE path segment: the
+        // mock/reality contract is `.../branches/{branch}`, not a nested
+        // route, so the name is percent-encoded.
+        assert_eq!(
+            branch_url(
+                "https://api.github.com",
+                "openabdev",
+                "openab",
+                "release/v1"
+            )
+            .unwrap(),
+            "https://api.github.com/repos/openabdev/openab/branches/release%2Fv1"
+        );
+        // Ordinary names are passed through untouched.
+        assert_eq!(
+            branch_url("https://api.github.com", "o", "r", "main").unwrap(),
+            "https://api.github.com/repos/o/r/branches/main"
+        );
+        // Characters that would otherwise rewrite the request are encoded.
+        let url = branch_url("https://api.github.com", "o", "r", "weird#name").unwrap();
+        assert!(url.ends_with("/branches/weird%23name"), "{}", url);
+        let url = branch_url("https://api.github.com", "o", "r", "a?b=c").unwrap();
+        assert!(url.ends_with("/branches/a%3Fb=c"), "{}", url);
+    }
+
+    #[test]
+    fn test_branch_url_rejects_a_non_http_base() {
+        assert!(branch_url("not-a-url", "o", "r", "main").is_err());
     }
 
     #[tokio::test]
