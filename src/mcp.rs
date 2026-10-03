@@ -382,25 +382,15 @@ pub async fn mcp_proxy(
         .filter(|t| is_local_tool(t))
         .map(str::to_string)
     {
-        let frame_ref = frame.as_ref().unwrap();
-        let local = match local_tool.as_str() {
-            MINIMIZE_COMMENT_TOOL => {
-                handle_minimize_comment(&state, &cred, frame_ref, GITHUB_GRAPHQL_URL).await
-            }
-            RESTORE_COMMENT_TOOL => {
-                handle_restore_comment(&state, &cred, frame_ref, GITHUB_GRAPHQL_URL).await
-            }
-            DELETE_PENDING_REVIEW_TOOL => {
-                handle_review_delete_pending(&state, &cred, frame_ref, GITHUB_GRAPHQL_URL).await
-            }
-            SUBMIT_REVIEW_TOOL => {
-                handle_review_submit(&state, &cred, frame_ref, GITHUB_GRAPHQL_URL).await
-            }
-            COMMIT_STATUS_TOOL => {
-                handle_commit_status_set(&state, &cred, frame_ref, GITHUB_API_URL).await
-            }
-            other => unreachable!("is_local_tool admitted {}", other),
-        };
+        let local = dispatch_local_tool(
+            &state,
+            &cred,
+            frame.as_ref().unwrap(),
+            &local_tool,
+            GITHUB_GRAPHQL_URL,
+            GITHUB_API_URL,
+        )
+        .await;
         if let (Some(tool_name), Some(sink)) = (&write_call, &state.audit) {
             let call = crate::audit::CallInfo {
                 rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
@@ -818,7 +808,11 @@ fn local_tool_definition(name: &str) -> serde_json::Value {
                 "required": ["owner", "repo", "sha", "state", "context"]
             }
         }),
-        other => unreachable!("unknown local tool: {}", other),
+        // Unknown names have no schema. `inject_custom_tools` only ever asks
+        // for names in LOCAL_TOOLS; a new entry without a schema here would
+        // advertise a null tool and is caught by
+        // `test_every_local_tool_has_a_schema`.
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -943,11 +937,17 @@ fn tool_response(
         .expect("static MCP tool response")
 }
 
-/// Every local-tool failure — argument, verification, or GitHub rejection —
-/// rides the wire as HTTP 200 with `result.isError`, same contract as
-/// `tool_call_denied`: strict JSON-RPC clients treat non-2xx as transport
-/// errors and would never surface the message to the model. The underlying
-/// status is preserved in `http_status` for the audit record only.
+/// Every *handler-level* local-tool failure — argument validation, node
+/// verification, or a GitHub rejection — rides the wire as HTTP 200 with
+/// `result.isError`, same contract as `tool_call_denied`: strict JSON-RPC
+/// clients treat non-2xx as transport errors and would never surface the
+/// message to the model. The underlying status is preserved in `http_status`
+/// for the audit record only.
+///
+/// Pre-flight rejections that happen BEFORE dispatch (tool allowlist, write
+/// gate, repository allowlist, in-flight cap, audit outage) are proxy-level
+/// decisions, not handler outcomes, and keep their own JSON-RPC error
+/// responses; that pre-existing behavior is unchanged by this layer.
 fn local_tool_error(
     rpc_id: Option<&serde_json::Value>,
     http_status: StatusCode,
@@ -957,6 +957,45 @@ fn local_tool_error(
         response: tool_response(rpc_id, true, StatusCode::OK, message),
         http_status: http_status.as_u16(),
         tool_error: Some(true),
+    }
+}
+
+/// Route a broker-owned tool name to its handler.
+///
+/// `name` must satisfy `is_local_tool` (the caller has already enforced the
+/// allowlist, write gate, repository policy, in-flight cap, and audit
+/// pre-flight). The GraphQL and REST endpoints are parameters so the whole
+/// dispatch — every name in `LOCAL_TOOLS` mapped to its own mutation — is
+/// testable without reaching api.github.com.
+///
+/// A name with no handler arm fails closed as a tool error rather than
+/// panicking: a request must never take the process down, and
+/// `test_every_local_tool_dispatches_to_its_handler` fails if a new
+/// `LOCAL_TOOLS` entry is ever added without one.
+async fn dispatch_local_tool(
+    state: &AppState,
+    cred: &McpCredential,
+    frame: &Frame,
+    name: &str,
+    graphql_url: &str,
+    api_url: &str,
+) -> LocalToolResponse {
+    match name {
+        MINIMIZE_COMMENT_TOOL => handle_minimize_comment(state, cred, frame, graphql_url).await,
+        RESTORE_COMMENT_TOOL => handle_restore_comment(state, cred, frame, graphql_url).await,
+        DELETE_PENDING_REVIEW_TOOL => {
+            handle_review_delete_pending(state, cred, frame, graphql_url).await
+        }
+        SUBMIT_REVIEW_TOOL => handle_review_submit(state, cred, frame, graphql_url).await,
+        COMMIT_STATUS_TOOL => handle_commit_status_set(state, cred, frame, api_url).await,
+        other => {
+            tracing::error!("octobroker-owned tool {} has no local handler", other);
+            local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::NOT_IMPLEMENTED,
+                format!("octobroker tool {} is not implemented", other),
+            )
+        }
     }
 }
 
@@ -1001,6 +1040,11 @@ fn normalize_actor(login: &str) -> &str {
 /// Validate the shared `owner`/`repo`/`node_id` argument set. Every local
 /// review-operations tool binds to a repository through these names — they
 /// are also what the proxy's policy layer resolves for the repo allowlist.
+///
+/// Values are trimmed exactly as `policy::resolve_repo` trims them, so the
+/// identity the repository allowlist approved and the identity compared
+/// against the comment/review node are provably the same string. A value
+/// that is empty after trimming is rejected here.
 fn required_repo_node_args<'a>(
     arguments: &'a serde_json::Map<String, serde_json::Value>,
     extra: &[&str],
@@ -1012,7 +1056,8 @@ fn required_repo_node_args<'a>(
         if arguments
             .get(key)
             .and_then(|value| value.as_str())
-            .is_none()
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
         {
             return Err(Box::new(local_tool_error(
                 rpc_id,
@@ -1022,9 +1067,9 @@ fn required_repo_node_args<'a>(
         }
     }
     Ok((
-        arguments["owner"].as_str().unwrap(),
-        arguments["repo"].as_str().unwrap(),
-        arguments["node_id"].as_str().unwrap(),
+        arguments["owner"].as_str().unwrap().trim(),
+        arguments["repo"].as_str().unwrap().trim(),
+        arguments["node_id"].as_str().unwrap().trim(),
     ))
 }
 
@@ -1533,11 +1578,14 @@ async fn handle_review_submit(
 }
 
 /// GitHub owner and repository names are limited to alphanumerics, hyphen,
-/// underscore, and dot. The values become URL path segments, so anything
-/// else is rejected — a crafted argument must not be able to escape the
-/// policy-checked repository path.
+/// underscore, and dot, and the values become URL path segments. A dot is
+/// allowed (GitHub names may contain one) but a dot-only segment is not:
+/// `..` is normalized away by URL parsing, which would let a crafted argument
+/// escape the policy-checked repository path (`/repos/{owner}/{repo}/…`).
 fn valid_repo_segment(value: &str) -> bool {
     !value.is_empty()
+        && value != "."
+        && value != ".."
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
@@ -1580,9 +1628,12 @@ async fn handle_commit_status_set(
             );
         }
     }
-    let owner = arguments["owner"].as_str().unwrap();
-    let repo = arguments["repo"].as_str().unwrap();
-    let sha = arguments["sha"].as_str().unwrap();
+    // Trimmed exactly as `policy::resolve_repo` trims the arguments the
+    // repository allowlist was evaluated against, so the audited identity and
+    // the request path are the same string.
+    let owner = arguments["owner"].as_str().unwrap().trim();
+    let repo = arguments["repo"].as_str().unwrap().trim();
+    let sha = arguments["sha"].as_str().unwrap().trim();
     let status_state = arguments["state"].as_str().unwrap();
     let context = arguments["context"].as_str().unwrap();
 
@@ -2619,6 +2670,9 @@ fn parse_frame(body: &[u8]) -> Option<Frame> {
     })
 }
 
+/// Short session tag for log lines. Every session id reaching this function
+/// comes from `HeaderValue::to_str()`, which rejects anything that is not
+/// visible ASCII, so the 8-byte slice is always a char boundary.
 fn session_suffix(session_id: Option<&str>) -> String {
     match session_id {
         Some(sid) => format!(" [session={}]", &sid[..sid.len().min(8)]),
@@ -2841,17 +2895,65 @@ data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
 
     #[test]
     fn test_inject_custom_tools_each_requires_own_allowlist_entry() {
+        // Default-deny is per tool: allowlisting one broker-owned tool must
+        // never advertise another. Every name in LOCAL_TOOLS is checked, so
+        // dropping the per-tool filter (or a filter for a new tool) is red.
         let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let allowed = vec![COMMIT_STATUS_TOOL.to_string()];
-        let injected = inject_custom_tools(body, Some("application/json"), Some(&allowed)).unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
-        let names: Vec<&str> = json["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect();
-        assert_eq!(names, vec![COMMIT_STATUS_TOOL]);
+        for tool in LOCAL_TOOLS {
+            let other = LOCAL_TOOLS
+                .iter()
+                .find(|candidate| **candidate != *tool)
+                .expect("at least two broker-owned tools");
+            let allowed = vec![other.to_string()];
+            let injected =
+                inject_custom_tools(body, Some("application/json"), Some(&allowed)).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+            let names: Vec<&str> = json["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert_eq!(names, vec![*other], "{} leaked into tools/list", tool);
+            // ...and it appears exactly once when it IS allowlisted.
+            let allowed = vec![tool.to_string()];
+            let injected =
+                inject_custom_tools(body, Some("application/json"), Some(&allowed)).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+            let names: Vec<&str> = json["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert_eq!(names, vec![*tool]);
+        }
+    }
+
+    #[test]
+    fn test_every_local_tool_has_a_schema() {
+        // tools/list must describe every broker-owned tool, and the
+        // description must name the tool (a default arm would otherwise
+        // advertise an unnamed schema to clients).
+        for tool in LOCAL_TOOLS {
+            let definition = local_tool_definition(tool);
+            assert_eq!(definition["name"], *tool);
+            assert!(
+                definition["description"]
+                    .as_str()
+                    .map(|d| !d.is_empty())
+                    .unwrap_or(false),
+                "{} has no description",
+                tool
+            );
+            assert_eq!(
+                definition["inputSchema"]["type"], "object",
+                "{} has no object input schema",
+                tool
+            );
+        }
+        // A name outside the layer has no schema (default-deny surface).
+        assert!(local_tool_definition("octobroker_review_teleport")["name"].is_null());
     }
 
     #[test]
@@ -4381,6 +4483,216 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(captured.lock().unwrap().len(), 0);
     }
 
+    // ---- broker-owned tool dispatch (every name reaches its own handler) ----
+
+    /// Mock api.github.com/graphql that satisfies every broker-owned tool:
+    /// both verification queries and all four mutations succeed, and each
+    /// mutation records its GraphQL operation name.
+    async fn spawn_mock_github_all() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{routing::post, Json, Router};
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let handler = move |Json(body): Json<serde_json::Value>| {
+            let log = log2.clone();
+            async move {
+                let query = body["query"].as_str().unwrap_or_default().to_string();
+                let data = if query.contains("VerifyComment") {
+                    serde_json::json!({"data": {"viewer": {"login": "oab-octobroker[bot]"},
+                        "node": {"author": {"login": "oab-octobroker"},
+                                 "issue": {"repository": {"nameWithOwner": "openabdev/openab"}}}}})
+                } else if query.contains("VerifyReview") {
+                    serde_json::json!({"data": {"viewer": {"login": "oab-octobroker[bot]"},
+                        "node": {"state": "PENDING", "author": {"login": "oab-octobroker"},
+                                 "repository": {"nameWithOwner": "openabdev/openab"}}}})
+                } else if query.contains("UnminimizeComment") {
+                    log.lock().unwrap().push("UnminimizeComment".to_string());
+                    serde_json::json!({"data": {"unminimizeComment": {"unminimizedComment": {"isMinimized": false}}}})
+                } else if query.contains("MinimizeComment") {
+                    log.lock().unwrap().push("MinimizeComment".to_string());
+                    serde_json::json!({"data": {"minimizeComment": {"minimizedComment": {"isMinimized": true}}}})
+                } else if query.contains("DeletePendingReview") {
+                    log.lock().unwrap().push("DeletePendingReview".to_string());
+                    serde_json::json!({"data": {"deletePullRequestReview": {"pullRequestReview": {"id": "PRR_x"}}}})
+                } else if query.contains("SubmitReview") {
+                    log.lock().unwrap().push("SubmitReview".to_string());
+                    let event = body
+                        .pointer("/variables/input/event")
+                        .and_then(|v| v.as_str());
+                    let state = match event {
+                        Some("APPROVE") => "APPROVED",
+                        Some("REQUEST_CHANGES") => "CHANGES_REQUESTED",
+                        _ => "COMMENTED",
+                    };
+                    serde_json::json!({"data": {"submitPullRequestReview": {"pullRequestReview": {"state": state}}}})
+                } else {
+                    serde_json::json!({"data": null, "errors": [{"message": "unmocked query"}]})
+                };
+                Json(data)
+            }
+        };
+        let app = Router::new().route("/", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}/", addr), log)
+    }
+
+    /// Arguments that make each broker-owned tool succeed against the mocks.
+    fn dispatch_args(tool: &str) -> serde_json::Value {
+        let mut args = serde_json::json!({
+            "owner": "openabdev",
+            "repo": "openab",
+            "node_id": "N_kwDOtest",
+        });
+        let map = args.as_object_mut().unwrap();
+        match tool {
+            MINIMIZE_COMMENT_TOOL => {
+                map.insert("classifier".to_string(), "OUTDATED".into());
+            }
+            SUBMIT_REVIEW_TOOL => {
+                map.insert("event".to_string(), "APPROVE".into());
+            }
+            COMMIT_STATUS_TOOL => {
+                map.insert("sha".to_string(), TEST_SHA.into());
+                map.insert("state".to_string(), "failure".into());
+                map.insert("context".to_string(), "OpenAB PR Review".into());
+            }
+            _ => {}
+        }
+        args
+    }
+
+    fn dispatch_frame(tool: &str, arguments: serde_json::Value) -> Frame {
+        Frame {
+            method: "tools/call".to_string(),
+            rpc_id: Some(serde_json::json!(1)),
+            tool: Some(tool.to_string()),
+            arguments: Some(arguments),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_every_local_tool_dispatches_to_its_handler() {
+        // Every name in LOCAL_TOOLS must reach its OWN handler and issue
+        // exactly its own GitHub operation: dropping a dispatch arm, or
+        // wiring a name to the wrong handler, is visible here.
+        let (gql, ops) = spawn_mock_github_all().await;
+        let (api, statuses) =
+            spawn_mock_statuses(201, serde_json::json!({"state": "failure"})).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let expected: Vec<(&str, &str)> = vec![
+            (MINIMIZE_COMMENT_TOOL, "MinimizeComment"),
+            (RESTORE_COMMENT_TOOL, "UnminimizeComment"),
+            (DELETE_PENDING_REVIEW_TOOL, "DeletePendingReview"),
+            (SUBMIT_REVIEW_TOOL, "SubmitReview"),
+            (COMMIT_STATUS_TOOL, "/repos/openabdev/openab/statuses/"),
+        ];
+        assert_eq!(
+            expected.iter().map(|(tool, _)| *tool).collect::<Vec<_>>(),
+            LOCAL_TOOLS.to_vec(),
+            "every broker-owned tool needs its own dispatch expectation"
+        );
+        for (tool, marker) in expected {
+            ops.lock().unwrap().clear();
+            statuses.lock().unwrap().clear();
+            let frame = dispatch_frame(tool, dispatch_args(tool));
+            let out = dispatch_local_tool(&state, &app_cred(), &frame, tool, &gql, &api).await;
+            assert_eq!(out.tool_error, Some(false), "{} must succeed", tool);
+            let ops = ops.lock().unwrap().clone();
+            let paths: Vec<String> = statuses
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect();
+            assert_eq!(
+                ops.len() + paths.len(),
+                1,
+                "{} must issue exactly one GitHub operation (graphql={:?} rest={:?})",
+                tool,
+                ops,
+                paths
+            );
+            assert!(
+                ops.iter().any(|op| op == marker)
+                    || paths.iter().any(|path| path.starts_with(marker)),
+                "{} did not reach its handler: expected {}, got graphql={:?} rest={:?}",
+                tool,
+                marker,
+                ops,
+                paths
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_unknown_tool_fails_closed_without_panic() {
+        // A name with no handler must never take the process down.
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = dispatch_frame("octobroker_review_teleport", serde_json::json!({}));
+        let out = dispatch_local_tool(
+            &state,
+            &app_cred(),
+            &frame,
+            "octobroker_review_teleport",
+            "http://127.0.0.1:1/",
+            "http://127.0.0.1:1/",
+        )
+        .await;
+        assert_eq!(out.tool_error, Some(true));
+        assert_eq!(out.response.status(), StatusCode::OK);
+        assert_eq!(out.http_status, StatusCode::NOT_IMPLEMENTED.as_u16());
+    }
+
+    #[tokio::test]
+    async fn test_review_ops_trim_repo_arguments_like_the_policy_layer() {
+        // `policy::resolve_repo` trims owner/repo before the repository
+        // allowlist is evaluated, so the handler must use the same trimmed
+        // identity: a padded argument is the SAME repository, not a mismatch.
+        let (gql, ops) = spawn_mock_github_all().await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let mut args = dispatch_args(RESTORE_COMMENT_TOOL);
+        args["owner"] = " openabdev ".into();
+        args["repo"] = "openab ".into();
+        let frame = dispatch_frame(RESTORE_COMMENT_TOOL, args);
+        let out = dispatch_local_tool(
+            &state,
+            &app_cred(),
+            &frame,
+            RESTORE_COMMENT_TOOL,
+            &gql,
+            "http://127.0.0.1:1/",
+        )
+        .await;
+        assert_eq!(
+            out.tool_error,
+            Some(false),
+            "trimmed arguments must match the node's repository"
+        );
+        assert_eq!(ops.lock().unwrap().as_slice(), ["UnminimizeComment"]);
+    }
+
+    #[tokio::test]
+    async fn test_review_ops_reject_blank_repo_arguments() {
+        // Trimming must not turn a blank argument into a valid one.
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        for blank in ["   ", ""] {
+            let mut args = dispatch_args(RESTORE_COMMENT_TOOL);
+            args["repo"] = blank.into();
+            let frame = dispatch_frame(RESTORE_COMMENT_TOOL, args);
+            let out = dispatch_local_tool(
+                &state,
+                &app_cred(),
+                &frame,
+                RESTORE_COMMENT_TOOL,
+                "http://127.0.0.1:1/",
+                "http://127.0.0.1:1/",
+            )
+            .await;
+            assert_eq!(out.tool_error, Some(true), "repo={:?}", blank);
+        }
+    }
+
     // ---- octobroker-owned tool: commit status (mock REST) ----
 
     type StatusesLog = Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
@@ -4476,7 +4788,12 @@ data: "id":1,"result":{"tools":[]}}
             ("sha", serde_json::json!("../../evil")),   // path escape
             ("owner", serde_json::json!("open/abdev")), // path escape
             ("repo", serde_json::json!("openab?x=1")),  // query injection
-            ("context", serde_json::json!("   ")),      // blank context
+            // dot-only segments pass the character allowlist but URL
+            // normalization would collapse them out of /repos/{owner}/{repo}
+            ("owner", serde_json::json!("..")),
+            ("repo", serde_json::json!("..")),
+            ("owner", serde_json::json!(".")),
+            ("context", serde_json::json!("   ")), // blank context
             ("target_url", serde_json::json!("javascript:alert(1)")),
             ("description", serde_json::json!("x".repeat(141))),
         ];
@@ -5046,6 +5363,100 @@ data: "id":1,"result":{"tools":[]}}
         let denied_path = audit_tmp("write-denied");
         assert!(read_audit(&denied_path).is_empty());
         std::fs::remove_file(&denied_path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_local_review_tool_dispatch_is_audited_and_never_proxied() {
+        // The broker-owned dispatch is the one write path that does NOT go
+        // upstream. It must be reachable only through the full proxy (agent
+        // allowlist, write gate, repository policy, in-flight cap, fail-closed
+        // audit pre-flight) and must leave a request+result audit trail.
+        // Arguments are deliberately incomplete so the handler rejects them
+        // before any GitHub call — this asserts the wiring, not GitHub.
+        let (url, captured) = spawn_mock_upstream().await;
+        let path = audit_tmp("local-tool");
+        // The sink appends: start from a clean file so a previously aborted
+        // run cannot make the record assertions pass or fail spuriously.
+        std::fs::remove_file(&path).ok();
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let state = test_state_writes_enabled(
+            &url,
+            sink,
+            vec![agent_with_repos(
+                "bot-w",
+                "key-w",
+                &[SUBMIT_REVIEW_TOOL],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"octobroker_review_submit","arguments":{"owner":"openabdev","repo":"octobroker"}}}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        // A tool error stays correlated to the request and rides HTTP 200.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["result"]["isError"], true);
+        assert!(
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("node_id"),
+            "handler-level argument error, got {}",
+            String::from_utf8_lossy(&body)
+        );
+        // The upstream GitHub MCP server never sees a broker-owned tool.
+        assert!(captured.lock().unwrap().is_empty());
+        // Durable audit: request + result, attributed to the agent.
+        let records = read_audit(&path);
+        assert_eq!(records.len(), 2, "request + result records");
+        assert_eq!(records[0]["phase"], "request");
+        assert_eq!(records[0]["tool"], SUBMIT_REVIEW_TOOL);
+        assert_eq!(records[0]["agent"], "bot-w");
+        assert_eq!(records[0]["rpc_id"], 7);
+        assert_eq!(records[0]["repo"], "openabdev/octobroker");
+        assert_eq!(records[0]["decision"], "allow");
+        assert_eq!(records[1]["phase"], "result");
+        assert_eq!(records[1]["tool"], SUBMIT_REVIEW_TOOL);
+        assert_eq!(records[1]["tool_error"], true);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_local_review_tool_rejected_when_audit_unavailable() {
+        // Fail-closed: a broker-owned write whose audit record cannot be
+        // persisted must be rejected BEFORE the handler runs, exactly like an
+        // upstream write.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_writes_enabled(
+            &url,
+            crate::audit::AuditSink::failing_for_tests(),
+            vec![agent_with_repos(
+                "bot-w",
+                "key-w",
+                &[SUBMIT_REVIEW_TOOL],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"octobroker_review_submit","arguments":{"owner":"openabdev","repo":"octobroker","node_id":"PRR_x","event":"APPROVE"}}}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(captured.lock().unwrap().is_empty());
     }
 
     #[test]

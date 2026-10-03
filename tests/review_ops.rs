@@ -173,52 +173,93 @@ impl Drop for Broker {
     }
 }
 
-fn spawn_broker(config: &str) -> Broker {
+/// Path of the `octobroker` binary built next to this test executable
+/// (`target/<profile>/deps/<test-bin>` → `target/<profile>/octobroker`).
+///
+/// `env!("CARGO_BIN_EXE_octobroker")` bakes in an absolute path that is only
+/// valid for the directory cargo happened to build in. These tests are also
+/// run from detached verification worktrees that share one `target/`
+/// directory, so a test binary compiled there would try to spawn a path that
+/// no longer exists once that worktree is removed. Resolving relative to the
+/// running test binary is correct in every build directory.
+fn broker_binary() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let profile_dir = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("target/<profile>/deps/<test-bin> layout");
+    let binary = profile_dir.join(format!("octobroker{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        binary.is_file(),
+        "octobroker binary not built at {}",
+        binary.display()
+    );
+    binary
+}
+
+/// One spawn attempt: returns `Err` when the child could not start or died
+/// before `/healthz` answered (a lost port race looks exactly like this).
+fn try_spawn_broker(config: &str, port: u16) -> Result<Broker, String> {
     let dir = std::env::temp_dir().join(format!(
         "octobroker-reviewops-it-{}-{}",
         std::process::id(),
         NEXT_DIR.fetch_add(1, Ordering::SeqCst)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("config.toml"), config).unwrap();
+    let config_path = dir.join("config.toml");
+    let config = config.replace("{PORT}", &port.to_string());
+    std::fs::write(&config_path, config).unwrap();
     let log_path = dir.join("server.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_octobroker"))
+    let child = Command::new(broker_binary())
         .env_clear()
-        .env("OCTOBROKER_CONFIG", dir.join("config.toml"))
+        .env("OCTOBROKER_CONFIG", &config_path)
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()))
         .spawn()
-        .expect("spawn octobroker");
-    let port = config
-        .lines()
-        .find_map(|l| l.strip_prefix("port = "))
-        .and_then(|v| v.trim().parse().ok())
-        .expect("config must set port");
+        .map_err(|e| format!("spawn octobroker: {e}"))?;
     let mut broker = Broker { child, port, dir };
-    wait_ready(&mut broker, &log_path);
-    broker
+    wait_ready(&mut broker, &log_path)?;
+    Ok(broker)
 }
 
-fn wait_ready(broker: &mut Broker, log_path: &Path) {
+/// Boot a broker on a free port, retrying on the bind race: the port is
+/// chosen by binding and releasing a socket, so another process (or a
+/// parallel test in this suite) can take it in between. A lost race is
+/// reported by an early child exit, never by a flaky assertion.
+fn spawn_broker(config: &str) -> Broker {
+    const ATTEMPTS: usize = 5;
+    let mut last = String::new();
+    for _ in 0..ATTEMPTS {
+        match try_spawn_broker(config, free_port()) {
+            Ok(broker) => return broker,
+            Err(e) => last = e,
+        }
+    }
+    panic!("octobroker did not start after {ATTEMPTS} attempts: {last}");
+}
+
+/// Poll `/healthz` until it answers, or report why the child is not usable.
+fn wait_ready(broker: &mut Broker, log_path: &Path) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(status) = broker.child.try_wait().unwrap() {
-            panic!(
+            return Err(format!(
                 "octobroker exited early ({status}); log:\n{}",
                 std::fs::read_to_string(log_path).unwrap_or_default()
-            );
+            ));
         }
         if let Some((200, _, _)) = http(broker.port, "GET", "/healthz", &[], "") {
-            return;
+            return Ok(());
         }
-        assert!(
-            Instant::now() < deadline,
-            "octobroker did not become ready; log:\n{}",
-            std::fs::read_to_string(log_path).unwrap_or_default()
-        );
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "octobroker did not become ready; log:\n{}",
+                std::fs::read_to_string(log_path).unwrap_or_default()
+            ));
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -257,10 +298,9 @@ const REVIEW_ARGS: &str = r#"{"owner":"openabdev","repo":"octobroker","node_id":
 #[test]
 fn local_review_tools_denied_in_network_trust_mode() {
     let upstream = spawn_stub_upstream();
-    let port = free_port();
     let up = upstream.port;
     let config = format!(
-        r#"port = {port}
+        r#"port = {{PORT}}
 
 [[identities]]
 id = "local"
@@ -289,14 +329,13 @@ upstream = "http://127.0.0.1:{up}/"
 #[test]
 fn local_review_tools_denied_when_writes_disabled() {
     let upstream = spawn_stub_upstream();
-    let port = free_port();
     let up = upstream.port;
     let tools: Vec<String> = LOCAL_REVIEW_TOOLS
         .iter()
         .map(|t| format!("\"{t}\""))
         .collect();
     let config = format!(
-        r#"port = {port}
+        r#"port = {{PORT}}
 
 [[identities]]
 id = "local"
@@ -331,10 +370,9 @@ repos = ["openabdev/octobroker"]
 #[test]
 fn local_review_tools_require_explicit_allowlist() {
     let upstream = spawn_stub_upstream();
-    let port = free_port();
     let up = upstream.port;
     let config = format!(
-        r#"port = {port}
+        r#"port = {{PORT}}
 
 [[identities]]
 id = "local"
@@ -364,10 +402,9 @@ tools = ["issue_read"]
 #[test]
 fn upstream_tools_still_proxied() {
     let upstream = spawn_stub_upstream();
-    let port = free_port();
     let up = upstream.port;
     let config = format!(
-        r#"port = {port}
+        r#"port = {{PORT}}
 
 [[identities]]
 id = "local"
