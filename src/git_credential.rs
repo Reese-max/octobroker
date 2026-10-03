@@ -45,6 +45,9 @@ pub async fn git_credential(
     // strict charset (GitHub logins: alphanumeric + hyphen; repo names:
     // alphanumeric + `-_.`). Percent-encoded or exotic input is rejected
     // here — before the allowlist, audit preflight, or any mint attempt.
+    // Dot-only names are rejected too: they are not valid GitHub
+    // repositories and would resolve to the *owner*'s own URL when the
+    // ref-policy reads are built.
     let Some((owner, name)) =
         params
             .get("repo")
@@ -52,6 +55,7 @@ pub async fn git_credential(
             .filter(|(o, n)| {
                 !o.is_empty()
                     && !n.is_empty()
+                    && !matches!(*n, "." | "..")
                     && o.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
                     && n.bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
@@ -176,7 +180,7 @@ pub async fn git_credential(
             &cred_label,
             &repo_label,
             mode,
-            false,
+            Some("owner_verification_failed"),
             None,
         ) {
             tracing::error!("git-credential failure result audit failed: {}", audit_err);
@@ -199,7 +203,7 @@ pub async fn git_credential(
                 &cred_label,
                 &repo_label,
                 mode,
-                false,
+                Some("mint_failed"),
                 None,
             ) {
                 tracing::error!("git-credential failure result audit failed: {}", audit_err);
@@ -216,34 +220,53 @@ pub async fn git_credential(
     // push-capable credential. Read-only (contents:read) credentials are
     // exempt: they cannot push, so there is no ref to police. Runs after
     // the mint because the reads are authenticated by the repo-scoped token
-    // itself; a denial never returns it.
+    // itself; a denial never returns it and drops it from the token cache,
+    // so a refused request leaves no live push-capable credential behind.
     if state.config.mcp.require_protected_default_branch && !read_only {
         let denial = match provider
             .default_branch_protected(owner, name, &token.token)
             .await
         {
             Ok(crate::ref_policy::Protection::Protected) => None,
-            Ok(crate::ref_policy::Protection::Unprotected) => Some(
-                "the repository's default branch is not protected — see the ref-level push policy in the README".to_string(),
-            ),
-            Err(e) => Some(format!(
-                "the repository's default branch protection could not be verified: {}",
-                e
+            // Two denials, deliberately distinct: a repository that needs
+            // hardening (403 — add the ruleset) versus an answer we could not
+            // obtain at all (503 — GitHub unreachable, rate limited, timed
+            // out; retry). The cause is echoed because it names the failing
+            // read, never the credential.
+            Ok(crate::ref_policy::Protection::Unprotected) => Some((
+                StatusCode::FORBIDDEN,
+                "unprotected_default_branch",
+                "the repository's default branch is not protected — see the ref-level push policy in the README"
+                    .to_string(),
+            )),
+            Err(e) => Some((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unverifiable_default_branch",
+                format!(
+                    "the repository's default branch protection could not be verified: {}",
+                    e
+                ),
             )),
         };
-        if let Some(reason) = denial {
-            tracing::warn!("git-credential DENIED ({}) [agent={}]", reason, agent.id);
+        if let Some((status, reason, message)) = denial {
+            tracing::warn!(
+                "git-credential DENIED [agent={}, reason={}, detail={}]",
+                agent.id,
+                reason,
+                message
+            );
+            provider.evict_git_tokens(name);
             if let Err(audit_err) = sink.record_git_credential_result(
                 &agent.id,
                 &cred_label,
                 &repo_label,
                 mode,
-                false,
+                Some(reason),
                 None,
             ) {
                 tracing::error!("git-credential failure result audit failed: {}", audit_err);
             }
-            return rpc_error(StatusCode::FORBIDDEN, &reason);
+            return rpc_error(status, &message);
         }
     }
 
@@ -253,7 +276,7 @@ pub async fn git_credential(
         &cred_label,
         &repo_label,
         mode,
-        true,
+        None,
         Some(token.expires_at),
     ) {
         tracing::error!(
@@ -344,18 +367,15 @@ mod tests {
         // from the repository name so one stateless mock serves every case:
         //   <repo>-unprotected → default branch reports protected:false
         //   <repo>-ghfail      → the branch read fails (500)
+        //   <repo>-metafail    → the repository read fails (500)
+        //   <repo>-nodefault   → the repository reports no default branch
+        //   <repo>-flip        → protected on the first branch read, then the
+        //                       repository becomes unreachable
         //   <repo>-slash       → default branch is "release/v1" (a branch
         //                       name containing a slash)
         //   anything else       → default branch "main", protected:true
         async fn repo_meta(
             Path((_owner, repo)): Path<(String, String)>,
-        ) -> axum::Json<serde_json::Value> {
-            axum::Json(serde_json::json!({
-                "default_branch": default_branch_of(&repo),
-            }))
-        }
-        async fn repo_branch(
-            Path((_owner, repo, branch)): Path<(String, String, String)>,
         ) -> axum::response::Response {
             let json = |value: serde_json::Value| {
                 axum::response::Response::builder()
@@ -364,25 +384,74 @@ mod tests {
                     .body(axum::body::Body::from(value.to_string()))
                     .unwrap()
             };
-            if repo.ends_with("-ghfail") {
+            if repo.ends_with("-metafail") {
                 return axum::response::Response::builder()
                     .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                     .body(axum::body::Body::from("boom"))
                     .unwrap();
             }
-            // Only the repo's real default branch exists: asking for any
-            // other name 404s, exactly as GitHub would.
-            if branch != default_branch_of(&repo) {
-                return axum::response::Response::builder()
-                    .status(axum::http::StatusCode::NOT_FOUND)
-                    .body(axum::body::Body::from("{\"message\":\"Branch not found\"}"))
-                    .unwrap();
+            if repo.ends_with("-nodefault") {
+                return json(serde_json::json!({"default_branch": null}));
             }
             json(serde_json::json!({
-                "name": branch,
-                "protected": !repo.ends_with("-unprotected"),
+                "default_branch": default_branch_of(&repo),
             }))
         }
+        // Per-repository branch-read counter, so `<repo>-flip` can answer
+        // once and fail afterwards (see below).
+        let branch_reads = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            usize,
+        >::new()));
+        let counter = branch_reads.clone();
+        let repo_branch = move |Path((_owner, repo, branch)): Path<(String, String, String)>| {
+            let counter = counter.clone();
+            async move {
+                let reply = |status: axum::http::StatusCode, body: String| {
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                };
+                let server_error = || {
+                    reply(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "boom".to_string(),
+                    )
+                };
+                if repo.ends_with("-ghfail") {
+                    return server_error();
+                }
+                if repo.ends_with("-flip") {
+                    // Protected on the first read, unreachable afterwards: a
+                    // later request that still succeeds can only have used a
+                    // cached verdict.
+                    let mut reads = counter.lock().unwrap();
+                    let seen = reads.entry(repo.clone()).or_insert(0);
+                    *seen += 1;
+                    if *seen > 1 {
+                        return server_error();
+                    }
+                }
+                // Only the repo's real default branch exists: asking for any
+                // other name 404s, exactly as GitHub would.
+                if branch != default_branch_of(&repo) {
+                    return reply(
+                        axum::http::StatusCode::NOT_FOUND,
+                        "{\"message\":\"Branch not found\"}".to_string(),
+                    );
+                }
+                reply(
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({
+                        "name": branch,
+                        "protected": !repo.ends_with("-unprotected"),
+                    })
+                    .to_string(),
+                )
+            }
+        };
 
         let log: MintLog = Arc::new(std::sync::Mutex::new(Vec::new()));
         let app = axum::Router::new()
@@ -496,6 +565,9 @@ mod tests {
                                     // ref-policy fixtures (see spawn_mock_github)
                                     "openabdev/openab-unprotected",
                                     "openabdev/openab-ghfail",
+                                    "openabdev/openab-metafail",
+                                    "openabdev/openab-nodefault",
+                                    "openabdev/openab-flip",
                                     "openabdev/openab-slash",
                                     "oablab/chi",
                                     "mislabeled/repo",
@@ -773,6 +845,8 @@ mod tests {
             "openabdev/open%20ab", // decodes to a space
             "openabdev/open+ab",   // '+' decodes to a space
             "open~abdev/openab",   // invalid owner charset
+            "openabdev/.",         // dot-only name resolves to the owner's URL
+            "openabdev/..",
         ] {
             let resp = app(state.clone())
                 .oneshot(req(bad, Some("key-b0")))
@@ -863,6 +937,9 @@ mod tests {
         let records = audit_records(&path);
         assert_eq!(records.len(), 2);
         assert_eq!(records[1]["success"], true);
+        // A successful issuance names no denial.
+        assert!(records[1]["denial"].is_null());
+        assert!(records[1]["expires_at"].as_u64().unwrap() > 0);
         std::fs::remove_file(&path).ok();
     }
 
@@ -870,8 +947,8 @@ mod tests {
     async fn test_unprotected_default_branch_denies_push_credential() {
         let path = audit_tmp("refpolicy-unprotected");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
-        let (state, _mint_log) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
-        let resp = app(state)
+        let (state, mint_log) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        let resp = app(state.clone())
             .oneshot(req("openabdev/openab-unprotected", Some("key-b0")))
             .await
             .unwrap();
@@ -887,14 +964,77 @@ mod tests {
             text
         );
         assert!(text.contains("not protected"), "got: {}", text);
-        // Audited as a failed issuance (preflight + result, no expiry).
+        // Audited as a failed issuance with the policy named (preflight +
+        // result, no expiry) — the operator can tell "needs hardening" from
+        // an unreadable answer.
         let records = audit_records(&path);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["phase"], "git_credential_request");
         assert_eq!(records[1]["phase"], "git_credential_result");
         assert_eq!(records[1]["success"], false);
         assert_eq!(records[1]["mode"], "write");
+        assert_eq!(records[1]["denial"], "unprotected_default_branch");
         assert!(records[1]["expires_at"].is_null());
+        assert!(!records[1].to_string().contains("ghs_git_openabdev"));
+        // A denied issuance leaves no live push-capable credential cached:
+        // the second attempt mints again rather than reusing the first.
+        assert_eq!(mint_log.lock().unwrap().len(), 1);
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-unprotected", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            mint_log.lock().unwrap().len(),
+            2,
+            "denied credential must be evicted from the token cache"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_protection_check_fails_closed_when_github_errors() {
+        let path = audit_tmp("refpolicy-ghfail");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let (state, _) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        let resp = app(state)
+            .oneshot(req("openabdev/openab-ghfail", Some("key-b0")))
+            .await
+            .unwrap();
+        // An unreadable answer is never a pass, and it is NOT reported as a
+        // policy denial: 503 (retry) with its own audit reason, so a GitHub
+        // outage does not read as "this repo needs hardening".
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let records = audit_records(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["success"], false);
+        assert_eq!(records[1]["denial"], "unverifiable_default_branch");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_protection_check_fails_closed_on_metadata_failures() {
+        let path = audit_tmp("refpolicy-meta");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        let (state, _) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
+        // The repository read itself failing, and a repository that reports
+        // no default branch, are both "protection not proven".
+        for repo in ["openabdev/openab-metafail", "openabdev/openab-nodefault"] {
+            let resp = app(state.clone())
+                .oneshot(req(repo, Some("key-b0")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", repo);
+        }
+        let records = audit_records(&path);
+        assert_eq!(records.len(), 4, "preflight + result per request");
+        for record in records
+            .iter()
+            .filter(|r| r["phase"] == "git_credential_result")
+        {
+            assert_eq!(record["success"], false);
+            assert_eq!(record["denial"], "unverifiable_default_branch");
+        }
         std::fs::remove_file(&path).ok();
     }
 
@@ -936,19 +1076,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_protection_check_fails_closed_on_github_error() {
-        let path = audit_tmp("refpolicy-ghfail");
+    async fn test_protection_verdict_is_reused_within_its_ttl() {
+        let path = audit_tmp("refpolicy-cached");
         let sink = crate::audit::AuditSink::open(&path).unwrap();
         let (state, _) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
-        let resp = app(state)
-            .oneshot(req("openabdev/openab-ghfail", Some("key-b0")))
-            .await
-            .unwrap();
-        // An unreadable answer is never a pass: 5xx from GitHub denies.
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let records = audit_records(&path);
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[1]["success"], false);
+        // `<repo>-flip` reports a protected default branch once and then fails
+        // every read, so a second request that still succeeds can only have
+        // used the cached verdict. The window is deliberate and bounded by
+        // PROTECT_TTL (a protection removed a moment ago can still pass for
+        // at most that long); denials are never cached, so fixing a
+        // repository takes effect at once.
+        for attempt in 1..=2 {
+            let resp = app(state.clone())
+                .oneshot(req("openabdev/openab-flip", Some("key-b0")))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "attempt {} should reuse the cached verdict",
+                attempt
+            );
+        }
         std::fs::remove_file(&path).ok();
     }
 
@@ -959,7 +1108,11 @@ mod tests {
         let (state, _) = test_state_with_ref_policy(true, false, true, Some(sink)).await;
         // Default branch is "release/v1": the branch that gets checked is
         // the one GitHub reports, not a hardcoded "main" — asking for any
-        // other name 404s in the mock, exactly as GitHub would.
+        // other name 404s in the mock, exactly as GitHub would. (That the
+        // name travels percent-encoded is pinned by
+        // app_token::tests::test_branch_url_carries_the_branch_as_one_segment;
+        // axum percent-decodes the path parameter, so this mock cannot
+        // distinguish the two wire forms.)
         let resp = app(state)
             .oneshot(req("openabdev/openab-slash", Some("key-b0")))
             .await

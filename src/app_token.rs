@@ -29,9 +29,29 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 const VERIFY_TTL: Duration = Duration::from_secs(3600);
 
 /// Hard ceiling on any single GitHub App API call (JWT-authenticated mint,
-/// installation resolution/verification). Without it a stalled connection
-/// would hold a singleflight waiter queue indefinitely.
+/// installation resolution/verification, and the token-authenticated
+/// protection reads). Without it a stalled connection would hold a
+/// singleflight waiter queue — or a credential request — indefinitely.
 const MINT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ceiling for the ref-policy protection reads (#49). Kept below the client
+/// helper's own budget (`obk` abandons a credential request after 15s) so a
+/// slow GitHub answer becomes a clean fail-closed denial here instead of a
+/// client-side timeout.
+const PROTECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a *positive* protection verdict may be reused (#49). GitHub
+/// applies branch protection / rulesets out of band, so a short window keeps
+/// a push-heavy agent from spending two API calls per git operation while
+/// bounding how long a just-removed protection could still pass. Only
+/// positives are cached: a denial or an unreadable answer is always
+/// re-checked, so fixing a repository takes effect immediately.
+const PROTECT_TTL: Duration = Duration::from_secs(60);
+
+/// Cap on cached protection verdicts. A wildcard-allowlisted agent can name
+/// repositories octobroker has never seen, so the map is dropped wholesale
+/// rather than grown without bound.
+const PROTECT_CACHE_MAX: usize = 1024;
 
 /// A minted installation token plus its expiry (unix seconds).
 #[derive(Clone, Debug)]
@@ -63,6 +83,9 @@ pub struct AppTokenProvider {
     /// with the verification time — re-checked after VERIFY_TTL. The
     /// configured owner label is not trusted by itself.
     verified_owner: Mutex<Option<(String, u64)>>,
+    /// Ref-policy protection verdicts (`owner/repo` → expiry), positives
+    /// only, bounded by PROTECT_CACHE_MAX (#49).
+    protected_branches: Mutex<HashMap<String, u64>>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +133,7 @@ impl AppTokenProvider {
             cached: Mutex::new(HashMap::new()),
             mint_locks: Mutex::new(HashMap::new()),
             verified_owner: Mutex::new(None),
+            protected_branches: Mutex::new(HashMap::new()),
         })
     }
 
@@ -355,10 +379,11 @@ impl AppTokenProvider {
     /// Contents: read. No extra App permission is required.
     ///
     /// `Ok(Protected)` only when GitHub reports `protected: true` for the
-    /// default branch (that flag covers classic branch protection *and*
-    /// rulesets). `Ok(Unprotected)` when GitHub reports no protection;
+    /// current default branch (that flag covers classic branch protection
+    /// *and* rulesets). `Ok(Unprotected)` when GitHub reports no protection;
     /// `Err` when the check could not be completed at all (transport
-    /// failure, non-2xx, unparsable body, no default branch name). Callers
+    /// failure, non-2xx including rate limiting, unparsable body, no
+    /// default branch name, or the read exceeding PROTECT_TIMEOUT). Callers
     /// must deny on `Err` too — it is never a pass.
     pub async fn default_branch_protected(
         &self,
@@ -366,20 +391,74 @@ impl AppTokenProvider {
         repository: &str,
         token: &str,
     ) -> Result<crate::ref_policy::Protection, String> {
-        let repo_url = format!("{}/repos/{}/{}", self.api_base, owner, repository);
-        let repo = self.get_json(&repo_url, token).await?;
-        let branch = crate::ref_policy::default_branch(&repo).ok_or_else(|| {
-            format!(
-                "repository {}/{} reports no default branch",
-                owner, repository
+        if self.protected_verdict(owner, repository).is_some() {
+            return Ok(crate::ref_policy::Protection::Protected);
+        }
+        let repo_url = repo_url(&self.api_base, owner, repository)?;
+        let branch = tokio::time::timeout(PROTECT_TIMEOUT, async {
+            let repo = self.get_json(&repo_url, token).await?;
+            let branch = crate::ref_policy::default_branch(&repo).ok_or_else(|| {
+                format!(
+                    "repository {}/{} reports no default branch",
+                    owner, repository
+                )
+            })?;
+            let branch_url = branch_url(&self.api_base, owner, repository, branch)?;
+            let branch_value = self.get_json(&branch_url, token).await?;
+            Ok::<crate::ref_policy::Protection, String>(
+                crate::ref_policy::default_branch_protected(Some(&repo), Some(&branch_value)),
             )
-        })?;
-        let branch_url = branch_url(&self.api_base, owner, repository, branch)?;
-        let branch_value = self.get_json(&branch_url, token).await?;
-        Ok(crate::ref_policy::default_branch_protected(
-            Some(&repo),
-            Some(&branch_value),
-        ))
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "protection check for {}/{} exceeded {}s",
+                owner,
+                repository,
+                PROTECT_TIMEOUT.as_secs()
+            )
+        })??;
+        if branch == crate::ref_policy::Protection::Protected {
+            self.remember_protected(owner, repository);
+        }
+        Ok(branch)
+    }
+
+    /// Drop every cached git credential for `repository` (both permission
+    /// envelopes). Called when issuance is denied AFTER the mint, so a
+    /// refused request leaves no live push-capable token behind.
+    pub fn evict_git_tokens(&self, repository: &str) {
+        let mut cached = self.cached.lock().unwrap();
+        for purpose in ["git:contents=read", "git:contents=write"] {
+            // Mirrors the single-repository cache key built by token_for.
+            cached.remove(&format!("{}:{}", purpose, repository));
+        }
+    }
+
+    /// A cached, unexpired positive verdict for this repository, if any.
+    fn protected_verdict(&self, owner: &str, repository: &str) -> Option<u64> {
+        let key = protection_cache_key(owner, repository);
+        let mut map = self.protected_branches.lock().unwrap();
+        match map.get(&key).copied() {
+            Some(expiry) if expiry > unix_now() => Some(expiry),
+            _ => {
+                // Expired or unknown: drop it so the map only ever holds
+                // live verdicts.
+                map.remove(&key);
+                None
+            }
+        }
+    }
+
+    fn remember_protected(&self, owner: &str, repository: &str) {
+        let mut map = self.protected_branches.lock().unwrap();
+        if map.len() >= PROTECT_CACHE_MAX {
+            map.clear();
+        }
+        map.insert(
+            protection_cache_key(owner, repository),
+            unix_now() + PROTECT_TTL.as_secs(),
+        );
     }
 
     /// Installation-token-authenticated GET returning parsed JSON, or an
@@ -476,26 +555,46 @@ fn parse_rfc3339_unix(s: &str) -> Option<u64> {
     u64::try_from(parsed.unix_timestamp()).ok()
 }
 
+/// `<api_base>/repos/<owner>/<repo>` with owner and repository carried as
+/// path segments. Repository names may contain `.` — including a bare `..`,
+/// which a raw interpolation would let the URL parser collapse into a
+/// different route.
+fn repo_url(api_base: &str, owner: &str, repository: &str) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(&format!("{}/repos", api_base))
+        .map_err(|e| format!("invalid repository URL: {}", e))?;
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| "api_base is not a hierarchical URL".to_string())?;
+    segments.pop_if_empty().push(owner).push(repository);
+    drop(segments);
+    Ok(url.to_string())
+}
+
 /// `<api_base>/repos/<owner>/<repo>/branches/<branch>` with the branch name
 /// carried as a single path segment. Branch names may contain `/`
-/// (`release/v1`); interpolating one raw would address a different route
-/// (and a name containing `..` or a query would rewrite the request), so it
-/// is percent-encoded.
+/// (`release/v1`); interpolating one raw would address a different route,
+/// so it is percent-encoded.
 fn branch_url(
     api_base: &str,
     owner: &str,
     repository: &str,
     branch: &str,
 ) -> Result<String, String> {
-    let mut url = reqwest::Url::parse(&format!(
-        "{}/repos/{}/{}/branches",
-        api_base, owner, repository
-    ))
-    .map_err(|e| format!("invalid branch URL: {}", e))?;
-    url.path_segments_mut()
-        .map_err(|_| "repository path is not a valid URL base".to_string())?
-        .push(branch);
+    let mut url = reqwest::Url::parse(&repo_url(api_base, owner, repository)?)
+        .map_err(|e| format!("invalid branch URL: {}", e))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "repository path is not a valid URL base".to_string())?;
+        segments.pop_if_empty().push("branches").push(branch);
+    }
     Ok(url.to_string())
+}
+
+/// Cache key for a protection verdict. Owner case is folded, matching the
+/// installation routing (`verify_owner` compares lowercased logins).
+fn protection_cache_key(owner: &str, repository: &str) -> String {
+    format!("{}/{}", owner.to_lowercase(), repository)
 }
 
 /// Multi-app mode: one `AppTokenProvider` per repository owner, enabling
@@ -757,6 +856,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_repo_url_carries_owner_and_repo_as_segments() {
+        assert_eq!(
+            repo_url("https://api.github.com", "openabdev", "openab").unwrap(),
+            "https://api.github.com/repos/openabdev/openab"
+        );
+        // A name carrying URL-significant characters can only ever be a path
+        // segment: it must not introduce a query or a fragment. (A dot-only
+        // name is additionally refused by the /git-credential charset check
+        // before any URL is built.)
+        for name in ["..", "a?b=c", "a#b", "openab/../escape"] {
+            let url = repo_url("https://api.github.com", "acme", name).unwrap();
+            assert!(!url.contains('?'), "{} rewrote the query: {}", name, url);
+            assert!(!url.contains('#'), "{} added a fragment: {}", name, url);
+        }
+        assert!(repo_url("not-a-url", "o", "r").is_err());
+    }
+
+    #[test]
     fn test_branch_url_carries_the_branch_as_one_segment() {
         // A branch name containing a slash must stay ONE path segment: the
         // mock/reality contract is `.../branches/{branch}`, not a nested
@@ -786,6 +903,70 @@ pub(crate) mod tests {
     #[test]
     fn test_branch_url_rejects_a_non_http_base() {
         assert!(branch_url("not-a-url", "o", "r", "main").is_err());
+    }
+
+    #[test]
+    fn test_protection_verdict_cache_is_positive_only_and_bounded() {
+        let p = AppTokenProvider::new("123".into(), TEST_RSA_PEM, Some(1), None, "http://x".into())
+            .unwrap();
+        // Nothing remembered yet.
+        assert!(p.protected_verdict("openabdev", "openab").is_none());
+        p.remember_protected("openabdev", "openab");
+        // Owner case is folded like installation routing.
+        assert!(p.protected_verdict("OpenABdev", "openab").is_some());
+        // Another repository is a miss.
+        assert!(p.protected_verdict("openabdev", "other").is_none());
+        // An expired verdict is neither returned nor left behind.
+        p.protected_branches
+            .lock()
+            .unwrap()
+            .insert(protection_cache_key("openabdev", "stale"), unix_now() - 1);
+        assert!(p.protected_verdict("openabdev", "stale").is_none());
+        assert!(!p
+            .protected_branches
+            .lock()
+            .unwrap()
+            .contains_key(&protection_cache_key("openabdev", "stale")));
+        // A wildcard-allowlisted agent can name repositories octobroker has
+        // never seen: the map must not grow without bound.
+        for i in 0..(PROTECT_CACHE_MAX + 10) {
+            p.remember_protected("openabdev", &format!("wildcard-{}", i));
+        }
+        assert!(
+            p.protected_branches.lock().unwrap().len() <= PROTECT_CACHE_MAX,
+            "protection cache must stay bounded"
+        );
+    }
+
+    #[test]
+    fn test_evict_git_tokens_drops_only_that_repository() {
+        let p = AppTokenProvider::new("123".into(), TEST_RSA_PEM, Some(1), None, "http://x".into())
+            .unwrap();
+        let exp = unix_now() + 3600;
+        let mut cached = p.cached.lock().unwrap();
+        for key in [
+            "git:contents=write:openab",
+            "git:contents=read:openab",
+            "git:contents=write:openab-ab",
+            "mcp:openab",
+        ] {
+            cached.insert(
+                key.to_string(),
+                AppToken {
+                    token: "ghs_x".into(),
+                    expires_at: exp,
+                },
+            );
+        }
+        drop(cached);
+        p.evict_git_tokens("openab");
+        let cached = p.cached.lock().unwrap();
+        // Both git envelopes for THIS repository go; a repository whose name
+        // merely ends with it, and the MCP namespace, stay.
+        assert!(!cached.contains_key("git:contents=write:openab"));
+        assert!(!cached.contains_key("git:contents=read:openab"));
+        assert!(cached.contains_key("git:contents=write:openab-ab"));
+        assert!(cached.contains_key("mcp:openab"));
     }
 
     #[tokio::test]

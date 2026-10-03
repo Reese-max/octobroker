@@ -73,12 +73,16 @@ enabled = false
 # boundary (octobroker does not proxy git to police refs). With this set,
 # octobroker reads GET /repos/{owner}/{repo} and
 # GET /repos/{owner}/{repo}/branches/{default_branch} before returning a
-# push-capable token, and denies (403, audited as a failed issuance) unless
-# GitHub reports protected:true. Fail-closed: an API error or an
-# unreadable answer denies too. Read-only credentials are exempt — they
-# cannot push. No extra App permission needed (Metadata + Contents: read).
-# See README "Ref-level push policy" for the ruleset setup. Requires
-# enable_git_credentials. Default false.
+# push-capable token, and requires GitHub to report protected:true for the
+# repository's CURRENT default branch. Fail-closed: an unprotected branch,
+# a missing default branch, an API error or an unreadable answer all deny
+# (403 for unprotected, 503 when the check could not be completed — the
+# audit record names which). Read-only credentials are exempt — they cannot
+# push. No extra App permission needed (Metadata + Contents: read). NOTE:
+# `protected` does not imply "direct pushes are blocked" — configure a
+# ruleset requiring a pull request, and treat this flag as the tripwire that
+# notices when it is missing. See README "Ref-level push policy".
+# Requires enable_git_credentials. Default false.
 # require_protected_default_branch = false
 # Max concurrent write calls per agent (0 = unlimited).
 # max_inflight_writes = 4

@@ -551,7 +551,7 @@ boundary, but inside it the token can push to `main` as freely as to a
 feature branch. Enforce the ref boundary in GitHub — see
 [Ref-level push policy](#ref-level-push-policy) for the branch-protection
 setup, and `require_protected_default_branch` to make octobroker refuse
-credentials for a repository whose default branch is open.
+push-capable credentials for a repository whose default branch is open.
 
 Agent side, `obk` doubles as a standard git credential helper. Register it
 as the **only** helper for `github.com` — `--replace-all` with an empty
@@ -658,16 +658,36 @@ Semantics:
   (`contents: read`) cannot push at all, so it is never withheld — a
   read-only fleet keeps working on unprotected repositories.
 - **Fail-closed.** Unprotected, no default branch, an API error, or an
-  unreadable answer all deny (403) and are audited as a failed issuance. Only
-  an explicit `protected: true` passes. The token, if already minted, is
-  never returned.
+  unreadable answer all deny and are audited as a failed issuance. Only an
+  explicit `protected: true` for the repository's current default branch
+  passes. The token, if already minted, is never returned and is dropped
+  from the cache, so a refused request leaves no live credential behind.
+- **Two denial shapes, on purpose.** An unprotected default branch is a
+  `403` (`"denial": "unprotected_default_branch"` in the audit record — fix
+  the ruleset); an answer that could not be obtained at all — GitHub
+  unreachable, rate limited, timed out — is a `503`
+  (`"denial": "unverifiable_default_branch"`, retry). An outage therefore
+  never reads as a hardening problem.
 - **No extra App permissions.** The check is two reads the credential's own
   token already authorizes — `GET /repos/{owner}/{repo}` (Metadata) and
-  `GET /repos/{owner}/{repo}/branches/{branch}` (Contents: read).
-- **Scope.** It proves the default branch is protected; it does not police
-  which feature branches the App may push, nor force-push classification.
-  Those remain ruleset responsibilities — see *namespace agent branches*
-  above.
+  `GET /repos/{owner}/{repo}/branches/{branch}` (Contents: read) — bounded
+  to 10s, with a *protected* verdict reused for 60s so a push-heavy agent
+  does not spend two API calls per git operation. Denials are never cached,
+  so hardening a repository takes effect immediately.
+- **Scope — read this before relying on it.** The check proves the default
+  branch is *protected*; it does not prove that **direct pushes are
+  blocked**. A branch whose only rule is "require status checks" (or
+  "require linear history") is `protected: true` while direct pushes still
+  succeed, and so is one that uses *Restrict who can push* to name the App
+  as an allowed pusher. Proving "no direct push" means reading the
+  protection rules themselves
+  (`GET /repos/{owner}/{repo}/rules/branches/{branch}`, **Administration:
+  read**) — a permission this project deliberately does not ask for, and one
+  that rulesets do not expose there at all. So: configure the ruleset as
+  above (*Require a pull request*, no bypass for the App) and treat this
+  check as the tripwire that notices when it is missing. The check also says
+  nothing about *which* feature branches the App may push — that is the
+  namespace ruleset's job.
 - Requires `enable_git_credentials` (startup validation rejects the flag
   otherwise). Default `false`, so existing deployments are unchanged.
 

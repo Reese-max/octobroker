@@ -88,14 +88,16 @@ pub struct McpConfig {
     pub git_credentials_read_only: bool,
     /// Ref-level push policy (#49): before issuing a PUSH-CAPABLE
     /// git credential, verify with GitHub that the target repository's
-    /// default branch is protected (branch protection or a ruleset), and
-    /// refuse the credential if it is not — or if that cannot be verified.
-    /// A repository-scoped token can otherwise rewrite `main` directly;
-    /// GitHub's protection is the ref-level boundary, since octobroker
-    /// deliberately does not proxy the git protocol. Read-only
-    /// (`contents: read`) credentials are exempt: they cannot push at all.
-    /// Requires `enable_git_credentials` (validated at startup). Default
-    /// false (opt-in) — hardening guidance lives in the README.
+    /// current default branch is protected (branch protection or a
+    /// ruleset), and refuse the credential if it is not — or if that cannot
+    /// be verified. A repository-scoped token can otherwise rewrite `main`
+    /// directly; GitHub's protection is the ref-level boundary, since
+    /// octobroker deliberately does not proxy the git protocol.
+    /// Read-only (`contents: read`) credentials are exempt: they cannot
+    /// push at all. `protected` does not by itself mean "direct pushes are
+    /// blocked" — see the README's hardening section, which this flag
+    /// complements rather than replaces. Requires `enable_git_credentials`
+    /// (validated at startup). Default false (opt-in).
     #[serde(default)]
     pub require_protected_default_branch: bool,
     /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant,

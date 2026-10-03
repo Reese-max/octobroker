@@ -125,13 +125,21 @@ impl AuditSink {
     /// `mode` is the effective permission envelope ("read" or "write") —
     /// recorded durably so the audit trail alone can answer whether an agent
     /// held push capability at a point in time (mixed-mode fleets).
+    ///
+    /// `denial` names the policy that refused issuance (e.g.
+    /// "unprotected_default_branch") and IS the success flag: `success` is
+    /// recorded as `denial.is_none()`, so a failed issuance can never be
+    /// written without saying why. Operators must be able to tell a
+    /// repository that needs hardening from a GitHub API that was
+    /// unreachable or rate limited, and both from a denied issuance.
+    /// `expires_at` is set only when the credential was issued.
     pub fn record_git_credential_result(
         &self,
         agent: &str,
         credential: &str,
         repo: &str,
         mode: &str,
-        success: bool,
+        denial: Option<&str>,
         expires_at: Option<u64>,
     ) -> Result<(), String> {
         self.append(serde_json::json!({
@@ -141,7 +149,8 @@ impl AuditSink {
             "cred": credential,
             "repo": repo,
             "mode": mode,
-            "success": success,
+            "success": denial.is_none(),
+            "denial": denial,
             "expires_at": expires_at,
         }))
     }

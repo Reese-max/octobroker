@@ -83,3 +83,24 @@ fn test_unreadable_repository_fails_closed() {
         Protection::Unprotected
     );
 }
+
+#[test]
+fn test_branch_of_another_ref_does_not_count() {
+    // The answer must describe the CURRENT default branch: a response for a
+    // different name (e.g. one a redirect delivered) proves nothing about it.
+    assert_eq!(
+        default_branch_protected(
+            Some(&repo("main")),
+            Some(&serde_json::json!({"name": "master", "protected": true}))
+        ),
+        Protection::Unprotected
+    );
+    // Nor does a response that carries no name at all.
+    assert_eq!(
+        default_branch_protected(
+            Some(&repo("main")),
+            Some(&serde_json::json!({"protected": true}))
+        ),
+        Protection::Unprotected
+    );
+}

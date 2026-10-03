@@ -51,14 +51,24 @@ pub fn branch_protected(branch: &serde_json::Value) -> bool {
 /// could not be parsed: a broker that proved nothing has not proved
 /// protection, so the answer is `Unprotected`.
 ///
-/// `branch` must be the response for the default branch named by `repo` —
-/// the caller reads it back from GitHub rather than matching it locally.
+/// `branch` must be the response for the default branch named by `repo`, and
+/// its `name` is compared against it. That closes the gap where a redirect
+/// (GitHub answers `301 Moved permanently` for a renamed repo, and the HTTP
+/// client follows redirects) would otherwise let the verdict describe a
+/// different ref than the current default branch.
 pub fn default_branch_protected(
     repo: Option<&serde_json::Value>,
     branch: Option<&serde_json::Value>,
 ) -> Protection {
-    match (repo.and_then(default_branch), branch) {
-        (Some(_), Some(branch)) if branch_protected(branch) => Protection::Protected,
-        _ => Protection::Unprotected,
+    let protected = match (repo.and_then(default_branch), branch) {
+        (Some(default), Some(branch)) => {
+            branch.get("name").and_then(|v| v.as_str()) == Some(default) && branch_protected(branch)
+        }
+        _ => false,
+    };
+    if protected {
+        Protection::Protected
+    } else {
+        Protection::Unprotected
     }
 }
