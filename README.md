@@ -629,7 +629,8 @@ push to:
 
 In the GitHub UI: *Settings → Rulesets → New ruleset → New branch ruleset*,
 targeting `~DEFAULT_BRANCH`; or the classic equivalent, *Settings → Branches →
-Add rule* on the branch itself.
+Add classic branch protection rule* with a branch name pattern matching the
+default branch.
 Either makes `GET /repos/{owner}/{repo}/branches/{default_branch}` report
 `protected: true` — GitHub documents that flag as covering both mechanisms
 ("branches protected by branch protections **or rulesets**").

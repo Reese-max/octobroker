@@ -95,9 +95,10 @@ pub struct McpConfig {
     /// octobroker deliberately does not proxy the git protocol.
     /// Read-only (`contents: read`) credentials are exempt: they cannot
     /// push at all. `protected` does not by itself mean "direct pushes are
-    /// blocked" — see the README's hardening section, which this flag
-    /// complements rather than replaces. Requires `enable_git_credentials`
-    /// (validated at startup). Default false (opt-in).
+    /// blocked" — see the README's "Ref-level push policy" section, which
+    /// this flag complements rather than replaces. Requires
+    /// `enable_git_credentials` (validated at startup). Default false
+    /// (opt-in).
     #[serde(default)]
     pub require_protected_default_branch: bool,
     /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant,
