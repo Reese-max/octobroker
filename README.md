@@ -608,6 +608,13 @@ Properties:
 - **Nothing to store** — `store`/`erase` are no-ops; tokens expire on their
   own. `cache-control: no-store` on the response.
 
+Deployment notes:
+
+- Requires egress to `api.githubcopilot.com` (the only additional external dependency).
+- Run a **single replica** while MCP is enabled — session pins live in process memory. A rolling deploy terminates sessions; clients recover by re-initializing.
+- Inside a trusted network, any workload that can reach `/mcp` gets the same read-only access (same trust model as octobroker's REST reads). Put TLS and agent authentication in front before any write-capable phase.
+- If the hosted endpoint is unreachable from your network, point `upstream` at a self-hosted [`github-mcp-server`](https://github.com/github/github-mcp-server) instead — same protocol and headers.
+
 #### Ref-level push policy
 
 GitHub enforces octobroker's boundaries; that principle extends to refs. The
@@ -716,18 +723,10 @@ Semantics:
   App may push — that is the namespace ruleset's job — and it governs
   **`/git-credential` only**: with `enable_writes`, an agent that
   allowlists `push_files` or `create_or_update_file` gets an MCP token
-  carrying the App's full
-  permission set, and that path is bounded by the MCP tool allowlist and
-  GitHub's protections, not by this flag.
+  carrying the App's full permission set, and that path is bounded by the
+  MCP tool allowlist and GitHub's protections, not by this flag.
 - Requires `enable_git_credentials` (startup validation rejects the flag
   otherwise). Default `false`, so existing deployments are unchanged.
-
-Deployment notes:
-
-- Requires egress to `api.githubcopilot.com` (the only additional external dependency).
-- Run a **single replica** while MCP is enabled — session pins live in process memory. A rolling deploy terminates sessions; clients recover by re-initializing.
-- Inside a trusted network, any workload that can reach `/mcp` gets the same read-only access (same trust model as octobroker's REST reads). Put TLS and agent authentication in front before any write-capable phase.
-- If the hosted endpoint is unreachable from your network, point `upstream` at a self-hosted [`github-mcp-server`](https://github.com/github/github-mcp-server) instead — same protocol and headers.
 
 ### Management
 

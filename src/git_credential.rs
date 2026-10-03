@@ -400,7 +400,7 @@ mod tests {
         //   <repo>-nodefault   → the repository reports no default branch
         //   <repo>-flip        → protected on the first branch read; every
         //                       later branch read for it fails
-        //   <repo>-mintfail    → the mint endpoint answers 500
+        //   mintfail            → the mint endpoint answers 422
         //   <repo>-slash       → default branch is "release/v1" (a branch
         //                       name containing a slash)
         //   anything else       → default branch "main", protected:true
