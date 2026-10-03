@@ -101,6 +101,15 @@ async fn main() {
     // lifecycle transition lands in the same durable forensic trail.
     // Requires [mcp.audit] even when the MCP proxy itself is off — there is
     // no durable path without it.
+    // [mcp.approvals] is validated whenever it is present, not only when the
+    // MCP proxy is on: the /approvals routes are registered unconditionally,
+    // so an unvalidated operator_key or ttl_secs would be live config.
+    if config.mcp.approvals.is_some() {
+        config
+            .mcp
+            .validate()
+            .expect("invalid [mcp.approvals] config");
+    }
     let approvals = config.mcp.approvals.as_ref().map(|ap| {
         let audit_path = &config
             .mcp
@@ -109,11 +118,13 @@ async fn main() {
             .expect("[mcp.approvals] requires [mcp.audit] — approval records share the audit JSONL")
             .path;
         let store = approvals::ApprovalStore::open(audit_path, ap.ttl_secs)
-            .expect("invalid [mcp.approvals] config");
+            .expect("invalid [mcp.approvals] config")
+            .with_max_records(ap.max_records);
         tracing::info!(
-            "MCP approval gate enabled → /approvals (records → {}, ttl={}s)",
+            "MCP approval gate enabled → /approvals (records → {}, ttl={}s, max_records={})",
             audit_path,
-            ap.ttl_secs
+            ap.ttl_secs,
+            ap.max_records
         );
         store
     });

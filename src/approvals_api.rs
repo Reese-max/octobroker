@@ -97,9 +97,11 @@ fn approval_json(a: &Approval) -> Value {
     })
 }
 
-/// Statuses `?status=` accepts. `all` disables the filter.
-const STATUS_FILTERS: [&str; 7] = [
-    "all", "pending", "approved", "denied", "consumed", "expired", "",
+/// Statuses `?status=` accepts. `all` disables the filter; an absent
+/// `status` defaults to `pending`. Everything else — including an empty
+/// `?status=` — is a 400, never a silently empty queue.
+const STATUS_FILTERS: [&str; 6] = [
+    "all", "pending", "approved", "denied", "consumed", "expired",
 ];
 
 pub async fn list_approvals(
@@ -275,6 +277,7 @@ mod tests {
                     approvals: enabled.then(|| config::ApprovalsConfig {
                         operator_key: operator_key.into(),
                         ttl_secs: 900,
+                        max_records: config::MAX_APPROVAL_RECORDS,
                     }),
                 },
             },
@@ -362,7 +365,9 @@ mod tests {
         let path = approvals_tmp("bad-status");
         let state = test_state(&path, "op-key", true);
         make_pending(&state, "deadbeef");
-        for bad in ["pendings", "Pending", "approve", "granted"] {
+        // "pendings" (typo), wrong case, a decision verb, an unknown word,
+        // and an empty value — all must be 400, never a silent empty list.
+        for bad in ["pendings", "Pending", "approve", "granted", ""] {
             let resp = app(state.clone())
                 .oneshot(req(
                     "GET",

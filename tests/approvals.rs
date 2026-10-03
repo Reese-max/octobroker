@@ -439,31 +439,72 @@ fn replay_tolerates_blank_lines() {
 
 #[test]
 fn open_fails_loudly_on_an_unreadable_log() {
-    // An audit file the process can append to but not read means the
-    // forensic trail and the live state have diverged — refuse to start
-    // rather than silently reconstruct empty approval state.
+    // An audit file the process cannot read means the forensic trail and the
+    // live state have diverged — refuse to start rather than silently
+    // reconstruct empty approval state.
+    //
+    // A directory is the root-proof fixture: `open(2)` on a directory
+    // succeeds but every read fails with EISDIR, so the replay cannot
+    // complete no matter who is running.
+    let dir = std::env::temp_dir().join(format!(
+        "octobroker-approvals-dir-{}-{}",
+        "unreadable",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = ApprovalStore::open(dir.to_str().unwrap(), 900)
+        .err()
+        .expect("an unreadable log must abort the replay");
+    assert!(
+        err.contains("cannot replay approval log"),
+        "the replay must be what fails, not the later append open: {}",
+        err
+    );
+    std::fs::remove_dir(&dir).ok();
+
+    // The unreadable-file variant is EACCES, which root ignores; skip only
+    // when the fixture cannot express it.
     use std::os::unix::fs::PermissionsExt;
     let (path, _store) = open("unreadable", 900);
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o000);
     std::fs::set_permissions(&path, perms).unwrap();
-    // root ignores mode bits; then the fixture cannot express the case.
-    if std::fs::read_to_string(&path).is_ok() {
-        std::fs::remove_file(&path).ok();
-        return;
+    if std::fs::read_to_string(&path).is_err() {
+        assert!(ApprovalStore::open(&path, 900)
+            .err()
+            .unwrap()
+            .contains("cannot replay approval log"));
     }
-    assert!(ApprovalStore::open(&path, 900).is_err());
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
     std::fs::remove_file(&path).ok();
 }
 
 #[test]
-fn terminal_records_are_pruned_so_the_working_set_stays_bounded() {
-    // An agent that keeps retrying (and an operator that keeps denying)
-    // must not grow the in-memory working set without bound. The JSONL
-    // stays the full history; only live work is retained.
-    let (path, store) = open("prune", 900);
+fn a_missing_log_opens_empty_rather_than_failing() {
+    // The NotFound arm is the only "no log yet" case: no approvals have
+    // ever been requested, which must not be confused with a broken log.
+    let path = tmp_path("absent");
+    std::fs::remove_file(&path).ok();
+    let store = ApprovalStore::open(&path, 900).expect("a fresh path must open");
+    assert!(store.list(None).is_empty());
+    let h = hash("merge_pull_request", serde_json::json!({"owner": "o"}));
+    let id = pending_id(
+        store
+            .gate("bot-a", "merge_pull_request", &h, &[], None)
+            .unwrap(),
+    );
+    assert!(id.starts_with("apv_"));
+    std::fs::remove_file(&path).ok();
+}
 
+#[test]
+fn terminal_records_stay_visible_so_the_api_contract_holds() {
+    // Eviction is bounded, not unconditional: a denied approval must keep
+    // answering NotPending (409) on re-decision and keep showing up under
+    // ?status=denied, and a consumed one must stay visible. Only the oldest
+    // records go once the bound is passed (see the next test).
+    let (path, store) = open("terminal-visible", 900);
+    let mut ids = Vec::new();
     for round in 0..25u64 {
         let h = hash(
             "merge_pull_request",
@@ -474,55 +515,74 @@ fn terminal_records_are_pruned_so_the_working_set_stays_bounded() {
                 .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
                 .unwrap(),
         );
-        store.decide(&id, false).unwrap();
+        store.decide(&id, round % 2 == 0).unwrap();
+        ids.push(id);
     }
-    // 25 requests were denied, each superseded by the next gate call: only
-    // the most recent terminal record is still held.
-    assert_eq!(store.list(None).len(), 1);
-
-    // The next call prunes it and opens a fresh one.
-    let fresh_h = hash("merge_pull_request", serde_json::json!({"owner": "fresh"}));
-    store
-        .gate("bot-a", "merge_pull_request", &fresh_h, &[], Some("o/r"))
-        .unwrap();
-    assert_eq!(store.list(None).len(), 1);
-    assert!(
-        store.list(Some("denied")).is_empty(),
-        "a superseded denial must not accumulate"
-    );
-
-    // An approved-but-unconsumed record IS live and must survive pruning.
-    let live_h = hash("merge_pull_request", serde_json::json!({"owner": "live"}));
-    let live_id = pending_id(
-        store
-            .gate("bot-a", "merge_pull_request", &live_h, &[], Some("o/r"))
-            .unwrap(),
-    );
-    store.decide(&live_id, true).unwrap();
-    store
-        .gate("bot-a", "push_files", &fresh_h, &[], Some("o/r"))
-        .unwrap();
     assert_eq!(
-        store.get(&live_id).map(|a| a.status),
-        Some(ApprovalStatus::Approved)
+        store.list(None).len(),
+        25,
+        "nothing is evicted under the bound"
     );
+    let denied: Vec<String> = ids
+        .iter()
+        .filter(|id| store.get(id).map(|a| a.status) == Some(ApprovalStatus::Denied))
+        .cloned()
+        .collect();
+    assert_eq!(denied.len(), 12);
+    // A denial is still answerable — NotPending, never NotFound, so the
+    // management API can keep returning 409 instead of 404.
+    for id in &denied {
+        assert!(
+            matches!(store.decide(id, true), Err(DecideError::NotPending)),
+            "{} lost its terminal state",
+            id
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
 
-    // Pruning is a memory concern only — the durable trail keeps every
-    // request and decision that was ever written.
+#[test]
+fn the_working_set_is_bounded_under_a_request_flood() {
+    // A flood of distinct requests must not grow the working set without
+    // limit. Eviction is oldest-first and fail-closed: the newest record
+    // always survives, and a dropped one only costs the agent a re-request.
+    let (path, store) = open("bounded", 900);
+    let store = store.with_max_records(8);
+    for round in 0..40u64 {
+        let h = hash(
+            "merge_pull_request",
+            serde_json::json!({"owner": "o", "n": round}),
+        );
+        store
+            .gate("bot-a", "merge_pull_request", &h, &[], Some("o/r"))
+            .unwrap();
+    }
+    let live = store.list(None);
+    assert!(
+        live.len() <= 8,
+        "working set grew past its bound: {}",
+        live.len()
+    );
+    let newest = hash(
+        "merge_pull_request",
+        serde_json::json!({"owner": "o", "n": 39}),
+    );
+    // The most recent request is still servable — eviction drops the oldest.
+    match store
+        .gate("bot-a", "merge_pull_request", &newest, &[], Some("o/r"))
+        .unwrap()
+    {
+        GateDecision::Pending { id, .. } => assert!(store.get(&id).is_some()),
+        GateDecision::Approved { id } => panic!("unexpected approval {}", id),
+    }
+    // The durable trail is untouched by eviction.
     let lines = std::fs::read_to_string(&path).unwrap();
     assert_eq!(
         lines
             .lines()
             .filter(|l| l.contains("approval_request"))
             .count(),
-        28
-    );
-    assert_eq!(
-        lines
-            .lines()
-            .filter(|l| l.contains("approval_decision"))
-            .count(),
-        26
+        40
     );
     std::fs::remove_file(&path).ok();
 }

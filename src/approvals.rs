@@ -158,6 +158,11 @@ impl std::fmt::Display for ConsumeError {
     }
 }
 
+/// Default in-memory working-set bound; overridable per deployment with
+/// `[mcp.approvals] max_records`. Only reached by a flood of distinct
+/// requests — see `gate` for the eviction policy.
+const MAX_RECORDS: usize = 1024;
+
 struct Inner {
     file: File,
     records: HashMap<String, Approval>,
@@ -173,6 +178,7 @@ pub struct ApprovalStore {
     inner: Mutex<Inner>,
     path: String,
     ttl_secs: u64,
+    max_records: usize,
 }
 
 impl ApprovalStore {
@@ -298,7 +304,15 @@ impl ApprovalStore {
             }),
             path: path.to_string(),
             ttl_secs,
+            max_records: MAX_RECORDS,
         })
+    }
+
+    /// Bound the in-memory working set. Defaults to `MAX_RECORDS`; lowered
+    /// by tests that would otherwise need thousands of fsync'd records.
+    pub fn with_max_records(mut self, max_records: usize) -> Self {
+        self.max_records = max_records;
+        self
     }
 
     /// A store whose appends always fail (read-only fd) — for fail-closed
@@ -320,6 +334,7 @@ impl ApprovalStore {
             }),
             path: "/dev/null (read-only)".to_string(),
             ttl_secs: 900,
+            max_records: MAX_RECORDS,
         }
     }
 
@@ -330,9 +345,15 @@ impl ApprovalStore {
     ///
     /// The dedup key is (agent, tool, args hash): dropping any component
     /// would let one agent's approval authorize another agent's call, or one
-    /// tool's approval authorize a different operation. Terminal and lapsed
-    /// records are pruned here so a retrying agent cannot grow the working
-    /// set without bound — the JSONL remains the full forensic history.
+    /// tool's approval authorize a different operation.
+    ///
+    /// A retrying agent must not grow the working set without bound, but the
+    /// management API must keep answering for records inside the bound: a
+    /// denied approval has to keep returning `409` on re-decision and stay
+    /// visible to `?status=denied`. So records are evicted OLDEST-FIRST only
+    /// past `MAX_RECORDS`. Eviction is fail-closed — a dropped record makes
+    /// the agent re-request, never auto-approve — and the JSONL remains the
+    /// full forensic history.
     pub fn gate(
         &self,
         agent: &str,
@@ -343,7 +364,20 @@ impl ApprovalStore {
     ) -> Result<GateDecision, String> {
         let now = unix_now_ms();
         let mut inner = self.inner.lock().unwrap();
-        inner.records.retain(|_, a| a.is_live(now));
+        if inner.records.len() >= self.max_records {
+            let mut oldest: Vec<(u64, String)> = inner
+                .records
+                .values()
+                .map(|a| (a.created_ts_ms, a.id.clone()))
+                .collect();
+            oldest.sort();
+            for (_, id) in oldest {
+                if inner.records.len() < self.max_records {
+                    break;
+                }
+                inner.records.remove(&id);
+            }
+        }
         if let Some(a) = inner.records.values().find(|a| {
             a.agent == agent && a.tool == tool && a.args_hash == args_hash && a.is_live(now)
         }) {

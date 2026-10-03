@@ -142,11 +142,25 @@ pub struct ApprovalsConfig {
     /// every agent call would mint a fresh undecidable request.
     #[serde(default = "default_approval_ttl_secs")]
     pub ttl_secs: u64,
+    /// Upper bound on the in-memory approval working set. Once exceeded, the
+    /// OLDEST records are dropped — the audit JSONL keeps the full history,
+    /// and dropping a record only costs the agent a re-request, never an
+    /// implicit approval. Raise it if operators page through long history;
+    /// lower it to bound memory on a small host.
+    #[serde(default = "default_approval_max_records")]
+    pub max_records: usize,
 }
 
 fn default_approval_ttl_secs() -> u64 {
     900
 }
+
+fn default_approval_max_records() -> usize {
+    MAX_APPROVAL_RECORDS
+}
+
+/// Default/upper bound for `[mcp.approvals] max_records`.
+pub const MAX_APPROVAL_RECORDS: usize = 1_048_576;
 
 /// Upper bound on `[mcp.approvals] ttl_secs` — an approval is a
 /// point-of-no-return grant for a high-blast-radius write, so it must not
@@ -348,6 +362,11 @@ impl McpConfig {
         if let Some(ap) = &self.approvals {
             if ap.operator_key.trim().is_empty() {
                 return Err("[mcp.approvals] operator_key must not be empty".into());
+            }
+            if ap.max_records == 0 {
+                return Err(
+                    "[mcp.approvals] max_records must be greater than 0 — a zero bound would evict every record the moment it is written".into(),
+                );
             }
             if ap.ttl_secs == 0 || ap.ttl_secs > MAX_APPROVAL_TTL_SECS {
                 return Err(format!(
@@ -1150,6 +1169,7 @@ mod approval_tier_tests {
         Some(ApprovalsConfig {
             operator_key: key.into(),
             ttl_secs: ttl,
+            max_records: MAX_APPROVAL_RECORDS,
         })
     }
 
@@ -1189,6 +1209,7 @@ path = "/tmp/a.jsonl"
 [mcp.approvals]
 operator_key = "env:OCTOBROKER_OPERATOR_KEY"
 ttl_secs = 120
+max_records = 5000
 
 [[mcp.agents]]
 id = "bot"
@@ -1200,6 +1221,7 @@ tools_approval = ["merge_pull_request"]
         .unwrap();
         assert_eq!(raw.mcp.agents[0].tools_approval, vec!["merge_pull_request"]);
         assert_eq!(raw.mcp.approvals.as_ref().unwrap().ttl_secs, 120);
+        assert_eq!(raw.mcp.approvals.as_ref().unwrap().max_records, 5000);
         // Defaults apply when the key is omitted entirely.
         let raw: RawConfig = toml::from_str(
             r#"
@@ -1215,6 +1237,21 @@ key = "k"
         .unwrap();
         assert!(raw.mcp.agents[0].tools_approval.is_empty());
         assert!(raw.mcp.approvals.is_none());
+        // Every optional [mcp.approvals] key has a default.
+        let raw: RawConfig = toml::from_str(
+            r#"
+[[identities]]
+id = "alice"
+token = "t"
+
+[mcp.approvals]
+operator_key = "k"
+"#,
+        )
+        .unwrap();
+        let ap = raw.mcp.approvals.as_ref().unwrap();
+        assert_eq!(ap.ttl_secs, 900);
+        assert_eq!(ap.max_records, MAX_APPROVAL_RECORDS);
     }
 
     #[test]
@@ -1251,9 +1288,25 @@ key = "k"
 
     #[test]
     fn operator_endpoint_requires_audit_and_a_bounded_ttl() {
+        // The write gate's own audit rule, for contrast.
         let mut m = valid();
         m.audit = None;
-        assert!(m.validate().unwrap_err().contains("[mcp.audit]"));
+        assert!(m
+            .validate()
+            .unwrap_err()
+            .contains("enable_writes requires [mcp.audit]"));
+        // The approvals guard itself. Both rules mention "[mcp.audit]" and the
+        // write gate fires first, so reaching the approvals guard needs the
+        // write gate out of the way — otherwise this assertion would pass on
+        // the wrong error.
+        let m = McpConfig {
+            approvals: approvals("operator-key", 900),
+            ..Default::default()
+        };
+        assert!(m
+            .validate()
+            .unwrap_err()
+            .contains("[mcp.approvals] requires [mcp.audit]"));
 
         // A zero TTL can never be decided; an unbounded TTL is not a human gate.
         for bad in [0, MAX_APPROVAL_TTL_SECS + 1] {
@@ -1265,6 +1318,16 @@ key = "k"
                 bad
             );
         }
+        // A zero bound would evict every record the moment it is written.
+        let mut m = valid();
+        m.approvals = approvals("operator-key", 900);
+        m.approvals.as_mut().unwrap().max_records = 0;
+        assert!(m.validate().unwrap_err().contains("max_records"));
+        let mut m = valid();
+        m.approvals = approvals("operator-key", 900);
+        m.approvals.as_mut().unwrap().max_records = 1;
+        assert!(m.validate().is_ok());
+
         // The boundary values are accepted.
         for good in [1, MAX_APPROVAL_TTL_SECS] {
             let mut m = valid();

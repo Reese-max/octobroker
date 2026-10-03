@@ -425,6 +425,7 @@ repos = ["openabdev/*"]
 [mcp.approvals]
 operator_key = "env:OCTOBROKER_OPERATOR_KEY" # separate credential, never an agent key
 ttl_secs = 900                              # bounds pending AND approved records
+max_records = 1048576                      # in-memory working-set bound
 ```
 
 Approval-tier tools require the same write stack as `enable_writes` (App
@@ -432,6 +433,9 @@ credentials + audit): an approved call executes as a normal audited
 write. `tools` and `tools_approval` must not list the same tool name —
 startup fails on the overlap. `ttl_secs` must be between 1 and 86400: a
 zero TTL can never be decided, and an unbounded one is not a human gate.
+`max_records` bounds the in-memory working set; past it the oldest records
+are dropped, which is fail-closed (the agent re-requests, nothing is
+implicitly approved) and never touches the JSONL.
 
 **Call flow.** A `tools/call` on an approval-tier tool runs every deny
 rule first (tool allowlist, write gate, repository allowlist — denied
@@ -491,9 +495,9 @@ last durable step — after the in-flight cap and the audit preflight — so
 a `429`/`503` never burns an approval. Single-use: the next identical
 call needs a fresh approval. And deny rules win end-to-end: every retry
 re-runs the full policy check, so an approval never overrides the tool or
-repository allowlists. Superseded decisions (denied, consumed, or lapsed)
-are dropped from the in-memory working set so a retrying agent cannot
-grow it without bound; the JSONL keeps the full forensic history.
+repository allowlists. Inside `max_records` every record stays
+answerable: a denial keeps returning `409` on re-decision and stays
+visible to `?status=denied`.
 
 #### Multi-installation routing (one key, many orgs)
 

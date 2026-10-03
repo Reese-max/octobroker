@@ -839,7 +839,15 @@ struct LocalToolResponse {
 
 fn custom_tool_enabled(agent: Option<&crate::config::McpAgentConfig>, tool_name: &str) -> bool {
     agent
-        .map(|a| a.tools.iter().any(|tool| tool == tool_name))
+        .map(|a| {
+            // Both tiers count as "advertised": an approval-tier tool the
+            // agent may call once a human decides must not be hidden from
+            // tools/list, or the tier is unreachable in practice.
+            a.tools
+                .iter()
+                .chain(a.tools_approval.iter())
+                .any(|tool| tool == tool_name)
+        })
         .unwrap_or(false)
 }
 
@@ -4414,6 +4422,7 @@ data: "id":1,"result":{"tools":[]}}
                     approvals: Some(config::ApprovalsConfig {
                         operator_key: "op-key".into(),
                         ttl_secs: 900,
+                        max_records: config::MAX_APPROVAL_RECORDS,
                     }),
                 },
             },
@@ -4972,6 +4981,7 @@ data: "id":1,"result":{"tools":[]}}
                     approvals: Some(config::ApprovalsConfig {
                         operator_key: "op-key".into(),
                         ttl_secs: 900,
+                        max_records: config::MAX_APPROVAL_RECORDS,
                     }),
                 },
             },
@@ -4995,6 +5005,68 @@ data: "id":1,"result":{"tools":[]}}
             "a pending approval must not mint an installation token"
         );
         assert!(captured.lock().unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_approval_tier_local_tool_is_advertised() {
+        // An approval-tier octobroker-owned tool must still appear in
+        // tools/list, exactly like a directly allowlisted one. Hiding it
+        // would make the tier unreachable: the agent is allowed to call it,
+        // but never told it exists.
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(|| async {
+                Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"issue_read"}]}}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{}", addr);
+
+        let path = audit_tmp("apv-local-list");
+        let state = test_state_approvals(
+            &url,
+            &path,
+            vec![agent_with_approval(
+                "bot-w",
+                "key-w",
+                &[],
+                &[COMMIT_STATUS_TOOL],
+                &["openabdev/octobroker"],
+            )],
+            4,
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("x-octobroker-key", "key-w")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![COMMIT_STATUS_TOOL],
+            "the approval-tier local tool must be advertised, and only tools the agent may call"
+        );
         std::fs::remove_file(&path).ok();
     }
 

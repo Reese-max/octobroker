@@ -94,9 +94,13 @@ enabled = false
 # /approvals endpoints via X-Octobroker-Operator-Key and must NOT equal
 # any agent key (startup fails if it does). ttl_secs bounds pending and
 # approved records alike and must be 1..86400 (0 could never be decided).
+# max_records bounds the in-memory working set: past it the OLDEST records
+# are dropped (the JSONL keeps everything, and dropping one only costs the
+# agent a re-request — never an implicit approval).
 # [mcp.approvals]
 # operator_key = "env:OCTOBROKER_OPERATOR_KEY"
 # ttl_secs = 900
+# max_records = 1048576
 
 # GitHub App credential backend (Phase 2b) — RECOMMENDED for production MCP.
 # When configured, the MCP path injects short-lived installation tokens
