@@ -397,7 +397,7 @@ impl AppTokenProvider {
         repository: &str,
         token: &str,
     ) -> Result<crate::ref_policy::Protection, String> {
-        if self.protected_verdict(owner, repository).is_some() {
+        if self.has_cached_protection(owner, repository) {
             return Ok(crate::ref_policy::Protection::Protected);
         }
         let repo_url = repo_url(&self.api_base, owner, repository)?;
@@ -431,8 +431,10 @@ impl AppTokenProvider {
     }
 
     /// Drop every cached git credential for `repository` (both permission
-    /// envelopes). Called when issuance is denied AFTER the mint, so a
-    /// refused request leaves no live push-capable token behind.
+    /// envelopes). Called whenever a request that already minted one will
+    /// not be completed — a ref-policy denial, or a result audit record that
+    /// could not be persisted — so no request that fails after the mint ever
+    /// leaves a live credential behind for a later caller.
     pub fn evict_git_tokens(&self, repository: &str) {
         let mut cached = self.cached.lock().unwrap();
         for purpose in ["git:contents=read", "git:contents=write"] {
@@ -441,19 +443,19 @@ impl AppTokenProvider {
         }
     }
 
-    /// A cached, unexpired positive verdict for this repository, if any.
-    fn protected_verdict(&self, owner: &str, repository: &str) -> Option<u64> {
+    /// Whether a cached, unexpired positive verdict exists for this
+    /// repository. Presence is the whole answer — the expiry lives in the
+    /// map and is not surfaced.
+    fn has_cached_protection(&self, owner: &str, repository: &str) -> bool {
         let key = protection_cache_key(owner, repository);
         let mut map = self.protected_branches.lock().unwrap();
-        match map.get(&key).copied() {
-            Some(expiry) if expiry > unix_now() => Some(expiry),
-            _ => {
-                // Expired or unknown: drop it so the map only ever holds
-                // live verdicts.
-                map.remove(&key);
-                None
-            }
+        if map.get(&key).is_some_and(|expiry| *expiry > unix_now()) {
+            return true;
         }
+        // Expired or unknown: drop it so the map only ever holds live
+        // verdicts.
+        map.remove(&key);
+        false
     }
 
     fn remember_protected(&self, owner: &str, repository: &str) {
@@ -563,9 +565,11 @@ fn parse_rfc3339_unix(s: &str) -> Option<u64> {
 
 /// `<api_base>/repos/<owner>/<repo>` with owner and repository carried as
 /// path segments, so neither can introduce a query, a fragment, or an extra
-/// path element. A dot-only name is refused HERE rather than relied upon
-/// upstream: pushing one does not encode it, and `..` would resolve to the
-/// owner's own endpoint.
+/// path element. A dot-only *repository* name is refused HERE rather than
+/// relied upon upstream: pushing one does not encode it, and `..` would
+/// resolve to the owner's own endpoint. The owner needs no such check —
+/// `/git-credential`'s charset filter rejects `.` in a login before any
+/// URL is built, and it must match a configured installation.
 fn repo_url(api_base: &str, owner: &str, repository: &str) -> Result<String, String> {
     if matches!(repository, "." | "..") {
         return Err(format!("invalid repository name '{}'", repository));
@@ -590,6 +594,11 @@ fn branch_url(
     repository: &str,
     branch: &str,
 ) -> Result<String, String> {
+    // As for a repository name: a dot-only branch is refused rather than
+    // normalized away (it would address the repository, not a branch).
+    if matches!(branch, "." | "..") {
+        return Err(format!("invalid branch name '{}'", branch));
+    }
     let mut url = reqwest::Url::parse(&repo_url(api_base, owner, repository)?)
         .map_err(|e| format!("invalid branch URL: {}", e))?;
     {
@@ -873,11 +882,17 @@ pub(crate) mod tests {
         );
         // A name carrying URL-significant characters can only ever be a path
         // segment: it must not introduce a query or a fragment.
-        for name in ["a?b=c", "a#b", "openab/../escape"] {
+        for name in ["a?b=c", "a#b"] {
             let url = repo_url("https://api.github.com", "acme", name).unwrap();
             assert!(!url.contains('?'), "{} rewrote the query: {}", name, url);
             assert!(!url.contains('#'), "{} added a fragment: {}", name, url);
         }
+        // A name with slashes stays ONE encoded segment rather than
+        // traversing to another route.
+        assert_eq!(
+            repo_url("https://api.github.com", "acme", "openab/../escape").unwrap(),
+            "https://api.github.com/repos/acme/openab%2F..%2Fescape"
+        );
         // Dot-only names are refused locally, not merely encoded: `..`
         // would otherwise resolve to the owner's own endpoint.
         assert!(repo_url("https://api.github.com", "acme", "..").is_err());
@@ -910,6 +925,10 @@ pub(crate) mod tests {
         assert!(url.ends_with("/branches/weird%23name"), "{}", url);
         let url = branch_url("https://api.github.com", "o", "r", "a?b=c").unwrap();
         assert!(url.ends_with("/branches/a%3Fb=c"), "{}", url);
+        // Dot-only branch names are refused, not normalized into the
+        // repository endpoint.
+        assert!(branch_url("https://api.github.com", "o", "r", "..").is_err());
+        assert!(branch_url("https://api.github.com", "o", "r", ".").is_err());
     }
 
     #[test]
@@ -954,7 +973,7 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(err.contains("exceeded"), "unexpected error: {}", err);
         // A timed-out check proves nothing and must not be cached as a pass.
-        assert!(p.protected_verdict("openabdev", "openab").is_none());
+        assert!(!p.has_cached_protection("openabdev", "openab"));
     }
 
     #[tokio::test]
@@ -998,7 +1017,7 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("403"), "unexpected error: {}", err);
-        assert!(p.protected_verdict("openabdev", "openab").is_none());
+        assert!(!p.has_cached_protection("openabdev", "openab"));
     }
 
     #[test]
@@ -1006,32 +1025,39 @@ pub(crate) mod tests {
         let p = AppTokenProvider::new("123".into(), TEST_RSA_PEM, Some(1), None, "http://x".into())
             .unwrap();
         // Nothing remembered yet.
-        assert!(p.protected_verdict("openabdev", "openab").is_none());
+        assert!(!p.has_cached_protection("openabdev", "openab"));
         p.remember_protected("openabdev", "openab");
         // Owner case is folded like installation routing.
-        assert!(p.protected_verdict("OpenABdev", "openab").is_some());
+        assert!(p.has_cached_protection("OpenABdev", "openab"));
         // Another repository is a miss.
-        assert!(p.protected_verdict("openabdev", "other").is_none());
+        assert!(!p.has_cached_protection("openabdev", "other"));
         // An expired verdict is neither returned nor left behind.
         p.protected_branches
             .lock()
             .unwrap()
             .insert(protection_cache_key("openabdev", "stale"), unix_now() - 1);
-        assert!(p.protected_verdict("openabdev", "stale").is_none());
+        assert!(!p.has_cached_protection("openabdev", "stale"));
         assert!(!p
             .protected_branches
             .lock()
             .unwrap()
             .contains_key(&protection_cache_key("openabdev", "stale")));
         // A wildcard-allowlisted agent can name repositories octobroker has
-        // never seen: the map must not grow without bound.
-        for i in 0..(PROTECT_CACHE_MAX + 10) {
+        // never seen: at the cap the map is dropped wholesale rather than
+        // grown without bound — proven by the oldest entry disappearing.
+        p.remember_protected("openabdev", "first");
+        for i in 0..PROTECT_CACHE_MAX {
             p.remember_protected("openabdev", &format!("wildcard-{}", i));
         }
         assert!(
-            p.protected_branches.lock().unwrap().len() <= PROTECT_CACHE_MAX,
-            "protection cache must stay bounded"
+            !p.has_cached_protection("openabdev", "first"),
+            "the cap must evict old verdicts"
         );
+        // …while the newest one is still cached, so the map really fills.
+        assert!(
+            p.has_cached_protection("openabdev", &format!("wildcard-{}", PROTECT_CACHE_MAX - 1))
+        );
+        assert!(p.protected_branches.lock().unwrap().len() <= PROTECT_CACHE_MAX);
     }
 
     #[test]

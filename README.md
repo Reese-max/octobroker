@@ -690,13 +690,16 @@ Semantics:
   "require linear history") is `protected: true` while direct pushes still
   succeed, and so is one that uses *Restrict who can push* to name the App
   as an allowed pusher. Proving "no direct push" means reading the active
-  rules for the branch (`GET /repos/{owner}/{repo}/rules/branches/{branch}`,
-  which reports rules from repository *and* organization rulesets), and that
-  needs **Administration: read** — a permission this project deliberately
-  does not ask an App for, since git credentials need Contents and nothing
-  else. So: configure the ruleset as
-  above (*Require a pull request*, no bypass for the App) and treat this
-  check as the tripwire that notices when it is missing. The check also says
+  rules for the branch — `GET /repos/{owner}/{repo}/rules/branches/{branch}`
+  reports the rules that apply from repository *and* organization rulesets —
+  and judging them. octobroker deliberately stops at the coarse `protected`
+  flag here (scope and latency, not permissions: that endpoint needs only
+  **Metadata: read**, which this credential already carries, so verify the
+  rule yourself with
+  `gh api repos/OWNER/REPO/rules/branches/BRANCH` when you want proof).
+  Configure the ruleset as above (*Require a pull request*, no bypass for
+  the App) and treat this check as the tripwire that notices when it is
+  missing. The check also says
   nothing about *which* feature branches the App may push — that is the
   namespace ruleset's job.
 - Requires `enable_git_credentials` (startup validation rejects the flag

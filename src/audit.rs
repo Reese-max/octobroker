@@ -24,6 +24,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct AuditSink {
     file: Mutex<File>,
     path: String,
+    /// Test-only: refuse appends whose `phase` matches, so a handler can be
+    /// driven into the *second* record of a two-phase flow failing.
+    #[cfg(test)]
+    fail_phase: Option<&'static str>,
 }
 
 /// Everything identifying one write call, shared by both record phases.
@@ -58,6 +62,8 @@ impl AuditSink {
         Ok(Self {
             file: Mutex::new(file),
             path: path.to_string(),
+            #[cfg(test)]
+            fail_phase: None,
         })
     }
 
@@ -67,7 +73,18 @@ impl AuditSink {
         Self {
             file: Mutex::new(File::open("/dev/null").unwrap()),
             path: "/dev/null (read-only)".to_string(),
+            fail_phase: None,
         }
+    }
+
+    /// A sink that persists every record EXCEPT those of `phase`. Lets a
+    /// test fail the second phase of a two-phase flow — the case where work
+    /// has already been done and the credential must be discarded.
+    #[cfg(test)]
+    pub fn failing_on_phase_for_tests(path: &str, phase: &'static str) -> Self {
+        let mut sink = Self::open(path).expect("audit sink");
+        sink.fail_phase = Some(phase);
+        sink
     }
 
     /// Pre-flight record. An Err here MUST reject the call (fail-closed).
@@ -158,6 +175,13 @@ impl AuditSink {
     /// Append one JSONL record and fsync. Small blocking write on the async
     /// path — acceptable: write calls are rare and records are <1 KB.
     fn append(&self, record: serde_json::Value) -> Result<(), String> {
+        #[cfg(test)]
+        if self
+            .fail_phase
+            .is_some_and(|phase| record["phase"] == phase)
+        {
+            return Err(format!("audit append failed ({}): injected", self.path));
+        }
         let mut line = record.to_string();
         line.push('\n');
         let mut f = self.file.lock().unwrap();

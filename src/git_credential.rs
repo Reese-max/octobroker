@@ -220,8 +220,10 @@ pub async fn git_credential(
     // push-capable credential. Read-only (contents:read) credentials are
     // exempt: they cannot push, so there is no ref to police. Runs after
     // the mint because the reads are authenticated by the repo-scoped token
-    // itself; a denial never discloses it and drops it from the token cache,
-    // so octobroker holds no credential for a refused request.
+    // itself — so a live push-capable token exists in-process for the
+    // duration of this check, and is dropped again on any refusal (policy
+    // denial below, or a failed audit result record further down) so a
+    // refused request leaves octobroker holding no credential for it.
     if state.config.mcp.require_protected_default_branch && !read_only {
         let denial = match provider
             .default_branch_protected(owner, name, &token.token)
@@ -238,22 +240,26 @@ pub async fn git_credential(
                 "unprotected_default_branch",
                 "the repository's default branch is not protected — see the ref-level push policy in the README"
                     .to_string(),
+                None,
             )),
+            // The cause (a GitHub status, an unreachable API base) goes to
+            // the broker log, not to the caller: the response must not echo
+            // internal endpoints back to the agent.
             Err(e) => Some((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unverifiable_default_branch",
-                format!(
-                    "the repository's default branch protection could not be verified: {}",
-                    e
-                ),
+                "the repository's default branch protection could not be verified — retry later"
+                    .to_string(),
+                Some(e),
             )),
         };
-        if let Some((status, reason, message)) = denial {
+        if let Some((status, reason, message, detail)) = denial {
             tracing::warn!(
-                "git-credential DENIED [agent={}, reason={}, detail={}]",
+                "git-credential DENIED [agent={}, repo={}, reason={}, detail={:?}]",
                 agent.id,
+                repo_label,
                 reason,
-                message
+                detail
             );
             provider.evict_git_tokens(name);
             if let Err(audit_err) = sink.record_git_credential_result(
@@ -1038,6 +1044,14 @@ mod tests {
         // policy denial: 503 (retry) with its own audit reason, so a GitHub
         // outage does not read as "this repo needs hardening".
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("ghs_git_openabdev"),
+            "token leaked: {}",
+            String::from_utf8_lossy(&body)
+        );
         let records = audit_records(&path);
         assert_eq!(records.len(), 2);
         assert_eq!(records[1]["success"], false);
@@ -1058,6 +1072,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", repo);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&body).contains("ghs_git_openabdev"),
+                "token leaked: {}",
+                String::from_utf8_lossy(&body)
+            );
         }
         let records = audit_records(&path);
         assert_eq!(records.len(), 4, "preflight + result per request");
@@ -1166,6 +1188,36 @@ mod tests {
         assert_eq!(
             minted[0].1["permissions"],
             serde_json::json!({"contents": "read"})
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_failed_result_audit_discards_the_minted_credential() {
+        let path = audit_tmp("refpolicy-resultfail");
+        // The preflight record persists; the result record does not. That is
+        // the only window where a valid push-capable token exists for a
+        // request whose issuance never completes — it must be dropped, not
+        // left cached for the next caller to collect.
+        let sink =
+            crate::audit::AuditSink::failing_on_phase_for_tests(&path, "git_credential_result");
+        let (state, mint_log) = test_state(true, false, Some(sink)).await;
+        let resp = app(state.clone())
+            .oneshot(req("openabdev/openab", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mint_log.lock().unwrap().len(), 1, "issued, then discarded");
+        // No second request can collect that token: it was minted again.
+        let resp = app(state)
+            .oneshot(req("openabdev/openab", Some("key-b0")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            mint_log.lock().unwrap().len(),
+            2,
+            "a credential that was never audited must not stay cached"
         );
         std::fs::remove_file(&path).ok();
     }
