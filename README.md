@@ -627,8 +627,9 @@ push to:
 - Do **not** put the App in the ruleset's bypass list. A bypass actor undoes
   the boundary for everyone else's sake.
 
-In the GitHub UI: *Settings → Rules → Rulesets → New branch ruleset* targeting
-`~DEFAULT_BRANCH`, or *Settings → Branches → Add rule* on the branch itself.
+In the GitHub UI: *Settings → Rulesets → New ruleset → New branch ruleset*,
+targeting `~DEFAULT_BRANCH`; or the classic equivalent, *Settings → Branches →
+Add rule* on the branch itself.
 Either makes `GET /repos/{owner}/{repo}/branches/{default_branch}` report
 `protected: true` — GitHub documents that flag as covering both mechanisms
 ("branches protected by branch protections **or rulesets**").
@@ -641,15 +642,16 @@ permissions can push to branches whose name matches the pattern you
 specify") — enable it on the **human** namespaces, listing the humans and
 teams as bypass holders and **not** the App:
 
-- A ruleset targeting `refs/heads/release/**` (and any other namespace
-  humans use) with **Restrict updates**. Classic branch protection's
-  *Restrict who can push to matching branches* is the same control.
+- A ruleset targeting the namespace humans use — `refs/heads/release/*` and
+  any other pattern they work under — with **Restrict updates**. Classic
+  branch protection's *Restrict who can push to matching branches* is the
+  same control.
 - Give each depth its own pattern: ruleset ref patterns are fnmatch with
-  `FNM_PATHNAME`, where `*` matches one path segment and never crosses `/`,
-  so `refs/heads/release/*` covers `release/v1` while
-  `refs/heads/release/**/*` covers two or more levels (`release/2024/rc1`).
-  GitHub's own "any number of slashes" example is `qa/**/*`. A ruleset
-  accepts several include patterns, so list both.
+  `FNM_PATHNAME`, where `*` matches one path segment and never crosses `/`
+  (a bare `**` is therefore just `*`). So `refs/heads/release/*` covers
+  `release/v1` while `refs/heads/release/**/*` covers two or more levels
+  (`release/2024/rc1`) — GitHub's own "any number of slashes" example is
+  `qa/**/*`. A ruleset accepts several include patterns, so list both.
 - Agents then push only under their own namespaces
   (`refs/heads/agent-a/…`, which nothing restricts), and open a PR into the
   default branch, where the require-PR rule above applies.
@@ -680,10 +682,11 @@ Semantics:
   expires).
 - **Two denial shapes, on purpose.** An unprotected default branch is a
   `403` (`"denial": "unprotected_default_branch"` in the audit record — fix
-  the ruleset); an answer that could not be obtained at all — GitHub
-  unreachable, rate limited, timed out — is a `503`
-  (`"denial": "unverifiable_default_branch"`, retry). An outage therefore
-  never reads as a hardening problem.
+  the ruleset); an answer that could not be obtained at all is a `503`
+  (`"denial": "unverifiable_default_branch"`). GitHub unreachable, rate
+  limited or timed out are worth retrying; a repository that reports no
+  usable default branch name never becomes issuable and retrying will not
+  help. Either way an outage never reads as a hardening problem.
 - **No extra App permissions.** The check is two reads the credential's own
   token already authorizes — `GET /repos/{owner}/{repo}` (Metadata) and
   `GET /repos/{owner}/{repo}/branches/{branch}` (Contents: read) — bounded
@@ -704,15 +707,15 @@ Semantics:
   and judging them. octobroker deliberately stops at the coarse `protected`
   flag here (scope and latency, not permissions: that endpoint needs only
   **Metadata: read**, which this credential already carries, so verify the
-  rule yourself with
-  `gh api repos/OWNER/REPO/rules/branches/BRANCH` when you want proof).
+  rule yourself with `gh api repos/OWNER/REPO/rules/branches/BRANCH` when
+  you want proof).
   Configure the ruleset as above (*Require a pull request*, no bypass for
   the App) and treat this check as the tripwire that notices when it is
-  missing. The check also says
-  nothing about *which* feature branches the App may push — that is the
-  namespace ruleset's job. It also governs **`/git-credential` only**: with
-  `enable_writes`, an agent that allowlists `push_files` or
-  `create_or_update_file` gets an MCP token carrying the App's full
+  missing. The check also says nothing about *which* feature branches the
+  App may push — that is the namespace ruleset's job — and it governs
+  **`/git-credential` only**: with `enable_writes`, an agent that
+  allowlists `push_files` or `create_or_update_file` gets an MCP token
+  carrying the App's full
   permission set, and that path is bounded by the MCP tool allowlist and
   GitHub's protections, not by this flag.
 - Requires `enable_git_credentials` (startup validation rejects the flag
