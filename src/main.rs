@@ -3,14 +3,18 @@ mod audit;
 mod cache;
 mod config;
 mod git_credential;
+mod iam;
 mod mcp;
+mod metrics;
 mod policy;
 mod pool;
+mod quota;
+mod session_store;
 
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::Json,
+    response::{Json, Response},
     routing::get,
     routing::post,
     Router,
@@ -25,8 +29,19 @@ struct AppState {
     config: config::Config,
     token_users: moka::future::Cache<String, String>,
     http: reqwest::Client,
-    /// MCP session pinning: Mcp-Session-Id → (pooled identity, agent binding)
-    mcp_sessions: moka::future::Cache<String, mcp::SessionPin>,
+    /// MCP session pinning: Mcp-Session-Id → (pooled identity, agent binding).
+    /// Single-replica (memory) or cross-replica (shared journal) per
+    /// [mcp.scaling] (Phase 3, #18).
+    mcp_sessions: session_store::PinStore,
+    /// Per-agent rate quotas + upstream circuit breaker (Phase 3, #18).
+    quotas: quota::QuotaRegistry,
+    /// MCP request / deny / upstream-latency metrics (Phase 3, #18).
+    metrics: metrics::Metrics,
+    /// Effective SigV4 proof policy for the secretless IAM path (Phase 3, #18).
+    iam_policy: iam::IamProofPolicy,
+    /// Signatures already spent inside their validity window, so each
+    /// presigned proof is single-use (Phase 3, #18).
+    iam_replay: iam::ReplayGuard,
     /// GitHub App installation token provider for the MCP path (2b).
     /// None = PAT pool backend.
     app_tokens: Option<app_token::AppTokenProvider>,
@@ -91,16 +106,29 @@ async fn main() {
         sink
     });
 
+    let mcp_sessions = build_pin_store(&config.mcp.scaling, config.mcp.session_ttl_secs);
+    let quotas = quota::QuotaRegistry::new(config.mcp.quota.to_quota_config());
+    let iam_policy = config.mcp.iam_proof_policy();
+    if config.mcp.iam.enabled {
+        tracing::info!(
+            "secretless IAM proof auth enabled (hosts={:?}, regions={:?}, max_proof_age_secs={})",
+            iam_policy.allowed_hosts,
+            iam_policy.allowed_regions,
+            iam_policy.max_validity_secs
+        );
+    }
+
     let state = Arc::new(AppState {
         pool,
         cache,
         config: config.clone(),
         token_users: moka::future::Cache::builder().max_capacity(100).build(),
         http: reqwest::Client::new(),
-        mcp_sessions: moka::future::Cache::builder()
-            .max_capacity(10_000)
-            .time_to_idle(std::time::Duration::from_secs(config.mcp.session_ttl_secs))
-            .build(),
+        mcp_sessions,
+        quotas,
+        metrics: metrics::Metrics::new(),
+        iam_policy,
+        iam_replay: iam::ReplayGuard::default(),
         app_tokens,
         multi_app_tokens,
         audit,
@@ -147,6 +175,7 @@ fn base_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
+        .route("/metrics", get(metrics))
         .route("/graphql", post(graphql_proxy))
         .route("/git-credential", get(git_credential::git_credential))
         .route("/raw/{*path}", get(proxy_raw))
@@ -157,13 +186,93 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// Build the session pin store. `shared` mode journals pins on storage every
+/// replica can reach; an unusable path aborts boot rather than leaving a
+/// deployment that silently terminates every session.
+fn build_pin_store(scaling: &config::ScalingConfig, ttl_secs: u64) -> session_store::PinStore {
+    match scaling.mode.as_str() {
+        "shared" => {
+            let replica_id = if scaling.replica_id.trim().is_empty() {
+                hostname()
+            } else {
+                scaling.replica_id.trim().to_string()
+            };
+            let store = session_store::PinStore::shared(
+                &scaling.journal_path,
+                ttl_secs,
+                &replica_id,
+            )
+            .unwrap_or_else(|e| panic!("invalid [mcp.scaling] config: {e}"));
+            tracing::info!(
+                "MCP session state: shared journal {} (replica {})",
+                scaling.journal_path,
+                replica_id
+            );
+            store
+        }
+        _ => {
+            tracing::info!("MCP session state: in-memory (single replica)");
+            session_store::PinStore::memory(ttl_secs)
+        }
+    }
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|h| h.trim().to_string())
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "octobroker".to_string())
+}
+
 async fn stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     let identities = state.pool.snapshot();
     let cache_stats = state.cache.stats();
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "identities": identities,
         "cache": cache_stats,
-    }))
+        "mcp": {
+            "sessions": {
+                "mode": state.mcp_sessions.mode(),
+                "pins": state.mcp_sessions.len(unix_now_secs()),
+            },
+            "quota": state.quotas.snapshot(),
+        },
+    });
+    merge_mcp_metrics(&mut body, &state);
+    Json(body)
+}
+
+/// Prometheus text exposition for the dashboards and alert rules.
+async fn metrics(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    axum::response::Response::builder()
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(axum::body::Body::from(state.metrics.render_prometheus()))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::from("metrics render failed"))
+                .expect("static response is always buildable")
+        })
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Splice the MCP metric tree into the `/stats` body.
+pub(crate) fn merge_mcp_metrics(body: &mut Value, state: &AppState) {
+    let snapshot = state.metrics.snapshot_json();
+    if let Some(target) = body.get_mut("mcp").and_then(Value::as_object_mut) {
+        if let Some(mcp) = snapshot.get("mcp") {
+            for (key, value) in mcp.as_object().into_iter().flatten() {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 async fn proxy(
@@ -179,20 +288,20 @@ async fn proxy(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Build cache key
-    let cache_key = cache::build_key(&api_path, &query);
-
-    // Check cache
-    if let Some(cached) = state.cache.get(&cache_key).await {
-        tracing::info!("200 OK {} [cache HIT]", api_path);
-        return Ok(Json(cached));
-    }
-
-    // Select identity from pool
+    // Select the identity BEFORE the cache lookup so the key can be scoped to
+    // it: a response fetched under one PAT's access scope must never be served
+    // to a caller that would resolve to a different identity (#18).
     let identity = state
         .pool
         .select()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let cache_key = cache::build_key(&api_path, &query, &identity.id);
+
+    // Check cache
+    if let Some(cached) = state.cache.get(&cache_key).await {
+        tracing::info!("200 OK {} [cache HIT via {}]", api_path, identity.id);
+        return Ok(Json(cached));
+    }
 
     // Build GitHub API URL
     let mut url = format!("https://api.github.com{}", api_path);
@@ -384,15 +493,6 @@ async fn graphql_proxy(
         .unwrap_or("");
     let is_mutation = query_str.trim_start().starts_with("mutation");
 
-    // For queries: check cache
-    let cache_key = format!("graphql:{}", cache::build_graphql_key(&body));
-    if !is_mutation {
-        if let Some(cached) = state.cache.get(&cache_key).await {
-            tracing::info!("200 OK /graphql [cache HIT]");
-            return Ok(Json(cached));
-        }
-    }
-
     // Mutations: passthrough client's own auth. Queries: use pooled PAT.
     let (auth_header, identity_id) = if is_mutation {
         let client_auth = headers
@@ -412,6 +512,17 @@ async fn graphql_proxy(
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         (format!("Bearer {}", identity.token), identity.id.clone())
     };
+
+    // Only queries are cached, and the key is scoped to the identity that will
+    // fetch it: a result fetched with a pooled PAT must never be replayed for a
+    // caller whose own identity would have been refused upstream (#18).
+    let query_cache_key = (!is_mutation).then(|| cache::build_graphql_key(&body, &identity_id));
+    if let Some(key) = &query_cache_key {
+        if let Some(cached) = state.cache.get(key).await {
+            tracing::info!("200 OK /graphql [cache HIT via {}]", identity_id);
+            return Ok(Json(cached));
+        }
+    }
 
     let resp = state
         .http
@@ -457,10 +568,10 @@ async fn graphql_proxy(
         return Err(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
     }
 
-    if !is_mutation {
+    if let Some(key) = &query_cache_key {
         state
             .cache
-            .insert(&cache_key, &resp_body, cache::RouteKind::Other)
+            .insert(key, &resp_body, cache::RouteKind::Other)
             .await;
     }
 
@@ -527,7 +638,11 @@ mod tests {
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
-            mcp_sessions: moka::future::Cache::builder().max_capacity(10).build(),
+            mcp_sessions: session_store::PinStore::memory(3_600),
+            quotas: quota::QuotaRegistry::new(quota::QuotaConfig::default()),
+            metrics: metrics::Metrics::new(),
+            iam_policy: iam::IamProofPolicy::default(),
+            iam_replay: iam::ReplayGuard::default(),
             app_tokens: None,
             multi_app_tokens: None,
             audit: None,

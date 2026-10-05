@@ -32,6 +32,10 @@ use std::sync::Arc;
 
 use crate::{pool, AppState};
 
+// Session pin types live in `session_store` so the store can be unit-tested
+// without the proxy; they stay re-exported here for existing call sites.
+pub use crate::session_store::{AppRoute, PinnedCred, SessionPin};
+
 /// Max accepted request body (JSON-RPC frames are typically <10 KB).
 pub const MAX_BODY_BYTES: usize = 1_048_576;
 
@@ -85,10 +89,55 @@ pub async fn mcp_proxy(
 ) -> Response {
     // Phase 2a: agent authentication. With no [[mcp.agents]] configured this
     // is Phase 1 network-trust mode (agent = None).
+    //
+    // Phase 3 (#18): when [mcp.iam] is enabled with `require_agent_key = false`,
+    // a presigned sts:GetCallerIdentity proof may authenticate the request
+    // instead of a shared key. An explicitly *invalid* key is still a hard 401
+    // — a proof never rescues a bad credential.
+    let iam_stands_in = state.config.mcp.iam.enabled && !state.config.mcp.iam.require_agent_key;
     let agent = match authenticate(&state, &headers) {
-        Ok(a) => a,
-        Err(resp) => return *resp,
+        Ok(Some(a)) => Some(a),
+        Ok(None) if iam_stands_in => match resolve_iam_agent(&state, &headers).await {
+            Ok(resolved) => resolved,
+            Err(resp) => return resp,
+        },
+        Ok(None) => None,
+        Err(resp) => {
+            state
+                .metrics
+                .observe_mcp(None, None, crate::metrics::Outcome::Denied);
+            return *resp;
+        }
     };
+
+    // Phase 3 (#18): per-agent rate quota + upstream circuit breaker. Charged
+    // for every authenticated /mcp request — before policy evaluation — so a
+    // client spamming denied calls cannot monopolise the proxy either.
+    let quota_key = agent.map(|a| a.id.as_str()).unwrap_or("<anonymous>");
+    match state.quotas.check(quota_key, unix_now_ms()) {
+        crate::quota::Decision::Allow => {}
+        crate::quota::Decision::Throttled { retry_after_secs } => {
+            state
+                .metrics
+                .observe_mcp(agent.map(|a| a.id.as_str()), None, crate::metrics::Outcome::QuotaRejected);
+            tracing::warn!(
+                "MCP request throttled for agent {} (Retry-After {}s)",
+                quota_key,
+                retry_after_secs
+            );
+            return retry_after_response(retry_after_secs, "agent rate limit exceeded");
+        }
+        crate::quota::Decision::CircuitOpen { retry_after_secs } => {
+            state
+                .metrics
+                .observe_mcp(agent.map(|a| a.id.as_str()), None, crate::metrics::Outcome::CircuitOpen);
+            tracing::warn!(
+                "MCP request refused: upstream circuit open for agent {}",
+                quota_key
+            );
+            return retry_after_response(retry_after_secs, "upstream circuit open");
+        }
+    }
 
     let session_id = headers
         .get("mcp-session-id")
@@ -128,6 +177,11 @@ pub async fn mcp_proxy(
                         agent.id,
                         session_suffix(session_id.as_deref())
                     );
+                    state.metrics.observe_mcp(
+                        Some(agent.id.as_str()),
+                        Some(tool_name),
+                        crate::metrics::Outcome::Denied,
+                    );
                     return tool_call_denied(
                         frame.rpc_id.as_ref(),
                         "tool not permitted by agent policy",
@@ -163,6 +217,11 @@ pub async fn mcp_proxy(
                         agent.id,
                         session_suffix(session_id.as_deref())
                     );
+                    state.metrics.observe_mcp(
+                        Some(agent.id.as_str()),
+                        Some(tool_name),
+                        crate::metrics::Outcome::Denied,
+                    );
                     return tool_call_denied(
                         frame.rpc_id.as_ref(),
                         "write tools require a repository-scoped agent",
@@ -178,6 +237,11 @@ pub async fn mcp_proxy(
                                 agent.id,
                                 session_suffix(session_id.as_deref())
                             );
+                            state.metrics.observe_mcp(
+                                Some(agent.id.as_str()),
+                                Some(tool_name),
+                                crate::metrics::Outcome::Denied,
+                            );
                             return tool_call_denied(
                                 frame.rpc_id.as_ref(),
                                 "call has no resolvable repository target",
@@ -189,6 +253,11 @@ pub async fn mcp_proxy(
                                     "MCP tools/call {} DENIED (repo {}/{} not allowlisted) [agent={}]{}",
                                     tool_name, owner, repo_name, agent.id,
                                     session_suffix(session_id.as_deref())
+                                );
+                                state.metrics.observe_mcp(
+                                    Some(agent.id.as_str()),
+                                    Some(tool_name),
+                                    crate::metrics::Outcome::Denied,
                                 );
                                 return tool_call_denied(
                                     frame.rpc_id.as_ref(),
@@ -215,6 +284,9 @@ pub async fn mcp_proxy(
                 "MCP tools/call {} DENIED (local write tools require an authenticated write-enabled agent)",
                 local
             );
+            state
+                .metrics
+                .observe_mcp(agent.map(|a| a.id.as_str()), Some(local), crate::metrics::Outcome::Denied);
             return tool_call_denied(
                 frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
                 "local write tools require an authenticated write-enabled agent",
@@ -258,9 +330,15 @@ pub async fn mcp_proxy(
                 "MCP request rejected: unknown or expired session{}",
                 session_suffix(session_id.as_deref())
             );
+            state
+                .metrics
+                .observe_mcp(agent.map(|a| a.id.as_str()), None, crate::metrics::Outcome::Denied);
             return rpc_error(StatusCode::NOT_FOUND, "session not found or expired");
         }
         Err(StatusCode::FORBIDDEN) => {
+            state
+                .metrics
+                .observe_mcp(agent.map(|a| a.id.as_str()), None, crate::metrics::Outcome::Denied);
             return rpc_error(StatusCode::FORBIDDEN, "session not owned by this agent");
         }
         Err(StatusCode::BAD_GATEWAY) => {
@@ -408,17 +486,10 @@ pub async fn mcp_proxy(
     // results) complete within a bounded window, but GET is the stream
     // resumption channel and may legitimately stay open indefinitely — a
     // total timeout there would sever healthy streams.
-    let req = match method {
-        Method::POST => state
-            .http
-            .post(upstream)
-            .body(reqwest::Body::from(body))
-            .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS)),
-        Method::GET => state.http.get(&upstream),
-        Method::DELETE => state
-            .http
-            .delete(upstream)
-            .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS)),
+    let timeout = match method {
+        Method::POST => Some(std::time::Duration::from_secs(POST_TIMEOUT_SECS)),
+        Method::DELETE => Some(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS)),
+        Method::GET => None,
         _ => return rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
     };
 
@@ -453,11 +524,82 @@ pub async fn mcp_proxy(
         }
     }
 
-    let resp = match req.headers(upstream_headers).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("mcp upstream request failed: {}", e);
-            return rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed");
+    // Phase 3 (#18): retry idempotent reads only. Write-classified tools/call is
+    // never retried here — a duplicated write is a duplicated side effect, and
+    // the Phase 2 gate is what guarantees the call reaches the upstream exactly
+    // once. 429 is not retried either: the upstream's Retry-After is handed to
+    // the client instead.
+    let mut upstream_retry_after: Option<u64> = None;
+    let quota_cfg = state.quotas.config().clone();
+    let idempotent = retryable_frame(frame.as_ref(), &method);
+    let max_attempts = if idempotent { quota_cfg.retry_max_attempts } else { 1 };
+    let mut attempt = 0u32;
+    let resp = loop {
+        attempt += 1;
+        let mut builder = match method {
+            Method::POST => state.http.post(&upstream),
+            Method::DELETE => state.http.delete(&upstream),
+            _ => state.http.get(&upstream),
+        }
+        .headers(upstream_headers.clone())
+        .body(reqwest::Body::from(body.clone()));
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let started = std::time::Instant::now();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match builder.send().await {
+            Ok(response) => {
+                let status = response.status();
+                state
+                    .metrics
+                    .observe_upstream(agent_id, elapsed_ms, status.as_u16());
+                if status.is_server_error() {
+                    state.quotas.record_upstream_failure(quota_key, unix_now_ms());
+                } else {
+                    state.quotas.record_success(quota_key, unix_now_ms());
+                }
+                // 502/503/504 are transient upstream failures worth one more
+                // try; 500 is a settled answer and is not retried.
+                let retriable = matches!(status.as_u16(), 502 | 503 | 504);
+                if retriable && attempt < max_attempts {
+                    tracing::warn!(
+                        "mcp upstream {} on attempt {}/{} — backing off",
+                        status,
+                        attempt,
+                        max_attempts
+                    );
+                    crate::quota::sleep_backoff(
+                        attempt,
+                        quota_cfg.retry_base_backoff_ms,
+                        quota_cfg.retry_max_backoff_ms,
+                    )
+                    .await;
+                    continue;
+                }
+                break response;
+            }
+            Err(e) => {
+                state.metrics.observe_upstream(agent_id, elapsed_ms, 0);
+                state.quotas.record_upstream_failure(quota_key, unix_now_ms());
+                if attempt < max_attempts {
+                    tracing::warn!(
+                        "mcp upstream transport failure on attempt {}/{}: {}",
+                        attempt,
+                        max_attempts,
+                        e
+                    );
+                    crate::quota::sleep_backoff(
+                        attempt,
+                        quota_cfg.retry_base_backoff_ms,
+                        quota_cfg.retry_max_backoff_ms,
+                    )
+                    .await;
+                    continue;
+                }
+                tracing::error!("mcp upstream request failed: {}", e);
+                return rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed");
+            }
         }
     };
 
@@ -498,6 +640,25 @@ pub async fn mcp_proxy(
             cred_label
         );
     }
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // Honour the upstream's own backpressure for this agent instead of
+        // letting it rediscover the limit one request at a time.
+        let advertised = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| crate::quota::parse_retry_after(v, unix_now_secs()));
+        let applied = state
+            .quotas
+            .record_upstream_throttle(quota_key, advertised, unix_now_ms());
+        tracing::warn!(
+            "MCP upstream throttled agent {} — cooling down {}s (Retry-After {:?})",
+            quota_key,
+            applied,
+            advertised
+        );
+        upstream_retry_after = Some(applied);
+    }
 
     // Pin new sessions: upstream returns Mcp-Session-Id on initialize.
     // The pin binds the session to the exact credential and the agent that
@@ -508,7 +669,7 @@ pub async fn mcp_proxy(
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
     {
-        if state.mcp_sessions.get(sid).await.is_none() {
+        if state.mcp_sessions.get(sid, unix_now_secs()).is_none() {
             if let Some(new_pin) = cred.to_pin(agent_id) {
                 tracing::info!(
                     "MCP session pinned to credential {}{}{}",
@@ -518,7 +679,20 @@ pub async fn mcp_proxy(
                         .unwrap_or_default(),
                     session_suffix(Some(sid))
                 );
-                state.mcp_sessions.insert(sid.to_string(), new_pin).await;
+                if let Err(e) = state.mcp_sessions.insert(sid, new_pin, unix_now_secs()) {
+                    // Fail closed: a pin we cannot share/durably record must not
+                    // be advertised to the client, or the next request would be
+                    // answered "unknown session" with no way to explain why.
+                    tracing::error!(
+                        "MCP session {} could not be pinned ({}): refusing the session",
+                        sid,
+                        e
+                    );
+                    return rpc_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "session state unavailable",
+                    );
+                }
             }
         }
     }
@@ -526,9 +700,18 @@ pub async fn mcp_proxy(
     // Session termination: drop the pin
     if method == Method::DELETE {
         if let Some(sid) = &session_id {
-            state.mcp_sessions.invalidate(sid).await;
+            drop_pins(&state, sid);
         }
     }
+
+    state.metrics.observe_mcp(
+        agent_id,
+        frame
+            .as_ref()
+            .and_then(|f| f.tool.as_deref())
+            .or(write_call.as_deref()),
+        crate::metrics::Outcome::Allowed,
+    );
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     // A secondary route's upstream echoes ITS session ID; the client must
@@ -544,6 +727,9 @@ pub async fn mcp_proxy(
         _ => None,
     };
     let mut builder = Response::builder().status(status);
+    if let Some(retry_after) = upstream_retry_after {
+        builder = builder.header("retry-after", retry_after.to_string());
+    }
     for name in RESP_HEADERS {
         if let Some(v) = resp.headers().get(*name) {
             if *name == "mcp-session-id" {
@@ -1245,49 +1431,6 @@ async fn handle_commit_status_set(
     }
 }
 
-/// What a pinned MCP session is bound to: the exact credential serving it,
-/// and (in agent mode) the agent that initialized it. A session presented by
-/// a different agent is rejected; a session whose credential has expired is
-/// terminated (404) — sessions cannot outlive their credential (2b gate).
-#[derive(Clone, Debug, PartialEq)]
-pub struct SessionPin {
-    /// None = session created in Phase 1 network-trust mode (no agents).
-    pub agent_id: Option<String>,
-    pub cred: PinnedCred,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum PinnedCred {
-    /// Pooled PAT, referenced by identity id (revoked by pool removal).
-    Pat { identity_id: String },
-    /// GitHub App installation token, pinned by value: the session keeps
-    /// using the token it started with (still valid upstream even after the
-    /// provider refreshes) and dies at that token's expiry.
-    App { token: String, expires_at: u64 },
-    /// Multi-installation mode: one pinned credential and one upstream
-    /// session per owner, all created eagerly at `initialize` (fan-out).
-    /// tools/call frames route by their resolved repository owner; the
-    /// session dies (404) when a needed route's token has expired — routes
-    /// are minted together, so expiries are effectively aligned.
-    MultiApp {
-        /// owner (lowercase) → pinned per-installation route.
-        routes: std::collections::HashMap<String, AppRoute>,
-        /// Owner whose upstream session ID doubles as the downstream
-        /// session ID; non-tools/call traffic is served by this route.
-        primary: String,
-    },
-}
-
-/// One installation's pinned credential + upstream session in multi mode.
-#[derive(Clone, Debug, PartialEq)]
-pub struct AppRoute {
-    pub token: String,
-    pub expires_at: u64,
-    /// Upstream session ID for this installation (None when the upstream
-    /// did not assign one — such routes are used statelessly).
-    pub upstream_session: Option<String>,
-}
-
 /// The upstream credential resolved for one request.
 pub enum McpCredential {
     Pat(pool::Identity),
@@ -1358,7 +1501,7 @@ async fn pick_credential(
 ) -> Result<McpCredential, StatusCode> {
     let agent_id = agent.map(|a| a.id.as_str());
     if let Some(sid) = session_id {
-        if let Some(pin) = state.mcp_sessions.get(sid).await {
+        if let Some(pin) = state.mcp_sessions.get(sid, unix_now_secs()) {
             if pin.agent_id.as_deref() != agent_id {
                 // Session binding violation: a different agent (or mode) is
                 // presenting this session ID. Do not disclose whether the
@@ -1375,7 +1518,7 @@ async fn pick_credential(
                         return Ok(McpCredential::Pat(ident));
                     }
                     // Identity left the pool — treat as terminated
-                    state.mcp_sessions.invalidate(sid).await;
+                    drop_pins(&state, sid);
                 }
                 PinnedCred::App { token, expires_at } => {
                     let now = std::time::SystemTime::now()
@@ -1393,7 +1536,7 @@ async fn pick_credential(
                         "MCP session terminated: pinned App token expired{}",
                         session_suffix(Some(sid))
                     );
-                    state.mcp_sessions.invalidate(sid).await;
+                    drop_pins(&state, sid);
                 }
                 PinnedCred::MultiApp { routes, primary } => {
                     // Routes are minted together — the session dies as a
@@ -1408,7 +1551,7 @@ async fn pick_credential(
                             "MCP session terminated: a pinned App token expired{}",
                             session_suffix(Some(sid))
                         );
-                        state.mcp_sessions.invalidate(sid).await;
+                        drop_pins(&state, sid);
                         return Err(StatusCode::NOT_FOUND);
                     }
                     let key = route_owner
@@ -1761,19 +1904,29 @@ async fn multi_initialize(
             agent.id,
             session_suffix(Some(dsid.as_str()))
         );
-        state
-            .mcp_sessions
-            .insert(
-                dsid,
-                SessionPin {
-                    agent_id: Some(agent.id.clone()),
-                    cred: PinnedCred::MultiApp {
-                        routes: routes.clone(),
-                        primary: primary_owner.clone(),
-                    },
+        if let Err(e) = state.mcp_sessions.insert(
+            &dsid,
+            SessionPin {
+                agent_id: Some(agent.id.clone()),
+                cred: PinnedCred::MultiApp {
+                    routes: routes.clone(),
+                    primary: primary_owner.clone(),
                 },
-            )
-            .await;
+            },
+            unix_now_secs(),
+        ) {
+            // Fail closed: do not hand the client a session the proxy cannot
+            // keep track of.
+            tracing::error!(
+                "MCP multi-installation session {} could not be pinned: {}",
+                dsid,
+                e
+            );
+            return rpc_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "session state unavailable",
+            );
+        }
     } else {
         tracing::warn!(
             "upstream initialize returned no session id — multi-installation session not pinned [agent={}]",
@@ -1850,7 +2003,7 @@ async fn multi_fanout(
     downstream_sid: &str,
     agent: Option<&crate::config::McpAgentConfig>,
 ) -> Option<Response> {
-    let pin = state.mcp_sessions.get(downstream_sid).await?;
+    let pin = state.mcp_sessions.get(downstream_sid, unix_now_secs())?;
     if pin.agent_id.as_deref() != agent.map(|a| a.id.as_str()) {
         tracing::warn!(
             "MCP session binding violation: session initialized by {:?}, presented by {:?}{}",
@@ -1932,7 +2085,7 @@ async fn multi_fanout(
 
     // Session termination: drop the whole multi-route pin
     if *method == Method::DELETE {
-        state.mcp_sessions.invalidate(downstream_sid).await;
+        drop_pins(state, downstream_sid);
     }
 
     Some(
@@ -1979,10 +2132,15 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Phase 2a agent authentication.
+/// Phase 2a agent authentication, extended by the Phase 3 secretless IAM path.
 /// - No [[mcp.agents]] configured → Phase 1 network-trust mode: Ok(None).
 /// - Agents configured → every request must present a valid X-Octobroker-Key;
 ///   missing or unknown keys get 401 with a JSON-RPC error body.
+/// - With [mcp.iam] enabled and `require_agent_key = false`, a presigned
+///   `sts:GetCallerIdentity` proof may stand in for the key. The proof is
+///   validated against the RFC's SigV4 controls locally and then replayed to
+///   STS, which is the only party that can check the signature; the caller ARN
+///   STS returns selects the agent. An unknown ARN is rejected.
 pub(crate) fn authenticate<'a>(
     state: &'a AppState,
     headers: &HeaderMap,
@@ -1991,10 +2149,15 @@ pub(crate) fn authenticate<'a>(
     if agents.is_empty() {
         return Ok(None);
     }
+    let iam_only = state.config.mcp.iam.enabled && !state.config.mcp.iam.require_agent_key;
     let Some(presented) = headers
         .get("x-octobroker-key")
         .and_then(|v| v.to_str().ok())
     else {
+        if iam_only && headers.contains_key(crate::iam::PROOF_HEADER) {
+            // Resolved below; the ARN from STS is authoritative.
+            return Ok(None);
+        }
         tracing::warn!("MCP request rejected: missing X-Octobroker-Key");
         return Err(Box::new(rpc_error(
             StatusCode::UNAUTHORIZED,
@@ -2011,6 +2174,128 @@ pub(crate) fn authenticate<'a>(
         StatusCode::UNAUTHORIZED,
         "invalid X-Octobroker-Key",
     )))
+}
+
+/// Resolve the agent behind a secretless IAM proof (Phase 3, #18).
+///
+/// Local validation enforces the RFC's SigV4 controls before anything leaves
+/// the process; the proof is then replayed to STS, which is the only party that
+/// holds the secret and can therefore judge the signature. The caller ARN STS
+/// returns — not the proof — selects the agent, and an ARN that is not on any
+/// agent's `iam_role_arns` allowlist is rejected.
+async fn resolve_iam_agent<'a>(
+    state: &'a AppState,
+    headers: &HeaderMap,
+) -> Result<Option<&'a crate::config::McpAgentConfig>, Response> {
+    let Some(raw) = headers.get(crate::iam::PROOF_HEADER) else {
+        return Ok(None);
+    };
+    let denied = |reason: &str| {
+        state
+            .metrics
+            .observe_mcp(None, None, crate::metrics::Outcome::Denied);
+        rpc_error(StatusCode::FORBIDDEN, reason)
+    };
+    let Some(proof_url) = raw.to_str().ok() else {
+        return Err(denied("iam_proof_malformed_header"));
+    };
+
+    let now = unix_now_secs();
+    let proof = match crate::iam::verify_presigned_proof(proof_url, now, &state.iam_policy) {
+        Ok(proof) => proof,
+        Err(rejection) => {
+            // The reason names the violated control, never the signature value.
+            tracing::warn!("MCP IAM proof rejected: {}", rejection.as_str());
+            return Err(denied(rejection.as_str()));
+        }
+    };
+    if !state.iam_replay.claim(&proof.signature, now) {
+        tracing::warn!("MCP IAM proof replay detected");
+        return Err(denied("iam_proof_replayed"));
+    }
+
+    let exchange = state
+        .http
+        .get(proof_url)
+        .header("Accept", "application/json")
+        .send()
+        .await;
+    let Ok(response) = exchange else {
+        tracing::error!("STS proof exchange failed");
+        return Err(rpc_error(
+            StatusCode::BAD_GATEWAY,
+            "iam_proof_exchange_failed",
+        ));
+    };
+    if !response.status().is_success() {
+        tracing::warn!("STS refused the IAM proof: {}", response.status());
+        return Err(denied("iam_proof_rejected_by_sts"));
+    }
+    let body = response.text().await.unwrap_or_default();
+    let Some(arn) = crate::iam::parse_caller_identity_arn(&body) else {
+        tracing::warn!("STS proof response carried no caller ARN");
+        return Err(denied("iam_proof_malformed_sts_response"));
+    };
+    let normalized = crate::iam::normalize_caller_arn(&arn);
+    match state.config.mcp.agents.iter().find(|agent| {
+        agent
+            .iam_role_arns
+            .iter()
+            .any(|allowed| allowed == &arn || allowed == &normalized)
+    }) {
+        Some(agent) => {
+            tracing::info!(
+                "MCP request authenticated by IAM proof (agent={}, access_key={}, expires_in={}s)",
+                agent.id,
+                proof.access_key_id,
+                proof.expires_in_secs
+            );
+            Ok(Some(agent))
+        }
+        None => {
+            tracing::warn!("MCP IAM proof caller is not an authorized agent");
+            Err(denied("iam_role_not_authorized"))
+        }
+    }
+}
+
+/// Whether a frame may be retried after a transient upstream failure.
+///
+/// Only POST is eligible: GET is the long-lived stream-resumption channel and
+/// DELETE terminates a session. Within POST, a `tools/call` is retryable only
+/// when it classifies as a READ — a write-classified call is a non-idempotent
+/// side effect and must reach the upstream exactly once.
+fn retryable_frame(frame: Option<&Frame>, method: &Method) -> bool {
+    if method != &Method::POST {
+        return false;
+    }
+    match frame {
+        None => true,
+        Some(frame) if frame.method == "tools/call" => frame.tool.as_deref().is_some_and(|tool| {
+            crate::policy::classify_tool(tool) == crate::policy::ToolKind::Read
+        }),
+        Some(_) => true,
+    }
+}
+
+/// 429 with a `Retry-After` header, so a well-behaved MCP client backs off
+/// instead of hammering a rate-limited upstream.
+fn retry_after_response(retry_after_secs: u64, message: &str) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("retry-after", retry_after_secs.to_string());
+    builder = builder.header(
+        "content-type",
+        "application/json",
+    );
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": { "code": -32000, "message": message, "data": { "retry_after_secs": retry_after_secs } }
+    });
+    builder
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| rpc_error(StatusCode::TOO_MANY_REQUESTS, message))
 }
 
 /// Compare keys via SHA-256 digests. Comparing fixed-length digests of both
@@ -2142,6 +2427,29 @@ fn parse_frame(body: &[u8]) -> Option<Frame> {
     })
 }
 
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Drop a pinned session. A shared-store failure is logged loudly but never
+/// fails the request: the session is already unusable upstream, and denying a
+/// `DELETE` because the journal is full would strand the client.
+fn drop_pins(state: &AppState, session_id: &str) {
+    if let Err(e) = state.mcp_sessions.invalidate(session_id, unix_now_secs()) {
+        tracing::error!("MCP session {} drop failed: {}", session_id, e);
+    }
+}
+
 fn session_suffix(session_id: Option<&str>) -> String {
     match session_id {
         Some(sid) => format!(" [session={}]", &sid[..sid.len().min(8)]),
@@ -2166,7 +2474,8 @@ mod tests {
 
     fn agent(id: &str, key: &str, tools: &[&str]) -> config::McpAgentConfig {
         config::McpAgentConfig {
-            id: id.to_string(),
+            iam_role_arns: Vec::new(),
+                   id: id.to_string(),
             key: None,
             keys: vec![key.to_string()],
             tools: tools.iter().map(|s| s.to_string()).collect(),
@@ -2216,6 +2525,9 @@ mod tests {
                 allowed_owners: vec!["openabdev".to_string()],
                 cache: cache_config,
                 mcp: config::McpConfig {
+                    iam: config::IamConfig::default(),
+                    quota: config::QuotaSettings::default(),
+                    scaling: config::ScalingConfig::default(),
                     enabled: true,
                     enable_writes: false,
                     enable_git_credentials: false,
@@ -2232,7 +2544,11 @@ mod tests {
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
-            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+mcp_sessions: crate::session_store::PinStore::memory(3_600),
+            quotas: crate::quota::QuotaRegistry::new(crate::quota::QuotaConfig::default()),
+            metrics: crate::metrics::Metrics::new(),
+            iam_policy: crate::iam::IamProofPolicy::default(),
+            iam_replay: crate::iam::ReplayGuard::default(),
             app_tokens: None,
             multi_app_tokens: None,
             audit: None,
@@ -2430,8 +2746,8 @@ data: "id":1,"result":{"tools":[]}}
         let state = test_state(&["alice", "bob"]);
         state
             .mcp_sessions
-            .insert("sess-1".to_string(), pin("bob", None))
-            .await;
+                .insert("sess-1", pin("bob", None), unix_now_secs())
+                .unwrap();
 
         let cred = pick_credential(&state, Some("sess-1"), None, None)
             .await
@@ -2472,13 +2788,13 @@ data: "id":1,"result":{"tools":[]}}
         let state = test_state(&["alice"]);
         state
             .mcp_sessions
-            .insert("sess-x".to_string(), pin("gone", None))
-            .await;
+                .insert("sess-x", pin("gone", None), unix_now_secs())
+                .unwrap();
         match pick_credential(&state, Some("sess-x"), None, None).await {
             Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
             Ok(_) => panic!("stale pin must not resolve an identity"),
         }
-        assert!(state.mcp_sessions.get("sess-x").await.is_none());
+        assert!(state.mcp_sessions.get("sess-x", unix_now_secs()).is_none());
     }
 
     // ---- Integration tests: real handler against an in-process mock upstream ----
@@ -2655,7 +2971,7 @@ data: "id":1,"result":{"tools":[]}}
         // Session pinned to the identity that served initialize (Phase 1
         // mode: no agent binding)
         assert_eq!(
-            state.mcp_sessions.get("mock-sess-1").await,
+            state.mcp_sessions.get("mock-sess-1", unix_now_secs()),
             Some(pin("alice", None))
         );
     }
@@ -2700,8 +3016,8 @@ data: "id":1,"result":{"tools":[]}}
         let state = test_state_with(&["alice"], &url, &[]);
         state
             .mcp_sessions
-            .insert("dead-sess".to_string(), pin("alice", None))
-            .await;
+                .insert("dead-sess", pin("alice", None), unix_now_secs())
+                .unwrap();
 
         let req = Request::builder()
             .method("DELETE")
@@ -2714,7 +3030,7 @@ data: "id":1,"result":{"tools":[]}}
 
         // DELETE was forwarded upstream and the local pin was dropped
         assert_eq!(captured.lock().unwrap()[0].method, "DELETE");
-        assert!(state.mcp_sessions.get("dead-sess").await.is_none());
+        assert!(state.mcp_sessions.get("dead-sess", unix_now_secs()).is_none());
     }
 
     #[tokio::test]
@@ -3028,7 +3344,7 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            state.mcp_sessions.get("mock-sess-1").await,
+            state.mcp_sessions.get("mock-sess-1", unix_now_secs()),
             Some(pin("alice", Some("bot-a")))
         );
 
@@ -3068,8 +3384,8 @@ data: "id":1,"result":{"tools":[]}}
         );
         state
             .mcp_sessions
-            .insert("old-sess".to_string(), pin("alice", None))
-            .await;
+                .insert("old-sess", pin("alice", None), unix_now_secs())
+                .unwrap();
 
         let resp = mcp_app(state)
             .oneshot(post_frame(
@@ -3648,6 +3964,9 @@ data: "id":1,"result":{"tools":[]}}
                 allowed_owners: vec!["openabdev".to_string()],
                 cache: cache_config,
                 mcp: config::McpConfig {
+                    iam: config::IamConfig::default(),
+                    quota: config::QuotaSettings::default(),
+                    scaling: config::ScalingConfig::default(),
                     enabled: true,
                     enable_writes: false,
                     enable_git_credentials: false,
@@ -3664,7 +3983,11 @@ data: "id":1,"result":{"tools":[]}}
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
-            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+mcp_sessions: crate::session_store::PinStore::memory(3_600),
+            quotas: crate::quota::QuotaRegistry::new(crate::quota::QuotaConfig::default()),
+            metrics: crate::metrics::Metrics::new(),
+            iam_policy: crate::iam::IamProofPolicy::default(),
+            iam_replay: crate::iam::ReplayGuard::default(),
             app_tokens: Some(provider),
             multi_app_tokens: None,
             audit: None,
@@ -3693,7 +4016,7 @@ data: "id":1,"result":{"tools":[]}}
         );
 
         // Session pinned to the App credential by value
-        let pin = state.mcp_sessions.get("mock-sess-1").await.unwrap();
+        let pin = state.mcp_sessions.get("mock-sess-1", unix_now_secs()).unwrap();
         match pin.cred {
             PinnedCred::App { token, expires_at } => {
                 assert_eq!(token, "ghs_mock_token");
@@ -3739,7 +4062,7 @@ data: "id":1,"result":{"tools":[]}}
         state
             .mcp_sessions
             .insert(
-                "old-sess".to_string(),
+                "old-sess",
                 SessionPin {
                     agent_id: None,
                     cred: PinnedCred::App {
@@ -3747,8 +4070,9 @@ data: "id":1,"result":{"tools":[]}}
                         expires_at: now() - 10,
                     },
                 },
+                unix_now_secs(),
             )
-            .await;
+            .unwrap();
 
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
@@ -3760,7 +4084,7 @@ data: "id":1,"result":{"tools":[]}}
         // Terminated per MCP spec: 404 → client re-initializes
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         // Pin removed; upstream never called
-        assert!(state.mcp_sessions.get("old-sess").await.is_none());
+        assert!(state.mcp_sessions.get("old-sess", unix_now_secs()).is_none());
         assert!(captured.lock().unwrap().is_empty());
     }
 
@@ -3798,6 +4122,9 @@ data: "id":1,"result":{"tools":[]}}
                 allowed_owners: vec!["openabdev".to_string()],
                 cache: cache_config,
                 mcp: config::McpConfig {
+                    iam: config::IamConfig::default(),
+                    quota: config::QuotaSettings::default(),
+                    scaling: config::ScalingConfig::default(),
                     enabled: true,
                     enable_writes: false,
                     enable_git_credentials: false,
@@ -3817,7 +4144,11 @@ data: "id":1,"result":{"tools":[]}}
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
-            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+mcp_sessions: crate::session_store::PinStore::memory(3_600),
+            quotas: crate::quota::QuotaRegistry::new(crate::quota::QuotaConfig::default()),
+            metrics: crate::metrics::Metrics::new(),
+            iam_policy: crate::iam::IamProofPolicy::default(),
+            iam_replay: crate::iam::ReplayGuard::default(),
             app_tokens: None,
             multi_app_tokens: None,
             audit: Some(sink),
@@ -4002,6 +4333,9 @@ data: "id":1,"result":{"tools":[]}}
                 allowed_owners: vec!["openabdev".to_string()],
                 cache: cache_config,
                 mcp: config::McpConfig {
+                    iam: config::IamConfig::default(),
+                    quota: config::QuotaSettings::default(),
+                    scaling: config::ScalingConfig::default(),
                     enabled: true,
                     enable_writes: true,
                     enable_git_credentials: false,
@@ -4021,7 +4355,11 @@ data: "id":1,"result":{"tools":[]}}
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
-            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+mcp_sessions: crate::session_store::PinStore::memory(3_600),
+            quotas: crate::quota::QuotaRegistry::new(crate::quota::QuotaConfig::default()),
+            metrics: crate::metrics::Metrics::new(),
+            iam_policy: crate::iam::IamProofPolicy::default(),
+            iam_replay: crate::iam::ReplayGuard::default(),
             app_tokens: None,
             multi_app_tokens: None,
             audit: Some(sink),
@@ -4327,6 +4665,9 @@ data: "id":1,"result":{"tools":[]}}
                 allowed_owners: vec!["openabdev".to_string(), "oablab".to_string()],
                 cache: cache_config,
                 mcp: config::McpConfig {
+                    iam: config::IamConfig::default(),
+                    quota: config::QuotaSettings::default(),
+                    scaling: config::ScalingConfig::default(),
                     enabled: true,
                     enable_writes,
                     enable_git_credentials: false,
@@ -4346,7 +4687,11 @@ data: "id":1,"result":{"tools":[]}}
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
-            mcp_sessions: moka::future::Cache::builder().max_capacity(100).build(),
+mcp_sessions: crate::session_store::PinStore::memory(3_600),
+            quotas: crate::quota::QuotaRegistry::new(crate::quota::QuotaConfig::default()),
+            metrics: crate::metrics::Metrics::new(),
+            iam_policy: crate::iam::IamProofPolicy::default(),
+            iam_replay: crate::iam::ReplayGuard::default(),
             app_tokens: None,
             multi_app_tokens: Some(multi),
             audit: sink,
@@ -4408,7 +4753,7 @@ data: "id":1,"result":{"tools":[]}}
         }
 
         // The pin covers both routes with distinct upstream sessions
-        let pin = state.mcp_sessions.get("sess-ghs_oablab").await.unwrap();
+        let pin = state.mcp_sessions.get("sess-ghs_oablab", unix_now_secs()).unwrap();
         assert_eq!(pin.agent_id.as_deref(), Some("b0"));
         match pin.cred {
             PinnedCred::MultiApp { routes, primary } => {
@@ -4540,7 +4885,7 @@ data: "id":1,"result":{"tools":[]}}
         state
             .mcp_sessions
             .insert(
-                "dsid".to_string(),
+                "dsid",
                 SessionPin {
                     agent_id: Some("b0".into()),
                     cred: PinnedCred::MultiApp {
@@ -4548,8 +4893,9 @@ data: "id":1,"result":{"tools":[]}}
                         primary: "oablab".into(),
                     },
                 },
+                unix_now_secs(),
             )
-            .await;
+            .unwrap();
 
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
@@ -4562,7 +4908,7 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         // Terminated per MCP spec: 404 → client re-initializes (fresh mints)
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert!(state.mcp_sessions.get("dsid").await.is_none());
+        assert!(state.mcp_sessions.get("dsid", unix_now_secs()).is_none());
         assert!(captured.lock().unwrap().is_empty());
     }
 
@@ -4581,7 +4927,7 @@ data: "id":1,"result":{"tools":[]}}
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         // No session pinned
-        assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_none());
+        assert!(state.mcp_sessions.get("sess-ghs_oablab", unix_now_secs()).is_none());
         // Partial-initialize cleanup: every upstream session opened before
         // the failure was DELETEd with its own credential — no orphans.
         let reqs = captured.lock().unwrap();
@@ -4658,7 +5004,7 @@ data: "id":1,"result":{"tools":[]}}
         }
 
         // Notification fan-out does not terminate the session
-        assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_some());
+        assert!(state.mcp_sessions.get("sess-ghs_oablab", unix_now_secs()).is_some());
     }
 
     #[tokio::test]
@@ -4694,7 +5040,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone()).oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert!(captured.lock().unwrap().is_empty());
-        assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_some());
+        assert!(state.mcp_sessions.get("sess-ghs_oablab", unix_now_secs()).is_some());
 
         // The rightful owner still works
         let resp = mcp_app(state)
@@ -4746,7 +5092,7 @@ data: "id":1,"result":{"tools":[]}}
             assert!(pairs.contains(&("Bearer ghs_openabdev".into(), "sess-ghs_openabdev".into())));
         }
 
-        assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_none());
+        assert!(state.mcp_sessions.get("sess-ghs_oablab", unix_now_secs()).is_none());
     }
 
     #[tokio::test]
@@ -4771,7 +5117,7 @@ data: "id":1,"result":{"tools":[]}}
             assert_eq!(reqs[0].auth.as_deref(), Some("Bearer token-alice"));
         }
         assert_eq!(
-            state.mcp_sessions.get("sess-token-alice").await,
+            state.mcp_sessions.get("sess-token-alice", unix_now_secs()),
             Some(pin("alice", Some("b2pat")))
         );
 

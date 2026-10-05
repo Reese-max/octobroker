@@ -152,7 +152,7 @@ pub struct CacheStats {
     pub entries: u64,
 }
 
-pub fn build_key(path: &str, query: &HashMap<String, String>) -> String {
+pub fn build_key(path: &str, query: &HashMap<String, String>, identity_scope: &str) -> String {
     let mut parts: Vec<(&str, &str)> = query
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -209,11 +209,16 @@ pub fn build_raw_key(
     }
 }
 
-pub fn build_graphql_key(body: &[u8]) -> String {
+/// Build a cache key for a GraphQL **query**.
+///
+/// Identity-scoped for the same reason as [`build_key`]: a query result
+/// fetched with a pooled PAT must never be replayed for a caller whose own
+/// identity would have been refused by GitHub's resolver.
+pub fn build_graphql_key(body: &[u8], identity_scope: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     body.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    format!("graphql:{}:{}", hasher.finish(), identity_scope)
 }
 
 pub fn classify_route(path: &str) -> RouteKind {

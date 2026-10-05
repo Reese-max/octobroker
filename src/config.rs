@@ -120,6 +120,144 @@ pub struct McpConfig {
     /// pre-flight audit record cannot be persisted is rejected (fail-closed).
     #[serde(default)]
     pub audit: Option<AuditConfig>,
+    /// Secretless IAM authentication for the shim path (Phase 3, #18).
+    /// Disabled by default; when enabled a request may authenticate with an
+    /// `X-Octobroker-IAM-Proof` presigned `sts:GetCallerIdentity` URL instead of
+    /// a shared `X-Octobroker-Key`.
+    #[serde(default)]
+    pub iam: IamConfig,
+    /// Per-agent rate quotas, upstream circuit breaking and retry policy
+    /// (Phase 3, #18).
+    #[serde(default)]
+    pub quota: QuotaSettings,
+    /// Horizontal-scaling / shared session state (Phase 3, #18).
+    #[serde(default)]
+    pub scaling: ScalingConfig,
+}
+
+/// Secretless IAM proof authentication (Phase 3, #18).
+#[derive(Clone, Deserialize)]
+pub struct IamConfig {
+    /// Master switch. When false the proof header is ignored entirely and only
+    /// `X-Octobroker-Key` authenticates (unchanged Phase 2 behaviour).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed STS endpoint hosts (exact, case-insensitive). Empty = the
+    /// default single-host allowlist.
+    #[serde(default)]
+    pub sts_hosts: Vec<String>,
+    /// Allowed regions in the credential scope. Empty = the default.
+    #[serde(default)]
+    pub regions: Vec<String>,
+    /// Max proof validity in seconds. 0 = the RFC cap (60). Values above the cap
+    /// are clamped down, never raised.
+    #[serde(default)]
+    pub max_proof_age_secs: u64,
+    /// Tolerance for clock drift between the shim and this proxy.
+    #[serde(default = "default_iam_clock_skew_secs")]
+    pub clock_skew_secs: u64,
+    /// Also require `X-Octobroker-Key` in addition to the proof (defence in
+    /// depth: the proof proves *who* the caller is, the key proves it is an
+    /// authorised client of this deployment).
+    #[serde(default = "default_true")]
+    pub require_agent_key: bool,
+}
+
+impl Default for IamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sts_hosts: Vec::new(),
+            regions: Vec::new(),
+            max_proof_age_secs: 0,
+            clock_skew_secs: default_iam_clock_skew_secs(),
+            require_agent_key: true,
+        }
+    }
+}
+
+/// Quota / circuit-breaker settings (Phase 3, #18).
+#[derive(Clone, Deserialize)]
+pub struct QuotaSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_quota_per_min")]
+    pub per_agent_per_min: f64,
+    #[serde(default = "default_quota_burst")]
+    pub per_agent_burst: f64,
+    #[serde(default = "default_retry_after_cap_secs")]
+    pub retry_after_cap_secs: u64,
+    #[serde(default = "default_circuit_failure_threshold")]
+    pub circuit_failure_threshold: u32,
+    #[serde(default = "default_circuit_cooldown_secs")]
+    pub circuit_cooldown_secs: u64,
+    #[serde(default = "default_one")]
+    pub circuit_half_open_successes: u32,
+    #[serde(default = "default_retry_max_attempts")]
+    pub retry_max_attempts: u32,
+    #[serde(default = "default_retry_base_backoff_ms")]
+    pub retry_base_backoff_ms: u64,
+    #[serde(default = "default_retry_max_backoff_ms")]
+    pub retry_max_backoff_ms: u64,
+}
+
+impl Default for QuotaSettings {
+    fn default() -> Self {
+        let defaults = crate::quota::QuotaConfig::default();
+        Self {
+            enabled: defaults.enabled,
+            per_agent_per_min: defaults.per_agent_per_min,
+            per_agent_burst: defaults.per_agent_burst,
+            retry_after_cap_secs: defaults.retry_after_cap_secs,
+            circuit_failure_threshold: defaults.circuit_failure_threshold,
+            circuit_cooldown_secs: defaults.circuit_cooldown_secs,
+            circuit_half_open_successes: defaults.circuit_half_open_successes,
+            retry_max_attempts: defaults.retry_max_attempts,
+            retry_base_backoff_ms: defaults.retry_base_backoff_ms,
+            retry_max_backoff_ms: defaults.retry_max_backoff_ms,
+        }
+    }
+}
+
+impl QuotaSettings {
+    pub fn to_quota_config(&self) -> crate::quota::QuotaConfig {
+        crate::quota::QuotaConfig {
+            enabled: self.enabled,
+            per_agent_per_min: self.per_agent_per_min,
+            per_agent_burst: self.per_agent_burst,
+            retry_after_cap_secs: self.retry_after_cap_secs,
+            circuit_failure_threshold: self.circuit_failure_threshold,
+            circuit_cooldown_secs: self.circuit_cooldown_secs,
+            circuit_half_open_successes: self.circuit_half_open_successes,
+            retry_max_attempts: self.retry_max_attempts,
+            retry_base_backoff_ms: self.retry_base_backoff_ms,
+            retry_max_backoff_ms: self.retry_max_backoff_ms,
+        }
+    }
+}
+
+/// Horizontal scaling of MCP session state (Phase 3, #18).
+#[derive(Clone, Deserialize)]
+pub struct ScalingConfig {
+    /// `memory` (default, single replica) or `shared` (cross-replica journal).
+    #[serde(default = "default_scaling_mode")]
+    pub mode: String,
+    /// Journal path for `shared` mode, on storage every replica can reach.
+    #[serde(default = "default_session_journal")]
+    pub journal_path: String,
+    /// Replica identity recorded in the journal. Empty = hostname.
+    #[serde(default)]
+    pub replica_id: String,
+}
+
+impl Default for ScalingConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_scaling_mode(),
+            journal_path: default_session_journal(),
+            replica_id: String::new(),
+        }
+    }
 }
 
 /// Durable audit configuration.
@@ -194,6 +332,13 @@ pub struct McpAgentConfig {
     /// (deny-if-unresolvable). Empty = no repository restriction.
     #[serde(default)]
     pub repos: Vec<String>,
+    /// IAM role ARNs allowed to authenticate this agent with a presigned
+    /// `sts:GetCallerIdentity` proof instead of a shared key (Phase 3, #18).
+    /// Operators configure either the assumed-role ARN STS returns or the
+    /// equivalent IAM role ARN; both forms match. Empty = the proof path is not
+    /// available to this agent.
+    #[serde(default)]
+    pub iam_role_arns: Vec<String>,
     /// Per-agent override of `[mcp] git_credentials_read_only`.
     /// `true` = this agent's /git-credential tokens are minted `contents:
     /// read` (clone/fetch, no push) regardless of the global default;
@@ -221,6 +366,9 @@ impl Default for McpConfig {
             github_app: None,
             github_apps: Vec::new(),
             audit: None,
+            iam: IamConfig::default(),
+            quota: QuotaSettings::default(),
+            scaling: ScalingConfig::default(),
         }
     }
 }
@@ -237,6 +385,20 @@ impl McpConfig {
         } else {
             default_mcp_upstream()
         }
+    }
+
+    /// Effective SigV4 proof policy for the secretless IAM path: operator
+    /// overrides layered on the RFC defaults, with validity clamped to the cap.
+    pub fn iam_proof_policy(&self) -> crate::iam::IamProofPolicy {
+        let mut policy = crate::iam::IamProofPolicy::from_config(self.iam.max_proof_age_secs);
+        policy.clock_skew_secs = self.iam.clock_skew_secs;
+        if !self.iam.sts_hosts.is_empty() {
+            policy.allowed_hosts = self.iam.sts_hosts.clone();
+        }
+        if !self.iam.regions.is_empty() {
+            policy.allowed_regions = self.iam.regions.clone();
+        }
+        policy
     }
 
     /// Startup validation of the write gate's hard requirements.
@@ -293,6 +455,29 @@ impl McpConfig {
                 .is_some_and(|app| app.owner.as_deref().is_none_or(|o| o.trim().is_empty()))
             {
                 return Err("enable_git_credentials with [mcp.github_app] requires `owner` — explicit installation IDs are verified against this owner before issuance".into());
+            }
+        }
+        // Secretless IAM proof path (Phase 3).
+        if self.iam.enabled {
+            self.iam_proof_policy().validate()?;
+            if self.agents.is_empty() {
+                return Err("[mcp.iam] enabled requires [[mcp.agents]] — the caller ARN is mapped to a configured agent, never trusted to select one".into());
+            }
+        }
+        // Per-agent quotas (Phase 3).
+        self.quota.to_quota_config().validate()?;
+        // Horizontal scaling (Phase 3).
+        match self.scaling.mode.as_str() {
+            "memory" => {}
+            "shared" => {
+                if self.scaling.journal_path.trim().is_empty() {
+                    return Err("[mcp.scaling] mode = \"shared\" requires `journal_path`".into());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "[mcp.scaling] mode must be \"memory\" or \"shared\", got {other:?}"
+                ));
             }
         }
         // Mutual exclusion: singular and plural forms cannot coexist
@@ -360,6 +545,20 @@ impl McpConfig {
         Ok(())
     }
 }
+
+fn default_true() -> bool { true }
+fn default_iam_clock_skew_secs() -> u64 { 5 }
+fn default_quota_per_min() -> f64 { 240.0 }
+fn default_quota_burst() -> f64 { 60.0 }
+fn default_retry_after_cap_secs() -> u64 { 120 }
+fn default_circuit_failure_threshold() -> u32 { 5 }
+fn default_circuit_cooldown_secs() -> u64 { 30 }
+fn default_one() -> u32 { 1 }
+fn default_retry_max_attempts() -> u32 { 3 }
+fn default_retry_base_backoff_ms() -> u64 { 100 }
+fn default_retry_max_backoff_ms() -> u64 { 2_000 }
+fn default_scaling_mode() -> String { "memory".to_string() }
+fn default_session_journal() -> String { "/var/lib/octobroker/mcp-sessions.jsonl".to_string() }
 
 fn default_mcp_upstream() -> String {
     "https://api.githubcopilot.com/mcp/readonly".to_string()
@@ -719,6 +918,7 @@ mod tests {
         };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
         m.agents.push(McpAgentConfig {
+    iam_role_arns: Vec::new(),
             id: "a".into(),
             key: None,
             keys: vec!["k".into()],
@@ -776,7 +976,8 @@ mod tests {
         }
         fn multi_agent(repos: &[&str]) -> McpAgentConfig {
             McpAgentConfig {
-                id: "b0".into(),
+                iam_role_arns: Vec::new(),
+                           id: "b0".into(),
                 key: None,
                 keys: vec!["k".into()],
                 tools: vec![],
@@ -914,7 +1115,8 @@ mod tests {
     fn test_mcp_validate_git_credentials_gate() {
         fn agent() -> McpAgentConfig {
             McpAgentConfig {
-                id: "b0".into(),
+                iam_role_arns: Vec::new(),
+                           id: "b0".into(),
                 key: None,
                 keys: vec!["k".into()],
                 tools: vec![],

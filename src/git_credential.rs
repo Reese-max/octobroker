@@ -306,7 +306,8 @@ mod tests {
 
     fn agent(id: &str, key: &str, repos: &[&str]) -> config::McpAgentConfig {
         config::McpAgentConfig {
-            id: id.into(),
+            iam_role_arns: Vec::new(),
+                   id: id.into(),
             key: None,
             keys: vec![key.into()],
             tools: vec![],
@@ -368,6 +369,9 @@ mod tests {
                     allowed_owners: vec![],
                     cache: cache_config,
                     mcp: config::McpConfig {
+                        iam: config::IamConfig::default(),
+                        quota: config::QuotaSettings::default(),
+                        scaling: config::ScalingConfig::default(),
                         enabled: true,
                         enable_writes: false,
                         enable_git_credentials: enabled,
@@ -396,7 +400,11 @@ mod tests {
                 },
                 token_users: moka::future::Cache::builder().max_capacity(10).build(),
                 http: reqwest::Client::new(),
-                mcp_sessions: moka::future::Cache::builder().max_capacity(10).build(),
+mcp_sessions: crate::session_store::PinStore::memory(3_600),
+            quotas: crate::quota::QuotaRegistry::new(crate::quota::QuotaConfig::default()),
+            metrics: crate::metrics::Metrics::new(),
+            iam_policy: crate::iam::IamProofPolicy::default(),
+            iam_replay: crate::iam::ReplayGuard::default(),
                 app_tokens: None,
                 multi_app_tokens: Some(multi),
                 audit: sink,
