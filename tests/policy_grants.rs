@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
+// Keep the integration test dependent on the binary target so Cargo builds it
+// alongside the test; resolve the path at runtime for detached replay worktrees.
+const _CARGO_BIN_EXE_OCTOBROKER: &str = env!("CARGO_BIN_EXE_octobroker");
+
 type HttpResponse = (u16, Vec<(String, String)>, String);
 
 fn http(
@@ -181,7 +185,19 @@ fn spawn_broker(config: &str) -> Broker {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("config.toml"), config).unwrap();
     let log_path = dir.join("server.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_octobroker"))
+    let build = Command::new("cargo")
+        .args(["build", "--quiet", "--bin", "octobroker"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .expect("build octobroker");
+    assert!(build.success(), "cargo build octobroker failed");
+    let broker_exe = std::env::current_exe()
+        .expect("current test executable")
+        .parent()
+        .and_then(Path::parent)
+        .expect("target/debug directory")
+        .join("octobroker");
+    let child = Command::new(broker_exe)
         .env_clear()
         .env("OCTOBROKER_CONFIG", dir.join("config.toml"))
         .env("PATH", std::env::var("PATH").unwrap_or_default())
