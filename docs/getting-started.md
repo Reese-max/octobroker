@@ -239,7 +239,8 @@ On ECS, run it as a Service Connect service and use
 Policy denials of `tools/call` are returned as *tool errors* (HTTP 200, JSON-RPC
 result with `isError: true`, request id echoed) so the calling model sees the
 denial and can adapt. Protocol-level failures (auth, sessions) remain HTTP
-error codes.
+error codes, but echo the request id whenever the frame was parsed so strict
+JSON-RPC clients can correlate the error with the pending call.
 
 | Symptom | Meaning | Fix |
 |---------|---------|-----|
@@ -248,8 +249,9 @@ error codes.
 | Tool result `… write tools are not enabled` | Write-classified tool without `enable_writes` | Complete Stage 4 |
 | Tool result `… call has no resolvable repository target` | Agent has `repos` but the call's arguments name no repo (e.g. `search_code`) | Expected: repo-restricted agents can't use repo-less tools; remove `repos` or use repo-scoped tools |
 | Tool result `… repository not permitted by agent policy` | Call targets a repo outside the agent's `repos` allowlist | Add the repo (or `owner/*`) to the agent's `repos`, or have the agent use a public fetch instead |
-| `403 session not owned by this agent` | Session ID reused by a different agent | Each agent keeps its own session; re-initialize |
+| `403 session not owned by this agent` | Session ID reused by a different agent (request id echoed) | Each agent keeps its own session; re-initialize |
 | `404 session not found or expired` | Pin evicted (TTL/restart) or credential expired | Normal: MCP clients re-initialize transparently |
+| `502 upstream credential unavailable` | App token mint failed (request id echoed) | Check the App installation / private key; retry — transient mint failures resolve on their own |
 | `429 agent write concurrency limit reached` | In-flight cap hit | Raise `max_inflight_writes` or let calls drain |
 | `503 audit backend unavailable — write rejected` | Fail-closed audit: record couldn't be persisted | Fix disk/permissions for `[mcp.audit].path` — this is by design |
 | Startup panic: `enable_writes requires …` | Write gate validation | Configure the missing section (agents / github_app / audit) |
