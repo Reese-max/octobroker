@@ -152,3 +152,29 @@ enabled = false
 # id = "ci-agent"
 # key = "env:OCTOBROKER_KEY_CI"
 # tools = ["get_file_contents", "list_commits"]
+#
+# Policy v2 (#35): `[[mcp.agents.grants]]` pairs a tool allowlist with a
+# repository allowlist PER GRANT — a tools/call is authorized only when one
+# grant contains BOTH. Use it when an agent is read-only on repo-A but may
+# write on repo-B (flat tools/repos alone would cross-multiply). The flat
+# fields remain sugar for one implicit grant ("flat") and may coexist with
+# grants. Grant `repos = []` = matches any repository target, including calls
+# with no resolvable repo. Optional `id` labels the grant in audit records;
+# [agents.grants.permissions] (permission name → "read"/"write"/"admin")
+# additionally downscopes the minted installation token. When every grant
+# covering an owner sets it, the minted envelope is their union.
+# [[mcp.agents]]
+# id = "review-bot"
+# keys = ["env:OCTOBROKER_KEY_REVIEW"]
+# [[mcp.agents.grants]]
+# repos = ["openabdev/octobroker"]
+# tools = ["issue_read", "pull_request_read"]
+# [mcp.agents.grants.permissions]
+# contents = "read"
+# issues = "read"
+# [[mcp.agents.grants]]
+# repos = ["openabdev/openab"]
+# tools = ["issue_read", "create_issue", "add_issue_comment"]
+# [mcp.agents.grants.permissions]
+# contents = "read"
+# issues = "write"

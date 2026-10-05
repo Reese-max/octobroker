@@ -345,6 +345,65 @@ Client config gains one line:
 
 Deliver `OCTOBROKER_KEY` to the agent container via ECS task secrets / K8s Secrets — most MCP clients expand `${ENV}` in config.
 
+#### Grant-based per-repo tool permissions (policy v2, #35)
+
+Flat `tools` + `repos` express one cross-product policy: every listed tool is
+allowed on every listed repo. When an agent should be **read-only on repo-A
+but able to write on repo-B**, declare `[[mcp.agents.grants]]` — each grant
+pairs its own tool allowlist with its own repository allowlist:
+
+```toml
+[[mcp.agents]]
+id   = "my-bot"
+keys = ["env:OCTOBROKER_KEY_MYBOT"]
+
+  [[mcp.agents.grants]]
+  repos = ["my-org/repo-a"]
+  tools = ["issue_read", "pull_request_read"]
+
+  [[mcp.agents.grants]]
+  repos = ["my-org/repo-b"]
+  tools = ["issue_read", "create_issue"]
+
+  [[mcp.agents.grants]]        # repo-unrestricted grant (e.g. get_me)
+  repos = []
+  tools = ["get_me"]
+
+[[mcp.agents]]
+id   = "legacy-bot"
+keys = ["env:OCTOBROKER_KEY_LEGACY"]
+tools = ["issue_read"]
+repos = ["my-org/repo-a"]      # sugar for one grant — unchanged semantics
+```
+
+Semantics:
+
+- **A `tools/call` is authorized when ≥1 grant contains both the tool and the
+  resolved repository** — `tools` and `repos` are matched *within the same
+  grant*, so tools granted on repo-B never leak onto repo-A. Default-deny
+  otherwise.
+- **`repos = []` on a grant is "any repository target"**, including calls
+  whose arguments resolve to no repo (e.g. `get_me`). Deny-if-unresolvable
+  therefore generalizes: a call with no resolvable repo is denied only when
+  *every* grant carrying that tool is repo-restricted.
+- **Flat `tools`/`repos` are sugar for one implicit grant** named `flat` —
+  existing configs behave identically, and flat fields may coexist with
+  `[[mcp.agents.grants]]` entries (they union).
+- **`id` is optional** — grants default to `grants[0]`, `grants[1]`, … in
+  declaration order; the matched grant id is recorded in audit records as
+  `"grant"`.
+- **`tools/list` and `X-MCP-Tools` expose the union** of tools across grants;
+  per-call proxy matching does the narrowing.
+- **Repo envelopes derive from all grants** — installation tokens cover every
+  repository any grant could reach, and multi-installation routing keys off
+  the union of grant `repos` owners.
+- **`[mcp.agents.grants.permissions]` optionally scopes minted tokens** — a
+  GitHub permission name → `"read" | "write" | "admin"` map sent as the App
+  installation-token `permissions` parameter. When several grants covering
+  the same owner all set it, the envelope is the union with the highest
+  access winning; if any covering grant omits it, the mint is unscoped
+  (installation defaults), because that grant may still need them.
+
 #### Write access (Phase 2b)
 
 ```toml
@@ -448,8 +507,8 @@ tools/call {owner: "oablab", …}    → session B (oablab token)
 
 - **Routing is argument-derived** — the installation is selected by the
   repository owner resolved from the call's `owner`/`repo` arguments, never
-  by anything the agent chooses directly. Owners outside the agent's `repos`
-  allowlist are denied before any credential is touched.
+  by anything the agent chooses directly. Owners outside the agent's flat
+  `repos` plus grant `repos` union are denied before any credential is touched.
 - **Eager fan-out at `initialize`** — one repo-scoped token is minted and one
   upstream session opened per owner in the agent's allowlist, fail-closed: if
   any installation can't mint or initialize, the whole `initialize` fails and

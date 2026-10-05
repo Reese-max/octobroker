@@ -121,6 +121,27 @@ the same session ID gets 403.
 
 Terminate TLS in front of octobroker in production — the key travels in a header.
 
+For different permissions on different repositories, use grant rows instead of
+cross-product `tools`/`repos` fields:
+
+```toml
+[[mcp.agents]]
+id = "my-bot"
+key = "env:OCTOBROKER_KEY_MYBOT"
+
+[[mcp.agents.grants]]
+repos = ["your-org/repo-a"]
+tools = ["issue_read", "pull_request_read"]
+
+[[mcp.agents.grants]]
+repos = ["your-org/repo-b"]
+tools = ["issue_read", "create_issue"]
+```
+
+A call must match both its tool and repository within one grant. Flat fields
+remain backward-compatible sugar for one grant; `repos = []` on a grant means
+that grant accepts any repository target, including repo-less tools.
+
 ## Stage 3: GitHub App backend
 
 Recommended for production even while read-only: short-lived installation

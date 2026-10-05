@@ -81,24 +81,43 @@ Sessions (`Mcp-Session-Id`) are pinned to `(credential, agent)` at
 
 ## Policy model
 
-Per-agent, default-deny, enforced at the proxy and mirrored upstream:
+Per-agent, default-deny, enforced at the proxy and mirrored upstream. Flat
+`tools` + `repos` remain backward-compatible cross-product sugar, while
+policy v2 grants pair the two axes:
 
 ```toml
 [[mcp.agents]]
 id    = "my-bot"
 keys  = ["env:KEY_CURRENT", "env:KEY_NEXT"]   # rotation: both valid
-tools = ["issue_read", "create_issue"]        # exact names, default-deny
-repos = ["my-org/repo-a", "my-org/*"]         # exact or owner wildcard
+
+[[mcp.agents.grants]]
+repos = ["my-org/repo-a"]
+tools = ["issue_read", "pull_request_read"]
+
+[[mcp.agents.grants]]
+repos = ["my-org/repo-b"]
+tools = ["issue_read", "create_issue"]
+[mcp.agents.grants.permissions]
+issues = "write"
 ```
 
-- The tool allowlist is injected upstream as **`X-MCP-Tools`** (exact
-  per-tool filtering, discovered and verified in Phase 0). We deliberately
-  do NOT use `X-MCP-Toolsets` for enforcement: Phase 0 found invalid
-  toolset names are silently ignored — fail-open.
+- A `tools/call` must match one grant on both the exact tool and resolved
+  repository. `repos = []` on a grant matches any target, including calls with
+  no resolvable repository; otherwise deny-if-unresolvable remains in force.
+- Flat `tools`/`repos` act as an implicit `flat` grant and may coexist with
+  explicit grants. The matched grant id is included in write audit records.
+- The tool header is the union of tools across all grants. The authoritative
+  pairing check remains at the proxy; a tool visible in `tools/list` may still
+  be denied for a particular repository.
+- Exact repository envelopes and multi-installation owner routing derive from
+  the union of grant repositories. Optional per-grant GitHub App permission
+  maps are merged per owner (highest access wins); if any covering grant is
+  unscoped, the token mint stays unscoped.
+- The tool allowlist is injected upstream as **`X-MCP-Tools`**. We deliberately
+  do NOT use `X-MCP-Toolsets` for enforcement: Phase 0 found invalid toolset
+  names are silently ignored — fail-open.
 - All client-supplied `X-MCP-*` headers are stripped; the upstream header
   set is built from scratch (a client cannot widen its own permissions).
-- Repo authorization is deny-if-unresolvable: a repo-restricted agent's
-  call whose arguments name no repository is rejected.
 - Write classification is rule-based and conservative: only
   `get_*`/`list_*`/`search_*`/`*_read` names are reads; **everything else,
   including unknown names, is a write**.
